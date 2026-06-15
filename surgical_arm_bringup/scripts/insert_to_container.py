@@ -103,6 +103,9 @@ import concurrent.futures
 import rclpy
 import rclpy.time
 from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from moveit_msgs.msg import CollisionObject
+from shape_msgs.msg import SolidPrimitive
 from rclpy.duration import Duration as RclpyDuration
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -423,10 +426,16 @@ class ContainerInserter(Node):
             self.create_timer(2.0, self._run_once, callback_group=self._cb_group)
 
         self.add_on_set_parameters_callback(self._parameter_callback)
+        self._collision_pub = self.create_publisher(CollisionObject, "/collision_object", 10)
+        self._camera_target = None
+        self.create_subscription(PoseStamped, "/fused_marker_square_center", self._camera_target_cb, 10)
         self._done = False
 
     # ------------------------------------------------------------------
 
+
+    def _camera_target_cb(self, msg: PoseStamped):
+        self._camera_target = msg
     def _parameter_callback(self, params):
         from rcl_interfaces.msg import SetParametersResult
         for p in params:
@@ -513,55 +522,6 @@ class ContainerInserter(Node):
         # Re-derive smooth velocities/accelerations from the new timestamps
         smooth_traj_velocities(solution)
         return solution
-
-    def _min_dt_ns(disp: float) -> int:
-            """Minimum nanoseconds needed to move disp rad within velocity limit."""
-            if abs(disp) < 1e-9:
-                return 0
-            return int(abs(disp) / vel_limit_ns * 1e9) + 1
-
-        # Forward pass: ensure each interval is long enough
-        for i in range(1, len(pts)):
-            min_dt = 0
-            for j in range(num_joints):
-                if j >= len(pts[i].positions) or j >= len(pts[i-1].positions):
-                    continue
-                disp = abs(pts[i].positions[j] - pts[i-1].positions[j])
-                min_dt = max(min_dt, _min_dt_ns(disp))
-            cur_dt = times_ns[i] - times_ns[i-1]
-            if cur_dt < min_dt:
-                stretch = min_dt - cur_dt
-                for k in range(i, len(pts)):
-                    times_ns[k] += stretch
-
-        # Backward pass: same logic reversed
-        for i in range(len(pts) - 2, -1, -1):
-            min_dt = 0
-            for j in range(num_joints):
-                if j >= len(pts[i+1].positions) or j >= len(pts[i].positions):
-                    continue
-                disp = abs(pts[i+1].positions[j] - pts[i].positions[j])
-                min_dt = max(min_dt, _min_dt_ns(disp))
-            cur_dt = times_ns[i+1] - times_ns[i]
-            if cur_dt < min_dt:
-                stretch = min_dt - cur_dt
-                for k in range(i + 1):
-                    times_ns[k] -= stretch
-
-        # Ensure times are monotonically increasing from zero
-        if times_ns[0] < 0:
-            offset = -times_ns[0]
-            times_ns = [t + offset for t in times_ns]
-
-        # Write timestamps back
-        for i, pt in enumerate(pts):
-            pt.time_from_start.sec     = times_ns[i] // 1_000_000_000
-            pt.time_from_start.nanosec = times_ns[i] %  1_000_000_000
-
-        # Re-derive smooth velocities and accelerations from corrected timestamps
-        smooth_traj_velocities(traj)
-
-        return traj
 
     def _preflight_check(self, p: dict) -> bool:
         """
@@ -2617,6 +2577,11 @@ class ContainerInserter(Node):
                 self.get_logger().error(
                     f"[TF Lookup] Failed to look up 'marker_square_center' transform: {e}. "
                     f"Falling back to default target parameters.")
+        if getattr(self, '_camera_target', None) is not None:
+            p["target_x"] = self._camera_target.pose.position.x
+            p["target_y"] = self._camera_target.pose.position.y
+            self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({p['target_x']:.3f}, {p['target_y']:.3f})")
+
 
         # Compute world-frame Z values from container parameters.
         #   container top  = table_z + container_height

@@ -86,6 +86,9 @@ import time
 import rclpy
 import rclpy.time
 from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from moveit_msgs.msg import CollisionObject
+from shape_msgs.msg import SolidPrimitive
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
@@ -390,10 +393,16 @@ class AngledInserter(Node):
             self.get_logger().warn("InsertContainer action interface not found — Action Server disabled.")
 
         self.add_on_set_parameters_callback(self._parameter_callback)
+        self._collision_pub = self.create_publisher(CollisionObject, "/collision_object", 10)
+        self._camera_target = None
+        self.create_subscription(PoseStamped, "/fused_marker_square_center", self._camera_target_cb, 10)
         self._done = False
 
     # ------------------------------------------------------------------
 
+
+    def _camera_target_cb(self, msg: PoseStamped):
+        self._camera_target = msg
     def _parameter_callback(self, params):
         from rcl_interfaces.msg import SetParametersResult
         for p in params:
@@ -990,6 +999,11 @@ class AngledInserter(Node):
         # Get container position
         cont_x = goal_handle.request.target_x
         cont_y = goal_handle.request.target_y
+        if getattr(self, '_camera_target', None) is not None:
+            cont_x = self._camera_target.pose.position.x
+            cont_y = self._camera_target.pose.position.y
+            self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({cont_x:.3f}, {cont_y:.3f})")
+
         container_top = table_z + cont_h
         hover_z  = container_top + hover_top
         ready_z  = container_top + approach
@@ -1012,6 +1026,27 @@ class AngledInserter(Node):
 
         # Compute tilt geometry
         geo = compute_tilt_geometry(hover_xyz, target_xyz)
+
+        
+        try:
+            co = CollisionObject()
+            co.header.frame_id = world_frame
+            co.id = "physical_container"
+            box = SolidPrimitive()
+            box.type = SolidPrimitive.BOX
+            box.dimensions = [0.15, 0.15, cont_h]
+            co.primitives.append(box)
+            box_pose = Pose()
+            box_pose.position.x = cont_x
+            box_pose.position.y = cont_y
+            box_pose.position.z = table_z + (cont_h / 2.0)
+            box_pose.orientation.w = 1.0
+            co.primitive_poses.append(box_pose)
+            co.operation = CollisionObject.ADD
+            self._collision_pub.publish(co)
+            self.get_logger().info("Published dynamic container CollisionObject.")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to publish CollisionObject: {e}")
 
         self.get_logger().info("=" * 62)
         self.get_logger().info("angled_insert — geometry")
