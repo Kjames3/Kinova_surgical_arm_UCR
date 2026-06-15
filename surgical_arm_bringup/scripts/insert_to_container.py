@@ -320,8 +320,8 @@ class AngledInserter(Node):
 
         # Target point inside container (mm from container centre, depth from top)
         # These are overridden by the interactive prompt when interactive_target=true.
-        self.declare_parameter("target_offset_x_mm",  10.0)    # +X = away from robot
-        self.declare_parameter("target_offset_y_mm",  -30.0)   # +Y = left, -Y = right
+        self.declare_parameter("insertion_angle_deg",  45.0)
+        self.declare_parameter("insertion_azimuth_deg",  0.0)
         self.declare_parameter("target_depth_mm",     30.0)    # mm below container top
 
         # If true, prompt user to enter target in mm at runtime
@@ -1010,26 +1010,40 @@ class AngledInserter(Node):
         hover_z  = container_top + hover_top
         ready_z  = container_top + approach
 
-        # Get target inside container
-        if self.get_parameter("interactive_target").value:
-            ox_mm, oy_mm, d_mm = self._prompt_target()
-        else:
-            ox_mm = self.get_parameter("target_offset_x_mm").value
-            oy_mm = self.get_parameter("target_offset_y_mm").value
-            d_mm  = self.get_parameter("target_depth_mm").value
-
-        ox_m = ox_mm / 1000.0
-        oy_m = oy_mm / 1000.0
-        d_m  = d_mm  / 1000.0
-
-        # Target point in world frame
-        target_xyz = (cont_x + ox_m, cont_y + oy_m, container_top - d_m)
-        hover_xyz  = (cont_x, cont_y, hover_z)
-
-        # Compute tilt geometry
-        geo = compute_tilt_geometry(hover_xyz, target_xyz)
-
+        # Phase 2 — Compute fixed 45 degree tilt geometry
+        d_m  = self.get_parameter("target_depth_mm").value / 1000.0
+        angle_deg = self.get_parameter("insertion_angle_deg").value
+        azimuth_deg = self.get_parameter("insertion_azimuth_deg").value
         
+        import math
+        tilt_rad = math.radians(angle_deg)
+        azimuth_rad = math.radians(azimuth_deg)
+        
+        # Tip must end exactly in the center
+        target_xyz = (cont_x, cont_y, container_top - d_m) 
+        
+        # Tool axis direction
+        axis_x = math.sin(tilt_rad) * math.cos(azimuth_rad)
+        axis_y = math.sin(tilt_rad) * math.sin(azimuth_rad)
+        axis_z = -math.cos(tilt_rad)
+        
+        vertical_dist = ready_z - target_xyz[2]
+        D = vertical_dist / math.cos(tilt_rad) if math.cos(tilt_rad) > 1e-3 else 0.0
+        
+        hover_xyz = (cont_x - axis_x * D, cont_y - axis_y * D, ready_z)
+        
+        geo = dict(
+            azimuth_rad=azimuth_rad, 
+            tilt_rad=tilt_rad, 
+            descent_m=D,
+            tool_axis=(axis_x, axis_y, axis_z)
+        )
+        ox_mm = 0.0
+        oy_mm = 0.0
+        d_mm = d_m * 1000.0
+        ox_m = 0.0
+        oy_m = 0.0
+
         try:
             co = CollisionObject()
             co.header.frame_id = world_frame
