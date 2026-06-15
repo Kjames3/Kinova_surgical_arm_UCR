@@ -77,6 +77,7 @@ Usage
 """
 
 import math
+from kortex_utils import *
 import signal
 import sys
 import threading
@@ -136,23 +137,13 @@ CONTAINER_INNER_R  = (CONTAINER_WIDTH_M / 2.0) - CONTAINER_WALL_M  # 42 mm
 
 MAX_TILT_DEG = 25.0   # hard limit — beyond this hits the wall at shallow depths
 
-_MAX_JOINT_VEL_RAD_S  = 0.8
-_MAX_JOINT_ACC_RAD_S2 = 0.4
+MAX_JOINT_VEL_RAD_S  = 0.8
+MAX_JOINT_ACC_RAD_S2 = 0.4
 
 
 # ---------------------------------------------------------------------------
 # Quaternion helpers (duplicated from insert_to_container for standalone use)
 # ---------------------------------------------------------------------------
-
-def _quat_multiply(q1, q2):
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return (
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-    )
 
 def _quat_conjugate(q):
     return (-q[0], -q[1], -q[2], q[3])
@@ -160,12 +151,6 @@ def _quat_conjugate(q):
 def _quat_normalize(q):
     n = math.sqrt(sum(v*v for v in q))
     return tuple(v/n for v in q)
-
-def _rotate_vector_by_quat(v, q):
-    qv  = (v[0], v[1], v[2], 0.0)
-    qc  = _quat_conjugate(q)
-    res = _quat_multiply(_quat_multiply(q, qv), qc)
-    return res[0], res[1], res[2]
 
 def _quat_slerp(q0, q1, t):
     """Spherical linear interpolation between two quaternions."""
@@ -216,7 +201,7 @@ def _tilt_quaternion(q_vertical, azimuth_rad, tilt_rad):
     tilt_ax = (-math.sin(azimuth_rad), math.cos(azimuth_rad), 0.0)
     q_tilt  = _quat_from_axis_angle(tilt_ax, tilt_rad)
     # Compose: q_new = q_tilt * q_az * q_vertical
-    q_new = _quat_multiply(q_tilt, _quat_multiply(q_az, q_vertical))
+    q_new = quat_multiply(q_tilt, quat_multiply(q_az, q_vertical))
     return _quat_normalize(q_new)
 
 
@@ -404,9 +389,18 @@ class AngledInserter(Node):
         else:
             self.get_logger().warn("InsertContainer action interface not found — Action Server disabled.")
 
+        self.add_on_set_parameters_callback(self._parameter_callback)
         self._done = False
 
     # ------------------------------------------------------------------
+
+    def _parameter_callback(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name in ["container_height", "insert_depth_from_top", "target_x", "target_y", "hover_above_top", "approach_clearance"]:
+                self.get_logger().info(f"Dynamically updated parameter {p.name} to {p.value}")
+        return SetParametersResult(successful=True)
+
     def _js_cb(self, msg):
         if self._js_frozen:
             return
@@ -450,11 +444,11 @@ class AngledInserter(Node):
                 continue
             worst = 1.0
             for v in pt.velocities:
-                if abs(v) > _MAX_JOINT_VEL_RAD_S:
-                    worst = max(worst, abs(v) / _MAX_JOINT_VEL_RAD_S)
+                if abs(v) > MAX_JOINT_VEL_RAD_S:
+                    worst = max(worst, abs(v) / MAX_JOINT_VEL_RAD_S)
             for a in pt.accelerations:
-                if abs(a) > _MAX_JOINT_ACC_RAD_S2:
-                    worst = max(worst, (abs(a) / _MAX_JOINT_ACC_RAD_S2) ** 0.5)
+                if abs(a) > MAX_JOINT_ACC_RAD_S2:
+                    worst = max(worst, (abs(a) / MAX_JOINT_ACC_RAD_S2) ** 0.5)
             if worst <= 1.0:
                 continue
             prev_ns = (pts[i-1].time_from_start.sec * 1_000_000_000
@@ -878,8 +872,36 @@ class AngledInserter(Node):
         self.get_logger().info("Received goal request")
         return GoalResponse.ACCEPT
 
+
+    def _cancel_active(self):
+        from std_msgs.msg import Empty as EmptyMsg
+        import time
+        try:
+            stop_pub = self.create_publisher(EmptyMsg, "/stop_kortex_cmd", 1)
+            stop_pub.publish(EmptyMsg())
+            self.get_logger().warn("  Published /stop_kortex_cmd (hardware stop).")
+        except Exception as e:
+            self.get_logger().warn(f"  Could not publish /stop_kortex_cmd: {e}")
+
+        gh = getattr(self, '_active_gh', None)
+        if gh is not None:
+            self.get_logger().warn("  Sending trajectory cancellation...")
+            try:
+                import rclpy
+                cancel_f = gh.cancel_goal_async()
+                deadline = time.monotonic() + 3.0
+                while not cancel_f.done() and time.monotonic() < deadline:
+                    rclpy.spin_once(self, timeout_sec=0.05)
+            except Exception as e:
+                self.get_logger().warn(f"  Cancel request failed: {e}")
+            self._active_gh = None
+
+        self.get_logger().warn("  Waiting 2s for controller to settle...")
+        time.sleep(2.0)
+
     def _action_cancel_cb(self, goal_handle):
-        self.get_logger().info("Received cancel request")
+        self.get_logger().warn("Action server: cancel requested — stopping arm.")
+        self._cancel_active()
         return CancelResponse.ACCEPT
 
     def _action_execute_cb(self, goal_handle):
@@ -1135,7 +1157,7 @@ class AngledInserter(Node):
         def _ee_at_orientation(q_xyzw):
             """EE position when tip is at hover_xyz and EE has orientation q."""
             # tip = EE + R * local_offset  →  EE = tip - R * local_offset
-            rot_offset = _rotate_vector_by_quat(local_tip_offset, q_xyzw)
+            rot_offset = rotate_vector_by_quat(local_tip_offset, q_xyzw)
             return (hover_xyz[0] - rot_offset[0],
                     hover_xyz[1] - rot_offset[1],
                     hover_xyz[2] - rot_offset[2])
@@ -1194,11 +1216,11 @@ class AngledInserter(Node):
 
         # EE position at target: tip is at target_xyz, EE has tilted orientation
         ee_target = _ee_at_orientation(q_tilted_xyzw)
-        ee_target = (target_xyz[0] - _rotate_vector_by_quat(
+        ee_target = (target_xyz[0] - rotate_vector_by_quat(
                          local_tip_offset, q_tilted_xyzw)[0],
-                     target_xyz[1] - _rotate_vector_by_quat(
+                     target_xyz[1] - rotate_vector_by_quat(
                          local_tip_offset, q_tilted_xyzw)[1],
-                     target_xyz[2] - _rotate_vector_by_quat(
+                     target_xyz[2] - rotate_vector_by_quat(
                          local_tip_offset, q_tilted_xyzw)[2])
 
         self.get_logger().info(

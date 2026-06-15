@@ -93,6 +93,7 @@ Usage
 """
 
 import math
+from kortex_utils import *
 import signal
 import sys
 import threading
@@ -174,56 +175,9 @@ _ASSEMBLY_TIP_OFFSET = {
 
 
 # ---------------------------------------------------------------------------
-# Safety limits — these mirror Kortex Gen3 firmware hard limits.
-# Trajectories are clamped to these before execution to prevent joint faults.
-# If you see joint faults, reduce _MAX_JOINT_VEL_RAD_S further (try 0.5).
-# ---------------------------------------------------------------------------
-_MAX_JOINT_VEL_RAD_S  = 0.8    # firmware limit ~1.22 rad/s; 0.8 gives 35% margin
-_MAX_JOINT_ACC_RAD_S2 = 0.4    # conservative; raise to 0.6 if moves feel too sluggish
-
-# Maximum allowed distance (m) from planned pen_tip target to actual TF position
-# before the script refuses to execute.  Catches wrong container_height / table_z.
-_MAX_TARGET_DIST_M = 0.60
-
-# Maximum allowed joint displacement (rad) between consecutive trajectory points.
-# Catches trajectories with large joint flips that would destroy the end-effector.
-_MAX_WAYPOINT_JUMP_RAD = 1.5   # ~86° per step; anything larger is a planning error
-
-# Minimum trajectory duration (s). Plans shorter than this are suspicious
-# (usually means velocity scaling was ignored and the arm would move at 100%).
-_MIN_TRAJ_DURATION_S = 0.5
-
-# Per-step joint displacement threshold used in _is_suspicious_trajectory.
-# Raised from 0.5 to 1.0 rad so that faster (50% vel) PTP plans — which the
-# planner may represent with fewer, slightly larger steps — are not incorrectly
-# filtered as suspicious.  The _MAX_WAYPOINT_JUMP_RAD hard limit (1.5 rad) still
-# guards against genuine IK flips.
-_SUSPICIOUS_STEP_RAD = 1.0
-
-
 # ---------------------------------------------------------------------------
 # Quaternion math helpers
 # ---------------------------------------------------------------------------
-
-def _quat_multiply(q1, q2):
-    """Hamilton product of two (x,y,z,w) tuples."""
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return (
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-    )
-
-
-def _rotate_vector_by_quat(v, q):
-    """Rotate vector v=(x,y,z) by unit quaternion q=(x,y,z,w)."""
-    qv  = (v[0], v[1], v[2], 0.0)
-    qc  = (-q[0], -q[1], -q[2], q[3])
-    res = _quat_multiply(_quat_multiply(q, qv), qc)
-    return res[0], res[1], res[2]
-
 
 def _tip_to_ee_pose(tip_x, tip_y, tip_z, q_xyzw, ee_offset_xyz):
     """
@@ -240,7 +194,7 @@ def _tip_to_ee_pose(tip_x, tip_y, tip_z, q_xyzw, ee_offset_xyz):
     Verify with: ros2 run tf2_ros tf2_echo end_effector_link pen_tip
     The translation shown is pen_tip_joint_xyz; negate it for ee_offset_xyz.
     """
-    wx, wy, wz = _rotate_vector_by_quat(ee_offset_xyz, q_xyzw)
+    wx, wy, wz = rotate_vector_by_quat(ee_offset_xyz, q_xyzw)
     return tip_x + wx, tip_y + wy, tip_z + wz
 
 
@@ -468,9 +422,18 @@ class ContainerInserter(Node):
                 "  Running in standalone timer mode.")
             self.create_timer(2.0, self._run_once, callback_group=self._cb_group)
 
+        self.add_on_set_parameters_callback(self._parameter_callback)
         self._done = False
 
     # ------------------------------------------------------------------
+
+    def _parameter_callback(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name in ["container_height", "insert_depth_from_top", "target_x", "target_y", "hover_above_top", "approach_clearance"]:
+                self.get_logger().info(f"Dynamically updated parameter {p.name} to {p.value}")
+        return SetParametersResult(successful=True)
+
     def _js_cb(self, msg: JointState):
         if self._js_frozen:
             return
@@ -548,276 +511,10 @@ class ContainerInserter(Node):
             pt.velocities    = [v * vel_scale          for v in pt.velocities]
             pt.accelerations = [a * vel_scale * vel_scale for a in pt.accelerations]
         # Re-derive smooth velocities/accelerations from the new timestamps
-        ContainerInserter._smooth_traj_velocities(solution)
+        smooth_traj_velocities(solution)
         return solution
 
-    def _validate_trajectory(self, traj: RobotTrajectory, label: str,
-                              real_robot: bool = False) -> bool:
-        """
-        Sanity-check a planned trajectory before execution.
-
-        Catches the most common planning errors that cause hardware damage:
-          1. Empty trajectory
-          2. Too short duration (velocity scaling ignored → arm moves at 100%)
-          3. Large joint jumps between consecutive waypoints (IK flip / wrong solution)
-          4. Any joint position outside Gen3 software limits
-          5. On real robot: asks user to confirm after showing key stats
-
-        Returns True if safe to execute, False to abort.
-        """
-        pts = traj.joint_trajectory.points
-        names = traj.joint_trajectory.joint_names
-
-        # 1. Empty
-        if not pts:
-            self.get_logger().error(f"  [VALIDATE] {label}: trajectory is EMPTY — aborting.")
-            return False
-
-        # 2. Duration
-        last = pts[-1].time_from_start
-        dur  = last.sec + last.nanosec * 1e-9
-        if dur < _MIN_TRAJ_DURATION_S:
-            # Allow very short trajectories if the arm is already near the goal
-            # (recovery return when already at home, or zero-length moves).
-            # Only block if duration is suspiciously short AND there are many waypoints.
-            if len(pts) > 5:
-                self.get_logger().error(
-                    f"  [VALIDATE] {label}: trajectory duration {dur:.2f} s < "
-                    f"{_MIN_TRAJ_DURATION_S} s minimum with {len(pts)} waypoints.\n"
-                    f"  This usually means velocity scaling was ignored and the arm\n"
-                    f"  would move at 100% speed.  Aborting for safety.")
-                return False
-            else:
-                self.get_logger().info(
-                    f"  [VALIDATE] {label}: short trajectory {dur:.2f} s with "
-                    f"{len(pts)} pts — arm already near goal, allowing.")
-
-        # 3. Joint jumps between consecutive waypoints
-        max_jump = 0.0
-        max_jump_info = ""
-        for i in range(1, len(pts)):
-            for j, name in enumerate(names):
-                if j >= len(pts[i].positions) or j >= len(pts[i-1].positions):
-                    continue
-                jump = abs(pts[i].positions[j] - pts[i-1].positions[j])
-                if jump > max_jump:
-                    max_jump = jump
-                    max_jump_info = f"{name} pt{i-1}→{i}: {math.degrees(jump):.1f}°"
-        if max_jump > _MAX_WAYPOINT_JUMP_RAD:
-            self.get_logger().error(
-                f"  [VALIDATE] {label}: LARGE JOINT JUMP detected!\n"
-                f"  Worst: {max_jump_info} ({math.degrees(max_jump):.1f}° > "
-                f"{math.degrees(_MAX_WAYPOINT_JUMP_RAD):.0f}° limit)\n"
-                f"  This is a planning error (wrong IK solution / joint flip).\n"
-                f"  DO NOT execute — it would destroy the end-effector.\n"
-                f"  Fix: reduce joint_delta_rad or increase approach_clearance.")
-            return False
-
-        # 4. Joint limits (Gen3 symmetric limits in radians)
-        # joint_3 limit is set to π (3.14159) because the calibrated home
-        # position uses joint_3 = -180° (−π rad), which the firmware allows.
-        # The URDF soft limit of ±152° (2.66 rad) is more conservative than
-        # the actual firmware range — using π avoids a false-positive warning.
-        _JOINT_LIMITS = {
-            "joint_1": 2.41, "joint_2": 2.41, "joint_3": math.pi,
-            "joint_4": 2.41, "joint_5": 2.41, "joint_6": 2.41, "joint_7": 2.41,
-        }
-        limit_violated = False
-        for pt in pts:
-            for j, name in enumerate(names):
-                if j >= len(pt.positions):
-                    continue
-                lim = _JOINT_LIMITS.get(name, 2.41)
-                pos = pt.positions[j]
-                # Normalize to [-π, π]
-                pos_norm = (pos + math.pi) % (2 * math.pi) - math.pi
-                if abs(pos_norm) > lim:
-                    self.get_logger().warn(
-                        f"  [VALIDATE] {label}: {name} position {math.degrees(pos):.1f}° "
-                        f"may exceed limit ±{math.degrees(lim):.0f}°")
-                    limit_violated = True
-                    break
-            if limit_violated:
-                break
-
-        # 5. Velocity peaks — warn if any point exceeds the firmware limit
-        max_vel = 0.0
-        max_vel_joint = ""
-        for pt in pts:
-            for j, v in enumerate(pt.velocities):
-                if abs(v) > max_vel:
-                    max_vel = abs(v)
-                    max_vel_joint = names[j] if j < len(names) else f"j{j}"
-        if max_vel > _MAX_JOINT_VEL_RAD_S:
-            self.get_logger().warn(
-                f"  [VALIDATE] {label}: peak velocity {max_vel:.3f} rad/s on "
-                f"{max_vel_joint} exceeds soft limit {_MAX_JOINT_VEL_RAD_S} rad/s.\n"
-                f"  _clamp_traj_limits will fix this before execution.")
-
-        # Summary log
-        self.get_logger().info(
-            f"  [VALIDATE] {label}: OK — {len(pts)} pts, {dur:.1f} s, "
-            f"max_jump={math.degrees(max_jump):.1f}°, peak_vel={max_vel:.3f} rad/s")
-
-        # 6. Publish to RViz display_planned_path so the ghost trajectory
-        #    preview appears in the Motion Planning panel.  Published regardless
-        #    of dry-run / real-robot so the operator can always see the plan.
-        try:
-            disp = DisplayTrajectory()
-            disp.trajectory.append(traj)
-            disp.trajectory_start = RobotState()
-            self._display_traj_pub.publish(disp)
-        except Exception as exc:
-            self.get_logger().warn(f"  [DISPLAY] Could not publish preview: {exc}")
-
-        # 7. On real robot: show first and last joint positions and ask to confirm
-        if real_robot and pts:
-            first = {names[j]: round(math.degrees(pts[0].positions[j]), 1)
-                     for j in range(min(len(names), len(pts[0].positions)))}
-            last_pt = {names[j]: round(math.degrees(pts[-1].positions[j]), 1)
-                       for j in range(min(len(names), len(pts[-1].positions)))}
-            self.get_logger().info(
-                f"\n  ── Trajectory preview: {label} ──\n"
-                f"  Duration : {dur:.1f} s\n"
-                f"  Waypoints: {len(pts)}\n"
-                f"  Start (°): {first}\n"
-                f"  End   (°): {last_pt}\n"
-                f"  ─────────────────────────────────\n"
-                f"  [RViz] Ghost trajectory published to /display_planned_path")
-            ans = input(
-                f"  Execute '{label}' on real robot? [y/N]: ").strip().lower()
-            if ans != "y":
-                self.get_logger().warn(
-                    f"  [VALIDATE] User rejected '{label}' — aborting phase.")
-                return False
-
-        return True
-
-    @staticmethod
-    def _smooth_traj_velocities(traj: RobotTrajectory) -> RobotTrajectory:
-        """
-        Re-derive joint velocities and accelerations from waypoint positions
-        and timestamps using a central-difference scheme.
-
-        Called after any timestamp rescaling (e.g. _rescale_cartesian_traj or
-        _clamp_traj_limits) to ensure the velocity/acceleration arrays are
-        consistent with the actual time intervals and produce smooth motion.
-
-        The first and last waypoints are forced to zero velocity / zero
-        acceleration (rest-to-rest profile) so the arm starts and stops
-        smoothly without abrupt jerks.
-        """
-        pts = traj.joint_trajectory.points
-        n   = len(pts)
-        if n < 2:
-            return traj
-        if not pts[0].positions:
-            return traj
-
-        num_joints = len(pts[0].positions)
-
-        # Build time array (seconds)
-        times = []
-        for pt in pts:
-            times.append(pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9)
-
-        # Central-difference velocities; forward/backward at endpoints
-        vels = [[0.0] * num_joints for _ in range(n)]
-        accs = [[0.0] * num_joints for _ in range(n)]
-
-        for j in range(num_joints):
-            for i in range(n):
-                if i == 0:
-                    dt = times[1] - times[0]
-                    vels[i][j] = 0.0   # start at rest
-                elif i == n - 1:
-                    vels[i][j] = 0.0   # end at rest
-                else:
-                    dt_prev = times[i]   - times[i-1]
-                    dt_next = times[i+1] - times[i]
-                    if dt_prev <= 0.0 or dt_next <= 0.0:
-                        vels[i][j] = 0.0
-                    else:
-                        v_prev = (pts[i].positions[j]   - pts[i-1].positions[j]) / dt_prev
-                        v_next = (pts[i+1].positions[j] - pts[i].positions[j])   / dt_next
-                        # Use central difference; clamp to zero if directions differ
-                        # (standard cubic-spline knot condition for monotone segments)
-                        if v_prev * v_next <= 0.0:
-                            vels[i][j] = 0.0
-                        else:
-                            vels[i][j] = 0.5 * (v_prev + v_next)
-
-            # Clamp velocities to firmware limit
-            for i in range(n):
-                if abs(vels[i][j]) > _MAX_JOINT_VEL_RAD_S:
-                    vels[i][j] = math.copysign(_MAX_JOINT_VEL_RAD_S, vels[i][j])
-
-            # Finite-difference accelerations from clamped velocities
-            for i in range(n):
-                if i == 0 or i == n - 1:
-                    accs[i][j] = 0.0
-                else:
-                    dt_prev = times[i]   - times[i-1]
-                    dt_next = times[i+1] - times[i]
-                    if dt_prev <= 0.0 or dt_next <= 0.0:
-                        accs[i][j] = 0.0
-                    else:
-                        accs[i][j] = (vels[i+1][j] - vels[i-1][j]) / (dt_prev + dt_next)
-
-            # Clamp accelerations
-            for i in range(n):
-                if abs(accs[i][j]) > _MAX_JOINT_ACC_RAD_S2:
-                    accs[i][j] = math.copysign(_MAX_JOINT_ACC_RAD_S2, accs[i][j])
-
-        # Write back
-        for i, pt in enumerate(pts):
-            pt.velocities    = list(vels[i])
-            pt.accelerations = list(accs[i])
-
-        return traj
-
-    @staticmethod
-    def _clamp_traj_limits(traj: RobotTrajectory) -> RobotTrajectory:
-        """
-        Clamp joint velocities and accelerations to safe Kortex firmware limits
-        using a forward/backward time-stretching pass, then re-derive smooth
-        velocities via _smooth_traj_velocities.
-
-        The Kortex Gen3 firmware trips a joint fault if any joint is commanded
-        above its internal velocity limit (~1.22 rad/s). OMPL's time
-        parameterisation can produce momentary spikes at individual waypoints
-        even at low overall velocity scaling.  The previous approach stretched
-        each offending interval independently which broke C1 continuity and
-        produced jittery motion.
-
-        This implementation:
-          1. Forward pass  — for each waypoint, compute the minimum dt needed
-             to travel the joint displacement at or below the velocity limit,
-             and stretch the interval if needed.
-          2. Backward pass — same in reverse to ensure the deceleration side
-             of every peak is also respected.
-          3. Re-derive velocities/accelerations from the final timestamps so
-             they are smooth and internally consistent.
-        """
-        pts = traj.joint_trajectory.points
-        if len(pts) < 2:
-            return traj
-
-        num_joints = len(pts[0].positions) if pts[0].positions else 0
-        if num_joints == 0:
-            return traj
-
-        # Build mutable time array in nanoseconds for precision
-        times_ns = []
-        for pt in pts:
-            times_ns.append(
-                pt.time_from_start.sec * 1_000_000_000
-                + pt.time_from_start.nanosec)
-
-        vel_limit_ns   = _MAX_JOINT_VEL_RAD_S   # rad/s
-        acc_limit_ns   = _MAX_JOINT_ACC_RAD_S2  # rad/s²
-
-        def _min_dt_ns(disp: float) -> int:
+    def _min_dt_ns(disp: float) -> int:
             """Minimum nanoseconds needed to move disp rad within velocity limit."""
             if abs(disp) < 1e-9:
                 return 0
@@ -862,7 +559,7 @@ class ContainerInserter(Node):
             pt.time_from_start.nanosec = times_ns[i] %  1_000_000_000
 
         # Re-derive smooth velocities and accelerations from corrected timestamps
-        ContainerInserter._smooth_traj_velocities(traj)
+        smooth_traj_velocities(traj)
 
         return traj
 
@@ -936,7 +633,7 @@ class ContainerInserter(Node):
                     f"  [PRE-FLIGHT] pen_tip TF OK: ({t.x:.3f}, {t.y:.3f}, {t.z:.3f})\n"
                     f"  [PRE-FLIGHT] pen_tip→container distance: {dist_xy*100:.1f} cm")
 
-            if dist_xy > _MAX_TARGET_DIST_M:
+            if dist_xy > MAX_TARGET_DIST_M:
                 self.get_logger().warn(
                     f"  [PRE-FLIGHT] WARN: pen_tip is {dist_xy*100:.0f} cm from "
                     f"target XY — large approach move expected.\n"
@@ -1005,7 +702,7 @@ class ContainerInserter(Node):
         use_moveit_execute=True  — MoveIt /execute_trajectory (OMPL joint-space).
         use_moveit_execute=False — Direct FJT (Cartesian, overrides 0.1 rad path tol).
         """
-        self._clamp_traj_limits(traj)
+        clamp_traj_limits(traj)
 
         if use_moveit_execute:
             if not self._execute_cli.wait_for_server(timeout_sec=5.0):
@@ -1633,7 +1330,7 @@ class ContainerInserter(Node):
             return False, None
 
         real = self.get_parameter("real_robot").value
-        if not self._validate_trajectory(traj, label, real_robot=real):
+        if not validate_trajectory(traj, label, self.get_logger(), self._display_traj_pub, real):
             return False, None
 
         end_state = self._extract_end_state(traj)
@@ -1762,8 +1459,7 @@ class ContainerInserter(Node):
             end_state = self._extract_end_state(traj)
             if p["execute"]:
                 real = self.get_parameter("real_robot").value
-                if not self._validate_trajectory(traj, "0b_navigate_ompl",
-                                                 real_robot=real):
+                if not validate_trajectory(traj, "0b_navigate_ompl", self.get_logger(), self._display_traj_pub, real):
                     return False, None
                 ok = self._execute_traj(traj, "0b_navigate_ompl",
                                         timeout_sec=120.0, use_moveit_execute=True)
@@ -1972,7 +1668,7 @@ class ContainerInserter(Node):
 
         if p["execute"]:
             real = self.get_parameter("real_robot").value
-            if self._validate_trajectory(traj, "Return", real_robot=real):
+            if validate_trajectory(traj, "Return", self.get_logger(), self._display_traj_pub, real):
                 self._execute_traj(traj, "Return", timeout_sec=120.0,
                                    use_moveit_execute=True)
 
@@ -2135,7 +1831,7 @@ class ContainerInserter(Node):
 
         # ── Validate and report ───────────────────────────────────────────
         real = self.get_parameter("real_robot").value
-        if not self._validate_trajectory(traj, "move_to_home", real_robot=real):
+        if not validate_trajectory(traj, "move_to_home", self.get_logger(), self._display_traj_pub, real):
             return False
 
         pts = traj.joint_trajectory.points
@@ -2159,7 +1855,7 @@ class ContainerInserter(Node):
         # trips this tolerance and aborts with error -4 — the "moves halfway then
         # stops" symptom.  The direct FJT path sets path_tolerance = 5.0 rad
         # (effectively disabled) so the arm tracks to completion.
-        self._clamp_traj_limits(traj)
+        clamp_traj_limits(traj)
         ok = self._execute_traj(traj, "move_to_home",
                                 timeout_sec=dur + 60.0,
                                 use_moveit_execute=False)
@@ -2383,7 +2079,7 @@ class ContainerInserter(Node):
 
         Checks
         ------
-        1. Max single-step joint displacement > _SUSPICIOUS_STEP_RAD.
+        1. Max single-step joint displacement > SUSPICIOUS_STEP_RAD.
            Normal smooth paths have steps < 0.1 rad per waypoint.
         2. Joint_1 total displacement > 120° (2.09 rad).
            Any path requiring > 120° base rotation is a circular arc.
@@ -2420,9 +2116,9 @@ class ContainerInserter(Node):
         last     = pts[-1].time_from_start
         duration = last.sec + last.nanosec * 1e-9
 
-        if max_step > _SUSPICIOUS_STEP_RAD:
+        if max_step > SUSPICIOUS_STEP_RAD:
             return True, (f"large mid-path jump {math.degrees(max_step):.1f}°/step "
-                          f"> {math.degrees(_SUSPICIOUS_STEP_RAD):.1f}°")
+                          f"> {math.degrees(SUSPICIOUS_STEP_RAD):.1f}°")
         if j1_idx >= 0 and j1_total > math.radians(120):
             return True, f"joint_1 swings {math.degrees(j1_total):.1f}° > 120° (circular arc)"
         if j3_idx >= 0 and j3_total > math.radians(120):
@@ -3040,7 +2736,7 @@ class ContainerInserter(Node):
             except Exception:
                 # Last resort: rotate local offset by pen_q
                 q_for_offset = (pen_q.x, pen_q.y, pen_q.z, pen_q.w)
-                wx, wy, wz = _rotate_vector_by_quat(
+                wx, wy, wz = rotate_vector_by_quat(
                     (p["tip_ee_ox"], p["tip_ee_oy"], p["tip_ee_oz"]), q_for_offset)
                 ee_world_offset = (wx, wy, wz)
                 self.get_logger().warn(
