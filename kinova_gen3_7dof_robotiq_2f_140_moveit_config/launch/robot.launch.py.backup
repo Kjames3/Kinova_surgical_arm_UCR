@@ -1,0 +1,416 @@
+# Copyright (c) 2023 PickNik, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+
+import os
+
+from launch import LaunchDescription
+from launch.substitutions import LaunchConfiguration
+from launch.actions import (
+    ExecuteProcess,
+    DeclareLaunchArgument,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
+from launch.event_handlers import OnProcessExit
+from launch.conditions import IfCondition, UnlessCondition
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+from moveit_configs_utils import MoveItConfigsBuilder
+
+# ── Name reference — every string here must match across all nodes ─────────────
+# world frame        : "world"
+# robot base frame   : "base_link"          ← world=base_link for fixed robot (identity)
+# robot EE frame     : "tool_frame"         ← MoveIt2 planning target
+# camera body frame  : "global_camera_color_optical_frame" ← calibration_tf publishes base_link→global_camera_color_optical_frame
+# color topic        : /global_camera/global_camera/color/image_raw
+# color info topic   : /global_camera/global_camera/color/camera_info
+# point cloud topic  : /global_camera/global_camera/depth/color/points  ← used by octomap + sensors_3d.yaml
+# joint states topic : /joint_states
+#
+# NOTE: ArUco removed — hand-eye calibration uses ChArUco board via easy_handeye2.
+# Run calibration separately:
+#   Terminal 1: ros2 launch realsense2_camera rs_launch.py camera_name:=global_camera
+#   Terminal 2: ros2 launch easy_handeye2 calibrate.launch.py \
+#                 eye_on_hand:=false \
+#                 robot_base_frame:=base_link \
+#                 robot_effector_frame:=tool_frame \
+#                 tracking_base_frame:=global_camera_color_optical_frame \
+#                 tracking_marker_frame:=charuco_board
+# ───────────────────────────────────────────────────────────────────────────────
+
+# ── Octomap / 3-D sensor config ─────────────────────────────────────────────────
+# ⚠️  FIX: Octomap is now DISABLED by default (use_octomap:=false).
+#
+# WHY: On real hardware the RealSense publishes a live point cloud.  If the
+# hand-eye calibration TF is even slightly off, MoveIt2 sees the robot arm
+# itself as an obstacle and refuses ALL motion plans — the robot appears to
+# "work" in simulation only because the fake hardware never publishes a point
+# cloud so the octomap stays empty.
+#
+# HOW TO RE-ENABLE: pass use_octomap:=true on the command line ONLY after you
+# have verified the calibration TF is accurate (quaternion normalised to 1.0,
+# robot not appearing as obstacle in RViz collision scene).
+#
+# Quick quaternion check (run in any Python 3 shell):
+#   import math
+#   q = [0.6220, 0.6099, -0.3475, -0.3469]
+#   print(math.sqrt(sum(x**2 for x in q)))   # must be ≈ 1.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+SENSORS_3D = {
+    "sensors": ["realsense_pointcloud"],
+    "realsense_pointcloud": {
+        "sensor_plugin":        "occupancy_map_monitor/PointCloudOctomapUpdater",
+        "point_cloud_topic":    "/global_camera/global_camera/depth/color/points",
+        "max_range":            3.0,
+        "min_sensor_noise":     0.01,
+        "padding_offset":       0.01,
+        "padding_scale":        1.0,
+        "point_subsample":      1,
+        "filtered_cloud_topic": "/global_camera/global_camera/depth/color/points_filtered",
+    },
+}
+
+OCTOMAP_CONFIG = {
+    "octomap_frame":      "world",    # octomap is built in world frame
+    "octomap_resolution": 0.05,       # 5 cm voxels — good balance speed vs detail
+    "max_range":          3.0,        # same as sensor max_range above
+}
+
+# ── FIX: Empty dict (not {"sensors": []}) — an empty list becomes an empty
+# tuple () inside ROS2's launch parameter validation, which only accepts
+# scalar types (float, int, str, bool, bytes) and raises:
+#   "Expected 'value' to be one of [...], but got '()' of type '<class 'tuple'>'"
+# Passing an empty dict is safe — ROS2 simply skips it.
+SENSORS_3D_DISABLED = {}
+OCTOMAP_CONFIG_DISABLED = {
+    "octomap_frame":      "world",
+    "octomap_resolution": 0.05,
+    "max_range":          0.0,
+}
+
+
+def launch_setup(context, *args, **kwargs):
+    robot_ip                      = LaunchConfiguration("robot_ip")
+    use_fake_hardware             = LaunchConfiguration("use_fake_hardware")
+    gripper_max_velocity          = LaunchConfiguration("gripper_max_velocity")
+    gripper_max_force             = LaunchConfiguration("gripper_max_force")
+    launch_rviz                   = LaunchConfiguration("launch_rviz")
+    use_sim_time                  = LaunchConfiguration("use_sim_time")
+    use_internal_bus_gripper_comm = LaunchConfiguration("use_internal_bus_gripper_comm")
+    use_octomap                   = LaunchConfiguration("use_octomap")
+
+    launch_arguments = {
+        "robot_ip":                      robot_ip,
+        "use_fake_hardware":             use_fake_hardware,
+        "gripper":                       "robotiq_2f_140",
+        "vision":                        "true",
+        "gripper_joint_name":            "finger_joint",
+        "dof":                           "7",
+        "gripper_max_velocity":          gripper_max_velocity,
+        "gripper_max_force":             gripper_max_force,
+        "use_internal_bus_gripper_comm": use_internal_bus_gripper_comm,
+    }
+
+    moveit_config = (
+        MoveItConfigsBuilder(
+            "gen3",
+            package_name="kinova_gen3_7dof_robotiq_2f_140_moveit_config",
+        )
+        .robot_description(mappings=launch_arguments)
+        .trajectory_execution(file_path="config/moveit_controllers.yaml")
+        .planning_scene_monitor(
+            publish_robot_description=True,
+            publish_robot_description_semantic=True,
+        )
+        # ── FIX: Added OMPL as primary planner + Pilz as fallback ──────────────
+        # Previously only Pilz was loaded.  Pilz is strict about IK reachability
+        # and start-state consistency; on real hardware these checks can cause
+        # silent planning failures that never occur in simulation.
+        # OMPL is tolerant and will find alternative paths automatically.
+        .planning_pipelines(pipelines=["ompl", "pilz_industrial_motion_planner"])
+        .to_moveit_configs()
+    )
+
+    moveit_config.moveit_cpp.update(
+        {"use_sim_time": use_sim_time.perform(context) == "true"}
+    )
+
+    # ── Choose sensor / octomap config based on use_octomap arg ────────────────
+    octomap_enabled = use_octomap.perform(context) == "true"
+    active_sensors_cfg = SENSORS_3D         if octomap_enabled else SENSORS_3D_DISABLED
+    active_octomap_cfg = OCTOMAP_CONFIG     if octomap_enabled else OCTOMAP_CONFIG_DISABLED
+
+    # ── ROS2 control ────────────────────────────────────────────────────────────
+    ros2_controllers_path = os.path.join(
+        get_package_share_directory(
+            "kinova_gen3_7dof_robotiq_2f_140_moveit_config"
+        ),
+        "config",
+        "ros2_controllers.yaml",
+    )
+
+    ros2_control_node = Node(
+        package="controller_manager",
+        executable="ros2_control_node",
+        parameters=[ros2_controllers_path],
+        remappings=[("/controller_manager/robot_description", "/robot_description")],
+        output="both",
+    )
+
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        output="both",
+        parameters=[moveit_config.robot_description],
+    )
+
+    joint_state_broadcaster_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[
+            "joint_state_broadcaster",
+            "--controller-manager", "/controller_manager",
+        ],
+    )
+
+    robot_traj_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["joint_trajectory_controller", "-c", "/controller_manager"],
+    )
+
+    # ── FIX: twist_controller spawned inactive — verified intentional ───────────
+    # This controller must stay INACTIVE while joint_trajectory_controller is
+    # running.  On real hardware an accidental activation causes a controller
+    # conflict that silently blocks all trajectory execution.
+    # Debug with:  ros2 control list_controllers
+    # Expected:    joint_trajectory_controller  active
+    #              twist_controller             inactive
+    robot_pos_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["twist_controller", "--inactive", "-c", "/controller_manager"],
+    )
+
+    robot_hand_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["robotiq_gripper_controller", "-c", "/controller_manager"],
+    )
+
+    # ── FIX: fault_controller — real hardware only (unchanged) ─────────────────
+    # If the robot has a latent fault (e-stop, joint-limit breach, power issue)
+    # this controller will reflect it.  Check after launch:
+    #   ros2 topic echo /fault_controller/status
+    fault_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["fault_controller", "-c", "/controller_manager"],
+        condition=UnlessCondition(use_fake_hardware),
+    )
+
+    # ── MoveIt2 (Octomap conditionally enabled) ─────────────────────────────────
+    move_group_node = Node(
+        package="moveit_ros_move_group",
+        executable="move_group",
+        output="screen",
+        parameters=[
+            moveit_config.to_dict(),
+            active_sensors_cfg,    # empty dict when octomap disabled
+            active_octomap_cfg,    # zero max_range when octomap disabled
+        ],
+    )
+
+    # ── TF tree ─────────────────────────────────────────────────────────────────
+    # world → base_link  (identity — fixed robot, world IS base_link)
+    static_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_transform_publisher",
+        output="log",
+        arguments=["--frame-id", "world", "--child-frame-id", "base_link"],
+    )
+
+    # base_link → global_camera_color_optical_frame  (hand-eye calibration result — Intel RealSense)
+    # ⚠️  UPDATE THESE 7 VALUES after every easy_handeye2 calibration run.
+    # Before updating, verify the quaternion is normalised:
+    #   python3 -c "import math; q=[0.6220,0.6099,-0.3475,-0.3469]; print(math.sqrt(sum(x**2 for x in q)))"
+    # Output must be ≈ 1.0.  A non-unit quaternion corrupts the whole TF tree
+    # and causes the robot to appear as an obstacle in its own collision scene.
+    calibration_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="calibration_tf_publisher",
+        output="log",
+        arguments=[
+            "--x",  "0.99",
+            "--y",  "-0.13",
+            "--z",  "0.77",
+            "--qx", "0.6220",
+            "--qy", "0.6099",
+            "--qz", "-0.3475",
+            "--qw", "-0.3469",
+            "--frame-id",       "base_link",
+            "--child-frame-id", "global_camera_color_optical_frame",
+        ],
+    )
+
+    # ── RViz ────────────────────────────────────────────────────────────────────
+    rviz_config_file = (
+        get_package_share_directory(
+            "kinova_gen3_7dof_robotiq_2f_140_moveit_config"
+        )
+        + "/config/moveit.rviz" if os.path.exists(
+            get_package_share_directory(
+                "kinova_gen3_7dof_robotiq_2f_140_moveit_config"
+            ) + "/config/moveit.rviz"
+        ) else "/tmp/moveit_simple.rviz"
+    )
+
+    rviz_node = Node(
+        package="rviz2",
+        condition=IfCondition(launch_rviz),
+        executable="rviz2",
+        name="rviz2_moveit",
+        output="log",
+        arguments=["-d", rviz_config_file],
+        parameters=[
+            moveit_config.robot_description,
+            moveit_config.robot_description_semantic,
+            moveit_config.robot_description_kinematics,
+            moveit_config.planning_pipelines,
+            moveit_config.joint_limits,
+        ],
+    )
+
+    delay_rviz_after_joint_state_broadcaster_spawner = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=joint_state_broadcaster_spawner,
+            on_exit=[rviz_node],
+        ),
+        condition=IfCondition(launch_rviz),
+    )
+
+    # ── Intel RealSense camera node ─────────────────────────────────────────────
+    # ⚠️  FIX: Added pointcloud.stream_filter:=2 and pointcloud.stream_index_filter:=0
+    # to enable RGB coloured point cloud (XYZRGB).
+    # Without this the camera publishes XYZ only which causes the perception
+    # node to fail with "Failed to find match for field 'rgb'".
+    realsense_node = Node(
+        package="realsense2_camera",
+        executable="realsense2_camera_node",
+        name="global_camera",
+        namespace="global_camera",
+        output="screen",
+        parameters=[{
+            "camera_name":                    "global_camera",   # fixes frame IDs → global_camera_color_optical_frame
+            "align_depth.enable":             True,
+            "pointcloud.enable":              True,
+            "pointcloud.stream_filter":       2,                 # 2 = color stream → enables RGB in point cloud
+            "pointcloud.stream_index_filter": 0,
+            "enable_sync":                    True,
+            "enable_color":                   True,
+            "enable_depth":                   True,
+            "publish_tf":                     False,             # TF handled by calibration_tf above
+        }],
+    )
+
+    depth_optical_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="depth_optical_tf_publisher",
+        output="log",
+        arguments=["--x","-0.015","--y","0.0","--z","0.0",
+                   "--qx","0.0","--qy","0.0","--qz","0.0","--qw","1.0",
+                   "--frame-id","global_camera_color_optical_frame",
+                   "--child-frame-id","global_camera_depth_optical_frame"],
+    )
+
+    nodes_to_start = [
+        # Core robot control
+        ros2_control_node,
+        robot_state_publisher,
+        joint_state_broadcaster_spawner,
+        robot_traj_controller_spawner,
+        robot_pos_controller_spawner,
+        robot_hand_controller_spawner,
+        fault_controller_spawner,
+        # MoveIt2 (octomap enabled/disabled via use_octomap arg)
+        move_group_node,
+        # TF tree
+        static_tf,
+        calibration_tf,
+        # Intel RealSense camera
+        realsense_node,
+        depth_optical_tf,
+        # RViz (conditional)
+        delay_rviz_after_joint_state_broadcaster_spawner,
+    ]
+
+    return nodes_to_start
+
+
+def generate_launch_description():
+    declared_arguments = [
+        DeclareLaunchArgument(
+            "robot_ip",
+            description="IP address by which the robot can be reached.",
+        ),
+        DeclareLaunchArgument(
+            "use_fake_hardware",
+            default_value="false",
+            description="Start robot with fake hardware mirroring command to its states.",
+        ),
+        DeclareLaunchArgument(
+            "gripper_max_velocity",
+            default_value="100.0",
+            description="Max velocity for gripper commands",
+        ),
+        DeclareLaunchArgument(
+            "gripper_max_force",
+            default_value="100.0",
+            description="Max force for gripper commands",
+        ),
+        DeclareLaunchArgument(
+            "use_internal_bus_gripper_comm",
+            default_value="true",
+            description="Use arm's internal gripper connection",
+        ),
+        DeclareLaunchArgument(
+            "use_external_cable",
+            default_value="false",
+            description="Max force for gripper commands",
+        ),
+        DeclareLaunchArgument(
+            "use_sim_time",
+            default_value="false",
+            description="Use simulated clock",
+        ),
+        DeclareLaunchArgument(
+            "launch_rviz",
+            default_value="true",
+            description="Launch RViz?",
+        ),
+        # ── NEW: octomap guard ──────────────────────────────────────────────────
+        # Default false — safe for first bring-up on real hardware.
+        # Enable ONLY after verifying hand-eye calibration is accurate and the
+        # robot arm does NOT appear as an obstacle in the RViz collision scene.
+        # Usage:  ros2 launch ... use_octomap:=true
+        DeclareLaunchArgument(
+            "use_octomap",
+            default_value="false",
+            description=(
+                "Enable RealSense point cloud octomap for collision avoidance. "
+                "Set true only after verifying hand-eye calibration — a bad TF "
+                "will make the robot see itself as an obstacle and refuse all plans."
+            ),
+        ),
+    ]
+
+    return LaunchDescription(
+        declared_arguments + [OpaqueFunction(function=launch_setup)]
+    )

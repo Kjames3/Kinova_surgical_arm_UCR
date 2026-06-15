@@ -1,0 +1,13 @@
+# Place at:
+# src/ros2_kortex/kortex_moveit_config/kinova_gen3_7dof_robotiq_2f_140_moveit_config/config/trajectory_execution.yaml
+#
+# Then in robot.launch.py replace the tempfile approach with:
+#   _traj_exec_path = os.path.join(
+#       get_package_share_directory("kinova_gen3_7dof_robotiq_2f_140_moveit_config"),
+#       "config", "trajectory_execution.yaml")
+#   parameters=[moveit_config.to_dict(), _traj_exec_path],
+trajectory_execution:
+  allowed_execution_duration_scaling: 2.0
+  allowed_goal_duration_margin: 5.0
+  allowed_start_tolerance: 0.05
+  execution_duration_monitoring: true

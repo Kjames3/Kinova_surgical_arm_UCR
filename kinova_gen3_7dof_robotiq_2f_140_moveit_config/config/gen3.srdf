@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="gen3">
+
+  <!-- ── Planning group ──────────────────────────────────────────────── -->
+  <group name="manipulator">
+    <!-- tip_link = pen_tip so KDL IK targets the writing tip directly.
+         pen_tip is the virtual TCP defined in thesis_ee_macro.xacro. -->
+    <chain base_link="base_link" tip_link="pen_tip"/>
+  </group>
+
+  <!-- ── Named states ────────────────────────────────────────────────── -->
+  <group_state name="Home" group="manipulator">
+    <joint name="joint_1" value="0"/>
+    <joint name="joint_2" value="0.26"/>
+    <joint name="joint_3" value="3.14"/>
+    <joint name="joint_4" value="-2.0"/>
+    <joint name="joint_5" value="0"/>
+    <joint name="joint_6" value="-0.93"/>
+    <joint name="joint_7" value="1.57"/>
+  </group_state>
+  <group_state name="Retract" group="manipulator">
+    <joint name="joint_1" value="0"/>
+    <joint name="joint_2" value="-0.35"/>
+    <joint name="joint_3" value="3.14"/>
+    <joint name="joint_4" value="-2.44"/>
+    <joint name="joint_5" value="0"/>
+    <joint name="joint_6" value="-0.87"/>
+    <joint name="joint_7" value="1.57"/>
+  </group_state>
+  <group_state name="Vertical" group="manipulator">
+    <joint name="joint_1" value="0"/>
+    <joint name="joint_2" value="0"/>
+    <joint name="joint_3" value="0"/>
+    <joint name="joint_4" value="0"/>
+    <joint name="joint_5" value="0"/>
+    <joint name="joint_6" value="0"/>
+    <joint name="joint_7" value="0"/>
+  </group_state>
+
+  <!-- ── Collision disables: arm self-collisions ─────────────────────── -->
+  <disable_collisions link1="base_link"             link2="forearm_link"           reason="Never"/>
+  <disable_collisions link1="base_link"             link2="half_arm_1_link"        reason="Never"/>
+  <disable_collisions link1="base_link"             link2="half_arm_2_link"        reason="Never"/>
+  <disable_collisions link1="base_link"             link2="shoulder_link"          reason="Adjacent"/>
+  <disable_collisions link1="bracelet_link"         link2="forearm_link"           reason="Never"/>
+  <disable_collisions link1="bracelet_link"         link2="half_arm_2_link"        reason="Never"/>
+  <disable_collisions link1="bracelet_link"         link2="spherical_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="bracelet_link"         link2="spherical_wrist_2_link" reason="Adjacent"/>
+  <disable_collisions link1="forearm_link"          link2="half_arm_1_link"        reason="Never"/>
+  <disable_collisions link1="forearm_link"          link2="half_arm_2_link"        reason="Adjacent"/>
+  <disable_collisions link1="forearm_link"          link2="shoulder_link"          reason="Never"/>
+  <disable_collisions link1="forearm_link"          link2="spherical_wrist_1_link" reason="Adjacent"/>
+  <disable_collisions link1="forearm_link"          link2="spherical_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="half_arm_1_link"       link2="half_arm_2_link"        reason="Adjacent"/>
+  <disable_collisions link1="half_arm_1_link"       link2="shoulder_link"          reason="Adjacent"/>
+  <disable_collisions link1="half_arm_1_link"       link2="spherical_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="half_arm_2_link"       link2="shoulder_link"          reason="Never"/>
+  <disable_collisions link1="half_arm_2_link"       link2="spherical_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="half_arm_2_link"       link2="spherical_wrist_2_link" reason="Never"/>
+  <disable_collisions link1="shoulder_link"         link2="spherical_wrist_1_link" reason="Never"/>
+  <disable_collisions link1="spherical_wrist_1_link" link2="spherical_wrist_2_link" reason="Adjacent"/>
+
+  <!-- ── Collision disables: thesis_ee with arm ──────────────────────── -->
+  <!-- thesis_ee mounts directly on bracelet_link via end_effector_link -->
+  <disable_collisions link1="bracelet_link"          link2="thesis_ee" reason="Adjacent"/>
+  <disable_collisions link1="spherical_wrist_1_link" link2="thesis_ee" reason="Never"/>
+  <disable_collisions link1="spherical_wrist_2_link" link2="thesis_ee" reason="Never"/>
+  <disable_collisions link1="forearm_link"           link2="thesis_ee" reason="Never"/>
+  <disable_collisions link1="half_arm_2_link"        link2="thesis_ee" reason="Never"/>
+  <!-- These two were missing and caused collision errors during planning: -->
+  <disable_collisions link1="half_arm_1_link"        link2="thesis_ee" reason="Never"/>
+  <disable_collisions link1="shoulder_link"          link2="thesis_ee" reason="Never"/>
+  <disable_collisions link1="base_link"              link2="thesis_ee" reason="Never"/>
+
+</robot>

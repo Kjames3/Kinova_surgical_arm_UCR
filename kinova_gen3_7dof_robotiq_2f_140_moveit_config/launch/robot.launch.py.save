@@ -1,0 +1,321 @@
+# Copyright (c) 2023 PickNik, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+
+import os
+
+from launch import LaunchDescription
+from launch.substitutions import LaunchConfiguration
+from launch.actions import (
+    ExecuteProcess,
+    DeclareLaunchArgument,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
+from launch.event_handlers import OnProcessExit
+from launch.conditions import IfCondition, UnlessCondition
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+from moveit_configs_utils import MoveItConfigsBuilder
+
+# ── Name reference — every string here must match across all nodes ─────────────
+# world frame        : "world"
+# robot base frame   : "base_link"          ← world=base_link for fixed robot (identity)
+# robot EE frame     : "tool_frame"         ← MoveIt2 planning target
+# camera body frame  : "global_camera_link" ← calibration_tf publishes base_link→global_camera_link
+# color topic        : /global_camera/color/image_raw
+# color info topic   : /global_camera/color/camera_info
+
+# point cloud topic  : /global_camera/stereo/points  ← used by octomap + sensors_3d.yaml
+# joint states topic : /joint_states
+#
+# NOTE: ArUco removed — hand-eye calibration uses ChArUco board via easy_handeye2.
+# Run calibration separately:
+#   Terminal 1: python3 oak_camera_node.py
+#   Terminal 2: ros2 launch easy_handeye2 calibrate.launch.py \
+#                 eye_on_hand:=false \
+#                 robot_base_frame:=base_link \
+#                 robot_effector_frame:=tool_frame \
+#                 tracking_base_frame:=global_camera_link \
+#                 tracking_marker_frame:=charuco_board
+# ───────────────────────────────────────────────────────────────────────────────
+
+# ── Octomap / 3-D sensor config ─────────────────────────────────────────────────
+# Passed directly to move_group so no separate sensors_3d.yaml file is needed.
+# The OAK-D Pro Wide point cloud is published on /global_camera/stereo/points
+# at frame_id = global_camera_link.
+SENSORS_3D = {
+    "sensors": ["oak_pointcloud"],
+    "oak_pointcloud": {
+        "sensor_plugin":        "occupancy_map_monitor/PointCloudOctomapUpdater",
+        "point_cloud_topic":    "/global_camera/stereo/points",
+        "max_range":            3.0,          # metres — matches oak_camera_node.py z < 3.0
+        "min_sensor_noise":     0.01,
+        "padding_offset":       0.01,
+        "padding_scale":        1.0,
+        "point_subsample":      1,
+        "filtered_cloud_topic": "/global_camera/stereo/points_filtered",
+    },
+}
+
+OCTOMAP_CONFIG = {
+    "octomap_frame":      "world",    # octomap is built in world frame
+    "octomap_resolution": 0.05,       # 5 cm voxels — good balance speed vs detail
+    "max_range":          3.0,        # same as sensor max_range above
+}
+
+
+def launch_setup(context, *args, **kwargs):
+    robot_ip                      = LaunchConfiguration("robot_ip")
+    use_fake_hardware             = LaunchConfiguration("use_fake_hardware")
+    gripper_max_velocity          = LaunchConfiguration("gripper_max_velocity")
+    gripper_max_force             = LaunchConfiguration("gripper_max_force")
+    launch_rviz                   = LaunchConfiguration("launch_rviz")
+    use_sim_time                  = LaunchConfiguration("use_sim_time")
+    use_internal_bus_gripper_comm = LaunchConfiguration("use_internal_bus_gripper_comm")
+
+    launch_arguments = {
+        "robot_ip":                     robot_ip,
+        "use_fake_hardware":            use_fake_hardware,
+        "gripper":                      "robotiq_2f_140",
+        "vision":                       "true",
+        "gripper_joint_name":           "finger_joint",
+        "dof":                          "7",
+        "gripper_max_velocity":         gripper_max_velocity,
+        "gripper_max_force":            gripper_max_force,
+        "use_internal_bus_gripper_comm": use_internal_bus_gripper_comm,
+    }
+
+    moveit_config = (
+        MoveItConfigsBuilder(
+            "gen3",
+            package_name="kinova_gen3_7dof_robotiq_2f_140_moveit_config",
+        )
+        .robot_description(mappings=launch_arguments)
+        .trajectory_execution(file_path="config/moveit_controllers.yaml")
+        .planning_scene_monitor(
+            publish_robot_description=True,
+            publish_robot_description_semantic=True,
+        )
+        .planning_pipelines(pipelines=["pilz_industrial_motion_planner"])
+        .to_moveit_configs()
+    )
+
+    moveit_config.moveit_cpp.update(
+        {"use_sim_time": use_sim_time.perform(context) == "true"}
+    )
+
+    # ── ROS2 control ────────────────────────────────────────────────────────────
+    ros2_controllers_path = os.path.join(
+        get_package_share_directory(
+            "kinova_gen3_7dof_robotiq_2f_140_moveit_config"
+        ),
+        "config",
+        "ros2_controllers.yaml",
+    )
+
+    ros2_control_node = Node(
+        package="controller_manager",
+        executable="ros2_control_node",
+        parameters=[ros2_controllers_path],
+        remappings=[("/controller_manager/robot_description", "/robot_description")],
+        output="both",
+    )
+
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        output="both",
+        parameters=[moveit_config.robot_description],
+    )
+
+    joint_state_broadcaster_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[
+            "joint_state_broadcaster",
+            "--controller-manager", "/controller_manager",
+        ],
+    )
+
+    robot_traj_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["joint_trajectory_controller", "-c", "/controller_manager"],
+    )
+
+    robot_pos_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["twist_controller", "--inactive", "-c", "/controller_manager"],
+    )
+
+    robot_hand_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["robotiq_gripper_controller", "-c", "/controller_manager"],
+    )
+
+    fault_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["fault_controller", "-c", "/controller_manager"],
+        condition=UnlessCondition(use_fake_hardware),
+    )
+
+    # ── MoveIt2 with Octomap ─────────────────────────────────────────────────────
+    # Merging octomap + sensor config directly into move_group parameters so
+    # MoveIt2 uses /global_camera/stereo/points for collision avoidance.
+    move_group_node = Node(
+        package="moveit_ros_move_group",
+        executable="move_group",
+        output="screen",
+        parameters=[
+            moveit_config.to_dict(),
+            SENSORS_3D,
+            OCTOMAP_CONFIG,
+        ],
+    )
+
+    # ── TF tree ─────────────────────────────────────────────────────────────────
+    # world → base_link
+    # For a fixed-base robot, world and base_link are the same frame (identity).
+    # The robot base IS the world origin — all EEF poses and camera transforms
+    # are expressed relative to base_link at (0, 0, 0).
+    static_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_transform_publisher",
+        output="log",
+        arguments=["--frame-id", "world", "--child-frame-id", "base_link"],
+    )
+
+    # base_link → global_camera_link  (hand-eye calibration result)
+    # ⚠️  UPDATE THESE 7 VALUES after every easy_handeye2 calibration run
+    calibration_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="calibration_tf_publisher",
+        output="log",
+        arguments=[
+            "--x",  "0.362562",
+            "--y",  "0.719192",
+            "--z",  "1.279846",
+            "--qx", "-0.341494",
+            "--qy", "-0.888985",
+            "--qz", "0.299234",
+            "--qw", "0.059552",
+            "--frame-id",       "base_link",
+            "--child-frame-id", "global_camera_link",   # must match oak_camera_node.py FRAME_ID
+        ],
+    )
+
+    # ── RViz ────────────────────────────────────────────────────────────────────
+    rviz_config_file = (
+        get_package_share_directory(
+            "kinova_gen3_7dof_robotiq_2f_140_moveit_config"
+        )
+        + "/config/moveit.rviz" if os.path.exists(
+            get_package_share_directory(
+                "kinova_gen3_7dof_robotiq_2f_140_moveit_config"
+            ) + "/config/moveit.rviz"
+        ) else "/tmp/moveit_simple.rviz"
+    )
+
+    rviz_node = Node(
+        package="rviz2",
+        condition=IfCondition(launch_rviz),
+        executable="rviz2",
+        name="rviz2_moveit",
+        output="log",
+        arguments=["-d", rviz_config_file],
+        parameters=[
+            moveit_config.robot_description,
+            moveit_config.robot_description_semantic,
+            moveit_config.robot_description_kinematics,
+            moveit_config.planning_pipelines,
+            moveit_config.joint_limits,
+        ],
+    )
+
+    delay_rviz_after_joint_state_broadcaster_spawner = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=joint_state_broadcaster_spawner,
+            on_exit=[rviz_node],
+        ),
+        condition=IfCondition(launch_rviz),
+    )
+
+    nodes_to_start = [
+        # Core robot control
+        ros2_control_node,
+        robot_state_publisher,
+        joint_state_broadcaster_spawner,
+        robot_traj_controller_spawner,
+        robot_pos_controller_spawner,
+        robot_hand_controller_spawner,
+        fault_controller_spawner,
+        # MoveIt2 (with octomap for pointcloud collision avoidance)
+        move_group_node,
+        # TF tree
+        static_tf,
+        calibration_tf,
+        # RViz (conditional)
+        delay_rviz_after_joint_state_broadcaster_spawner,
+        # NOTE: oak_camera_node is intentionally NOT here.
+        # Run it separately: python3 oak_camera_node.py
+        # Having it here AND running it manually = ALREADY_IN_USE error
+        # and CPU spikes that cause RT timeout errors on the robot.
+    ]
+
+    return nodes_to_start
+
+
+def generate_launch_description():
+    declared_arguments = [
+        DeclareLaunchArgument(
+            "robot_ip",
+            description="IP address by which the robot can be reached.",
+        ),
+        DeclareLaunchArgument(
+            "use_fake_hardware",
+            default_value="false",
+            description="Start robot with fake hardware mirroring command to its states.",
+        ),
+        DeclareLaunchArgument(
+            "gripper_max_velocity",
+            default_value="100.0",
+            description="Max velocity for gripper commands",
+        ),
+        DeclareLaunchArgument(
+            "gripper_max_force",
+            default_value="100.0",
+            description="Max force for gripper commands",
+        ),
+        DeclareLaunchArgument(
+            "use_internal_bus_gripper_comm",
+            default_value="true",
+            description="Use arm's internal gripper connection",
+        ),
+        DeclareLaunchArgument(
+            "use_external_cable",
+            default_value="false",
+            description="Max force for gripper commands",
+        ),
+        DeclareLaunchArgument(
+            "use_sim_time",
+            default_value="false",
+            description="Use simulated clock",
+        ),
+        DeclareLaunchArgument(
+            "launch_rviz",
+            default_value="true",
+            description="Launch RViz?",
+        ),
+    ]
+
+    return LaunchDescription(
+        declared_arguments + [OpaqueFunction(function=launch_setup)]
+    )

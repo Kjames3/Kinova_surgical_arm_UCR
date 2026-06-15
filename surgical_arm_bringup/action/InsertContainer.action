@@ -1,0 +1,28 @@
+# InsertContainer.action
+# Place at: kortex_bringup/action/InsertContainer.action
+# Then add to kortex_bringup/CMakeLists.txt:
+#   rosidl_generate_interfaces(${PROJECT_NAME}
+#     "action/InsertContainer.action"
+#     DEPENDENCIES builtin_interfaces
+#   )
+# And to package.xml:
+#   <build_depend>rosidl_default_generators</build_depend>
+#   <exec_depend>rosidl_default_runtime</exec_depend>
+#   <member_of_group>rosidl_interface_packages</member_of_group>
+# Then rebuild: colcon build --packages-select kortex_bringup --symlink-install
+
+# ── Goal (sent by calling script) ─────────────────────────────────────────
+float64 target_x          # container centre X in world frame [m]
+float64 target_y          # container centre Y in world frame [m]
+float64 hover_above_top   # how far above container top to hover [m] (default 0.03)
+bool    dry_run           # plan but do not move arm
+bool    skip_home_move    # skip the home move pre-phase
+---
+# ── Result (returned on completion/failure) ────────────────────────────────
+bool   success
+string message            # human-readable status or error description
+---
+# ── Feedback (published during execution) ─────────────────────────────────
+string  current_phase     # "home_move" | "preflight" | "approach" |
+                          # "descend" | "hold" | "ascend" | "return" | "complete"
+float64 progress          # 0.0 to 1.0

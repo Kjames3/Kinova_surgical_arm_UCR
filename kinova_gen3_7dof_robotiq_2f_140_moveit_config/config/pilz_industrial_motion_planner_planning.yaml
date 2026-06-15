@@ -1,0 +1,52 @@
+planning_plugin: pilz_industrial_motion_planner/CommandPlanner
+default_planner_config: PTP
+capabilities: >-
+  pilz_industrial_motion_planner/MoveGroupSequenceAction
+  pilz_industrial_motion_planner/MoveGroupSequenceService
+
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1
+
+cartesian_limits:
+  max_trans_vel: 1.0
+  max_trans_acc: 2.25
+  max_trans_dec: -5.0
+  max_rot_vel: 1.57
+
+joint_limits:
+  joint_1:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  joint_2:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  joint_3:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  joint_4:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  joint_5:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  joint_6:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  joint_7:
+    max_position: 2.88
+    min_position: -2.88
+    max_velocity: 1.0
+    max_acceleration: 1.0
+  # finger_joint removed — thesis_ee has no movable gripper joints
