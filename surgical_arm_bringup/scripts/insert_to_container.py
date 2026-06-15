@@ -1,95 +1,79 @@
 #!/usr/bin/env python3
 """
-Insert the assembly tip into the center of the glass container.
+angled_insert.py — Rotate the assembly tip about its own point then descend
+                   at the computed angle to reach a target inside the container.
 
-The glass container is 50 cm in front of the robot base and 20 cm to its left.
-The goal is to position the assembly_tip (physical TCP of the writing assembly)
-at the container's centre axis, hover_above_top metres above the container top,
-while keeping the assembly vertical (tip-down orientation).
+Overview
+--------
+The script takes the container centre position and a user-specified target
+point INSIDE the container (given in mm from the container centre).  It then:
 
-TCP frame: assembly_tip  (fixed joint from bracelet_link, offset=-0.027,0,-0.414 m)
-EE frame:  bracelet_link (live TF frame — end_effector_link is URDF-static only)
+  Phase 0 — Approach (Pilz PTP)
+    Navigate assembly_tip to hover position directly above container centre,
+    same as insert_to_container.py Phase 0.
 
-Four-phase operation
---------------------
-Phase 0 — Approach (Pilz PTP)
-  Navigate to assembly_tip at (target_x, target_y, ready_z) with orientation locked.
-  ready_z = container_top + approach_clearance ≈ home tip height (no Z descent during PTP).
+  Phase 1 — Descend vertical (Pilz LIN)
+    Drop straight down to hover_z (just above container top), tip still vertical.
 
-Phase 1 — Descend (Pilz LIN)
-  Straight-line TCP descent from ready_z to hover_target. Orientation locked.
-  Equivalent to Xbox controller twist-linear mode.
+  Phase 2 — Compute tilt geometry
+    From the hover position and target point, calculate:
+      azimuth  : compass direction to tilt toward (rotation about world Z)
+      tilt     : angle from vertical (0° = straight down, 30° max)
+      descent  : straight-line distance from hover_z to target
 
-Phase 2 — Hold
-  Remain at hover position for post_insert_wait seconds.
+  Phase 3 — CIRC rotation about tip (Pilz CIRC)
+    Rotate the EE in a circular arc that keeps assembly_tip FIXED at hover_z
+    while the wrist reorients to the computed tilt + azimuth.
+    The via-point is at half the rotation angle (required by Pilz CIRC).
 
-Phase 2.5 — Ascend (Pilz LIN)
-  Retract straight back up to ready_z.
+  Phase 4 — Angled descent (Pilz LIN along new tool axis)
+    Descend in a straight line along the tilted tool axis from hover_z to
+    the target point.  Distance = computed descent length.
 
-Phase 3 — Return (Pilz PTP)
-  Return to the joint configuration captured at startup.
+  Phase 5 — Hold
+    Wait for user to press Enter.
 
+  Phase 6 — Reverse (Phases 4→3 in reverse order)
+    Ascend along tool axis back to hover_z.
+    CIRC arc back to vertical orientation.
 
-Phase 1 — Descend (Cartesian)
-  Move straight down from the approach height into the container to the
-  insert depth (insert_depth_from_top below the container's top surface).
-  Dense waypoints + jump threshold prevent joint flips.
+  Phase 7 — Ascend vertical + Return
+    LIN back to approach height, PTP return to home joints.
 
-Phase 2 — Hold at insert position
-  Remain at the insert position for post_insert_wait seconds.
-  (Extend this phase later for fluid dispensing.)
+Coordinate convention for target point
+---------------------------------------
+The user specifies the target in millimetres from the container centre:
+  offset_x_mm : + = away from robot base  (world +X direction)
+  offset_y_mm : + = left, - = right        (world +Y direction)
+  depth_mm    : depth below container top  (always positive, converted to -Z)
 
-Phase 2.5 — Ascend (Cartesian)
-  Retract straight back up to the approach height.
+Container dimensions: 90 × 90 × 86 mm.  The target must be within:
+  |offset_x| ≤ 40 mm, |offset_y| ≤ 40 mm (inner radius with 5 mm wall margin)
+  0 < depth ≤ 80 mm
 
-Phase 3 — Return (OMPL)
-  Return to the joint configuration captured at startup.
-
-Parameters
-----------
-  target_x              (float, default 0.50)  : container centre X in world frame
-                                                  (50 cm in front of robot base)
-  target_y              (float, default -0.20) : container centre Y in world frame
-                                                  (20 cm to the left from operator's perspective facing the robot)
-  table_z               (float, default -0.03) : table surface Z in world frame
-  container_height      (float, default 0.10)  : height of the glass container [m]
-                                                  Measure and set before running.
-  insert_depth_from_top (float, default 0.010) : how far below the container's
-                                                  top surface to insert the tip [m]
-  approach_clearance    (float, default 0.05)  : approach height above container
-                                                  top before descending [m]
-  post_insert_wait      (float, default 2.0)   : seconds to hold at insert position
-
-  tip_ee_offset_x       (float, default -0.11726) : x-component of EE→pen_tip
-  tip_ee_offset_y       (float, default  0.32815) : y-component (negated joint xyz)
-  tip_ee_offset_z       (float, default  0.00288) : z-component
-                          These represent the vector from pen_tip back to EE origin,
-                          expressed in EE frame:  -pen_tip_joint_xyz.
-                          Update if the pen_tip joint offset changes in the URDF.
-
-  execute_motion        (bool,  default false) : false = dry-run | true = MOVES ARM
-  return_to_start       (bool,  default true)  : return to start joints after insert
-  max_velocity_scaling  (float, default 0.08)  : joint velocity limit fraction 0-1
-  tip_link              (str,   default pen_tip)
-  ee_link               (str,   default end_effector_link)
-  world_frame           (str,   default world)
-  move_group_name       (str,   default manipulator)
-  pen_down_qx/y/z/w     Pen-vertical quaternion (world -> end_effector_link).
-                         Re-measure with: ros2 run tf2_ros tf2_echo world end_effector_link
-  vertical_tilt_tol     (float, default 0.05)  : orientation tolerance [rad]
-  joint_delta_rad       (float, default 1.2)   : OMPL path constraint half-width [rad]
-  descend_step          (float, default 0.01)  : vertical waypoint spacing [m]
-  descend_jump_threshold(float, default 3.0)   : max joint delta between IK samples [rad]
-  add_pole_collision    (bool,  default false) : add pole to scene before planning
-  pole_x/y/radius/height                       : pole parameters (if add_pole_collision)
+Safety limits
+-------------
+  MAX_TILT_DEG = 25°  — beyond this the tool may hit the container wall
+  The script checks wall clearance at the target depth before executing.
 
 Usage
 -----
-  ros2 run surgical_arm_bringup insert_to_container.py                      # dry-run
-  ros2 run surgical_arm_bringup insert_to_container.py \\
-      --ros-args -p execute_motion:=true                              # MOVES ARM
-  ros2 run surgical_arm_bringup insert_to_container.py \\
-      --ros-args -p execute_motion:=true -p container_height:=0.085  # set container height
+  ros2 run surgical_arm_bringup angled_insert.py \\
+      --ros-args -p real_robot:=true -p execute_motion:=true \\
+      -p skip_home_move:=true
+
+  # Specify target at launch (mm from container centre, depth below top):
+  ros2 run surgical_arm_bringup angled_insert.py \\
+      --ros-args -p real_robot:=true -p execute_motion:=true \\
+      -p skip_home_move:=true \\
+      -p target_offset_x_mm:=10.0 \\
+      -p target_offset_y_mm:=-15.0 \\
+      -p target_depth_mm:=40.0
+
+  # Or use interactive prompt (default):
+  ros2 run surgical_arm_bringup angled_insert.py \\
+      --ros-args -p real_robot:=true -p execute_motion:=true \\
+      -p skip_home_move:=true -p interactive_target:=true
 """
 
 import math
@@ -98,7 +82,7 @@ import signal
 import sys
 import threading
 import time
-import concurrent.futures
+import subprocess
 
 import rclpy
 import rclpy.time
@@ -106,17 +90,20 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import CollisionObject
 from shape_msgs.msg import SolidPrimitive
-from rclpy.duration import Duration as RclpyDuration
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 
+try:
+    from surgical_arm_bringup.action import InsertContainer
+    _HAS_ACTION_INTERFACE = True
+except ImportError:
+    _HAS_ACTION_INTERFACE = False
+
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import JointState
-from std_msgs.msg import ColorRGBA
-from visualization_msgs.msg import Marker, MarkerArray
-from moveit_msgs.srv import GetCartesianPath, GetMotionPlan, ApplyPlanningScene
+from moveit_msgs.srv import GetMotionPlan
 from moveit_msgs.action import ExecuteTrajectory
 from builtin_interfaces.msg import Duration as RosDuration
 from control_msgs.action import FollowJointTrajectory
@@ -125,281 +112,273 @@ from moveit_msgs.msg import (
     RobotState, Constraints, OrientationConstraint,
     MotionPlanRequest, WorkspaceParameters,
     PositionConstraint, BoundingVolume, JointConstraint,
-    RobotTrajectory, PlanningScene, CollisionObject,
-    DisplayTrajectory,
+    RobotTrajectory,
 )
 from shape_msgs.msg import SolidPrimitive
 
-# Action interface — defined inline using a SimpleNamespace so no separate
-# .action file is required.  A calling script creates a goal dict and sends
-# it via the /insert_container ROS2 action topic.
-# For production use, generate a proper surgical_arm_bringup/action/InsertContainer.action.
-try:
-    from surgical_arm_bringup.action import InsertContainer
-    _HAS_ACTION_INTERFACE = True
-except ImportError:
-    _HAS_ACTION_INTERFACE = False
-
-
+# Re-use constants and helpers from insert_to_container
+# (assumes both scripts are in the same package)
 _GEN3_JOINTS = [
     "joint_1", "joint_2", "joint_3",
     "joint_4", "joint_5", "joint_6", "joint_7",
 ]
 
-# Home position — calibrated 2025-05-06, assembly_tip vertical to <0.5°.
-# RPY at home: (-0.000°, 0.403°, -0.038°) — essentially zero tilt.
-# assembly_tip world at home: (0.150, 0.001, 0.234)
-# Joint values remapped from /joint_states (topic order: j1,j2,j4,j5,j3,j6,j7).
 _GEN3_HOME_JOINTS = {
-    "joint_1":  0.0000,   #    0.0°
-    "joint_2": -0.3049,   #  -17.5°  shoulder raised for clearance
-    "joint_3": -3.1416,   # -180.0°  (note: negative, matches measured value)
-    "joint_4": -1.6607,   #  -95.2°
-    "joint_5":  0.0000,   #    0.0°
-    "joint_6": -1.7928,   # -102.7°  wrist tuned for vertical tip
-    "joint_7": -0.0006,   #    0.0°
+    "joint_1":  0.0000,
+    "joint_2": -0.3049,
+    "joint_3": -3.1416,
+    "joint_4": -1.6607,
+    "joint_5":  0.0000,
+    "joint_6": -1.7928,
+    "joint_7": -0.0006,
 }
 
-# Measured assembly tip offset from bracelet_link (in bracelet_link local frame).
-# Derived from: tip_z = bracelet_z + offset_z  (when arm points straight down)
-#   offset_z = table_z - bracelet_z_at_touch = -0.030 - 0.383 = -0.413 m
-#   offset_x ≈ -0.027 m (from 3.8° tilt × 0.413 m)
-#   offset_y ≈  0.000 m
-# Update the URDF assembly_tip joint xyz to these values and rebuild.
-# Then use: ros2 run tf2_ros tf2_echo world assembly_tip to verify.
-_ASSEMBLY_TIP_OFFSET = {
-    "x": -0.027,   # m — lateral offset due to bracelet tilt
-    "y":  0.000,   # m
-    "z": -0.414,   # m — main drop length (average of two measurements)
-}
+# Container physical dimensions (metres)
+CONTAINER_WIDTH_M  = 0.090   # 90 mm
+CONTAINER_HEIGHT_M = 0.086   # 86 mm
+CONTAINER_WALL_M   = 0.003   # 3 mm safety margin from inner wall
+CONTAINER_INNER_R  = (CONTAINER_WIDTH_M / 2.0) - CONTAINER_WALL_M  # 42 mm
 
+MAX_TILT_DEG = 25.0   # hard limit — beyond this hits the wall at shallow depths
 
-
+MAX_JOINT_VEL_RAD_S  = 0.8
+MAX_JOINT_ACC_RAD_S2 = 0.4
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Quaternion math helpers
+# Quaternion helpers (duplicated from insert_to_container for standalone use)
 # ---------------------------------------------------------------------------
 
-def _tip_to_ee_pose(tip_x, tip_y, tip_z, q_xyzw, ee_offset_xyz):
+def _quat_conjugate(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+def _quat_normalize(q):
+    n = math.sqrt(sum(v*v for v in q))
+    return tuple(v/n for v in q)
+
+def _quat_slerp(q0, q1, t):
+    """Spherical linear interpolation between two quaternions."""
+    dot = sum(a*b for a, b in zip(q0, q1))
+    # Ensure shortest path
+    if dot < 0.0:
+        q1 = tuple(-v for v in q1)
+        dot = -dot
+    dot = min(1.0, dot)
+    if dot > 0.9995:
+        # Linear interpolation for nearly identical quaternions
+        result = tuple(a + t*(b-a) for a, b in zip(q0, q1))
+        return _quat_normalize(result)
+    theta_0 = math.acos(dot)
+    theta   = theta_0 * t
+    sin_theta   = math.sin(theta)
+    sin_theta_0 = math.sin(theta_0)
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    return _quat_normalize(tuple(s0*a + s1*b for a, b in zip(q0, q1)))
+
+def _quat_from_axis_angle(axis_xyz, angle_rad):
+    """Build unit quaternion from rotation axis and angle."""
+    ax, ay, az = axis_xyz
+    n = math.sqrt(ax*ax + ay*ay + az*az)
+    if n < 1e-9:
+        return (0.0, 0.0, 0.0, 1.0)
+    ax, ay, az = ax/n, ay/n, az/n
+    s = math.sin(angle_rad / 2.0)
+    c = math.cos(angle_rad / 2.0)
+    return (ax*s, ay*s, az*s, c)
+
+def _tilt_quaternion(q_vertical, azimuth_rad, tilt_rad):
     """
-    Given a desired pen_tip world position and the EE quaternion
-    (world -> end_effector_link), return the end_effector_link origin in world.
+    Compute the new EE quaternion after tilting the tool axis by tilt_rad
+    toward azimuth_rad, starting from q_vertical (tool pointing straight down).
 
-    Geometry:
-      pen_tip = EE_origin + R * pen_tip_joint_xyz
-      => EE_origin = pen_tip - R * pen_tip_joint_xyz
-                   = pen_tip + R * ee_offset_xyz
+    The rotation is composed as two successive rotations applied to q_vertical:
+      1. Rotate about world Z by azimuth (point the tilt direction)
+      2. Rotate about the new X axis by tilt (lean the tool)
 
-    ee_offset_xyz = -pen_tip_joint_xyz (negated, in EE local frame).
-    IMPORTANT: these values must match your actual URDF pen_tip joint xyz.
-    Verify with: ros2 run tf2_ros tf2_echo end_effector_link pen_tip
-    The translation shown is pen_tip_joint_xyz; negate it for ee_offset_xyz.
+    This keeps the tip fixed while the wrist reorients.
     """
-    wx, wy, wz = rotate_vector_by_quat(ee_offset_xyz, q_xyzw)
-    return tip_x + wx, tip_y + wy, tip_z + wz
+    # Step 1: rotation about world Z by azimuth
+    q_az = _quat_from_axis_angle((0, 0, 1), azimuth_rad)
+    # Step 2: rotation about world X (after azimuth rotation) by tilt
+    # The tilt axis in world frame is perpendicular to azimuth in XY plane
+    tilt_ax = (-math.sin(azimuth_rad), math.cos(azimuth_rad), 0.0)
+    q_tilt  = _quat_from_axis_angle(tilt_ax, tilt_rad)
+    # Compose: q_new = q_tilt * q_az * q_vertical
+    q_new = quat_multiply(q_tilt, quat_multiply(q_az, q_vertical))
+    return _quat_normalize(q_new)
 
 
 # ---------------------------------------------------------------------------
+# Geometry: compute tilt from hover point to target
+# ---------------------------------------------------------------------------
 
-class ContainerInserter(Node):
+def compute_tilt_geometry(hover_xyz, target_xyz):
+    """
+    Given the hover position (tip directly above container centre) and
+    the target point inside the container, compute:
+
+      azimuth_rad  : rotation about world Z to face the target (0 = +X direction)
+      tilt_rad     : angle from vertical toward target (0 = straight down)
+      descent_m    : straight-line distance from hover to target
+      tool_axis    : unit vector pointing from hover to target (world frame)
+
+    Parameters
+    ----------
+    hover_xyz  : (x, y, z) world position of tip at hover height
+    target_xyz : (x, y, z) world position of target inside container
+
+    Returns dict with keys: azimuth_rad, tilt_rad, descent_m, tool_axis,
+                             dx, dy, dz, horizontal_m
+    """
+    dx = target_xyz[0] - hover_xyz[0]
+    dy = target_xyz[1] - hover_xyz[1]
+    dz = target_xyz[2] - hover_xyz[2]   # always negative (going down)
+
+    horizontal_m = math.sqrt(dx*dx + dy*dy)
+    descent_m    = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+    if descent_m < 1e-4:
+        return dict(azimuth_rad=0.0, tilt_rad=0.0, descent_m=0.0,
+                    tool_axis=(0.0, 0.0, -1.0),
+                    dx=dx, dy=dy, dz=dz, horizontal_m=0.0)
+
+    # Azimuth: direction of horizontal offset in XY plane
+    azimuth_rad = math.atan2(dy, dx)
+
+    # Tilt: angle from world -Z toward target
+    # dz is negative, so |dz| is the vertical drop
+    tilt_rad = math.atan2(horizontal_m, abs(dz))
+
+    # Unit vector pointing from hover to target
+    tool_axis = (dx/descent_m, dy/descent_m, dz/descent_m)
+
+    return dict(
+        azimuth_rad  = azimuth_rad,
+        tilt_rad     = tilt_rad,
+        descent_m    = descent_m,
+        tool_axis    = tool_axis,
+        dx=dx, dy=dy, dz=dz,
+        horizontal_m = horizontal_m,
+    )
+
+
+def check_wall_clearance(offset_x_m, offset_y_m, depth_m,
+                          tilt_rad, tip_radius_m=0.003):
+    """
+    Check that the tilted assembly does not hit the container wall.
+
+    At depth d below hover_z, the tip is offset (dx, dy) from centre.
+    The assembly body at depth d has an additional lateral offset from tilt:
+      lateral_at_depth = d * tan(tilt_rad)
+    This must not exceed inner_radius - tip_radius.
+
+    Returns (ok, message).
+    """
+    r_target = math.sqrt(offset_x_m**2 + offset_y_m**2)
+    if r_target > CONTAINER_INNER_R:
+        return False, (f"Target is {r_target*1000:.1f} mm from centre — "
+                       f"outside inner radius {CONTAINER_INNER_R*1000:.1f} mm")
+
+    if tilt_rad > math.radians(MAX_TILT_DEG):
+        return False, (f"Tilt {math.degrees(tilt_rad):.1f}° > "
+                       f"max {MAX_TILT_DEG}°")
+
+    # At full depth, the assembly body's lateral extent
+    lateral = depth_m * math.tan(tilt_rad)
+    effective_r = r_target + lateral + tip_radius_m
+    if effective_r > CONTAINER_INNER_R:
+        return False, (
+            f"Assembly hits wall at depth {depth_m*1000:.0f} mm: "
+            f"effective radius {effective_r*1000:.1f} mm > "
+            f"inner radius {CONTAINER_INNER_R*1000:.1f} mm.\n"
+            f"  Reduce offset or depth.")
+
+    return True, "OK"
+
+
+# ---------------------------------------------------------------------------
+# Main node
+# ---------------------------------------------------------------------------
+
+class AngledInserter(Node):
 
     def __init__(self):
-        super().__init__("container_inserter")
+        super().__init__("angled_inserter")
         self._cb_group = ReentrantCallbackGroup()
 
-        # --- Container target parameters ---
-        # Container position — measured 2025-05-06 with assembly_tip physically
-        # hovering 2cm above container centre while arm points down:
-        #   ros2 run tf2_ros tf2_echo world assembly_tip → (0.299, -0.192, 0.084)
-        # Container is 43cm forward and 20cm to the right of the robot base.
-        # Negative Y = right side from robot's perspective.
-        # Update these if the container is moved — jog tip over centre, re-echo.
-        self.declare_parameter("target_x",              0.299)
-        self.declare_parameter("target_y",             -0.192)
+        # Container position (same defaults as insert_to_container)
+        self.declare_parameter("container_x",          0.260)  # m, world frame
+        self.declare_parameter("container_y",          0.000)  # m, world frame
+        self.declare_parameter("table_z",             -0.030)  # m
+        self.declare_parameter("container_height",     0.086)  # m — 86 mm
+        self.declare_parameter("hover_above_top",      0.030)  # m above container top
 
-        # If true, prompt the user to enter container position in centimetres
-        # at runtime instead of using the target_x / target_y parameters above.
-        # The user types distances from the robot base:
-        #   forward (cm) : positive = away from robot  (becomes target_x in metres)
-        #   sideways (cm): negative = right, positive = left  (becomes target_y)
-        # Example: "43, -20" → target_x=0.430, target_y=-0.200
-        # This lets you reposition the container without restarting the script
-        # or passing command-line parameters each time.
-        self.declare_parameter("interactive_target",    False)
-        self.declare_parameter("table_z",              -0.03)   # table surface Z
-        # Container dimensions — physically measured:
-        #   Square 90mm × 90mm base, height 86mm.
-        #   container_top = table_z + container_height = -0.030 + 0.086 = 0.056 m
-        self.declare_parameter("container_height",      0.086)  # 86mm measured
+        # Approach height — must match home tip height minus container_top.
+        # Same rule as insert_to_container: ready_z ≈ home tip z.
+        self.declare_parameter("approach_clearance",   0.18)   # m above container top
 
-        # approach_clearance: calibrated from new level home position 2025-05-06.
-        #   home tip Z = 0.234 m, container_top = 0.056 m
-        #   clearance = 0.234 - 0.056 = 0.178 → 0.18
-        self.declare_parameter("approach_clearance",    0.18)
-        self.declare_parameter("insert_depth_from_top", 0.010)  # 10 mm from top
-        # approach_clearance: how far above container_top to position the tip
-        # before descending via Pilz LIN.
-        #
-        # MUST equal (home_tip_z - container_top) so ready_z matches the tip
-        # height at home — Phase 0b PTP then only moves XY with no Z descent.
-        #
-        # Calibrated from log 2025-05-06:
-        #   home tip Z    = 0.233 m  (from pre-flight log after home move)
-        #   container_top = table_z + container_height = -0.030 + 0.100 = 0.070 m
-        #   approach_clearance = 0.233 - 0.070 = 0.163 → rounded to 0.16
-        self.declare_parameter("hover_above_top",       0.025)
-        self.declare_parameter("lateral_rise",          0.20)
+        # Target point inside container (mm from container centre, depth from top)
+        # These are overridden by the interactive prompt when interactive_target=true.
+        self.declare_parameter("target_offset_x_mm",  10.0)    # +X = away from robot
+        self.declare_parameter("target_offset_y_mm",  -30.0)   # +Y = left, -Y = right
+        self.declare_parameter("target_depth_mm",     30.0)    # mm below container top
 
-        # --- Motion parameters ---
-        self.declare_parameter("post_insert_wait",     2.0)
+        # If true, prompt user to enter target in mm at runtime
+        self.declare_parameter("interactive_target",   False)
+
+        # Motion parameters
         self.declare_parameter("max_velocity_scaling", 0.15)
-        # transition_velocity_scaling: speed used for long-distance travel phases
-        # (Phase 0 approach PTP and Phase 3 return PTP/OMPL).  Kept separate from
-        # max_velocity_scaling so the physical insertion / retraction (Pilz LIN)
-        # always runs at the safe, slow vel_scale.
-        # Professor requested faster transitions — raise to 0.5 (50%) for approach
-        # and return while keeping insertion at max_velocity_scaling (15%).
-        self.declare_parameter("transition_velocity_scaling", 0.50)
         self.declare_parameter("execute_motion",       False)
+        self.declare_parameter("real_robot",           False)
+        self.declare_parameter("skip_home_move",       True)
         self.declare_parameter("return_to_start",      True)
-        # assembly_tip is the new measured TCP frame in the URDF.
-        # pen_tip has been removed from thesis_ee_macro.xacro.
-        # bracelet_link is the live EE TF frame (end_effector_link is URDF-static only).
+        self.declare_parameter("post_insert_wait",     2.0)
         self.declare_parameter("tip_link",             "assembly_tip")
         self.declare_parameter("ee_link",              "bracelet_link")
         self.declare_parameter("world_frame",          "world")
         self.declare_parameter("move_group_name",      "manipulator")
 
-        # Tip-vertical quaternion (world -> end_effector_link, assembly tip pointing straight down).
-        # EE +Y must point world +Z; exact value = RPY[90°,0°,90°] = (0.5, 0.5, 0.5, 0.5).
-        # Re-measure with: ros2 run tf2_ros tf2_echo world end_effector_link
-        # (run AFTER manually commanding arm to tip-down pose, not at ros2_control startup)
-        self.declare_parameter("pen_down_qx",  0.5)
-        self.declare_parameter("pen_down_qy",  0.5)
-        self.declare_parameter("pen_down_qz",  0.5)
-        self.declare_parameter("pen_down_qw",  0.5)
-        # If true, use the arm's CURRENT EE orientation as the pen-down target
-        # instead of the pen_down_qx/y/z/w parameters.
-        # Use this when the arm is already in the correct insertion orientation
-        # at startup — avoids the large reorientation move that causes joint_1
-        # to swing 177° to reach a different IK solution family.
-        # Measure the correct quaternion with:
-        #   ros2 run tf2_ros tf2_echo world end_effector_link
-        # then set pen_down_qx/y/z/w to those values and set this to false.
+        # use_current_orientation: use live EE quaternion as pen-down target
+        # (same meaning as insert_to_container — keep true unless you've
+        #  measured the exact pen-down quaternion separately)
         self.declare_parameter("use_current_orientation", True)
-        self.declare_parameter("vertical_tilt_tol", 0.05)
-        self.declare_parameter("joint_delta_rad",   1.2)
 
-        # Assembly tip offset from bracelet_link — calibrated 2025-05-06.
-        # Measured by touching tip to table and reading bracelet_link Z from TF:
-        #   offset_z = table_z - bracelet_z = -0.030 - 0.383 = -0.413 m
-        # Cross-checked at 20cm above table: -0.416 m (3mm error = acceptable)
-        # offset_x from 3.8° bracelet tilt × 0.414 m length = -0.027 m
-        # These are negated in the script (ee_offset = -pen_tip_joint_xyz):
-        #   tip_ee_offset_x = -(-0.027) = NOT applicable here — offset IS from bracelet
-        # For bracelet_link as ee_link, the offset vector IS the local tip position:
-        #   (x=-0.027, y=0.000, z=-0.414) in bracelet_link frame
-        # Since use_tf_offset=true reads this from live TF subtraction, these
-        # parameters are only used as fallback if TF lookup fails.
-        self.declare_parameter("tip_ee_offset_x", -0.027)
-        self.declare_parameter("tip_ee_offset_y",  0.000)
-        self.declare_parameter("tip_ee_offset_z", -0.414)
+        # CIRC arc parameters
+        # n_circ_via_points: number of intermediate via-points for the arc.
+        # Pilz CIRC needs exactly ONE via-point at the midpoint of the arc.
+        # This parameter is kept for documentation; do not change from 1.
+        self.declare_parameter("n_circ_via_points", 1)
 
-        # If true, look up the EE→pen_tip offset from TF at runtime instead of
-        # using the tip_ee_offset_x/y/z parameters above.  This is more reliable
-        # when the URDF offset is uncertain.  Requires robot_state_publisher running.
-        self.declare_parameter("use_tf_offset", True)
-
-        self.declare_parameter("real_robot",             False)
-        self.declare_parameter("skip_home_move",         False)
-        self.declare_parameter("use_dynamic_tf",         False)
-        self.declare_parameter("descend_step",          0.01)
-        self.declare_parameter("descend_jump_threshold", 3.0)
-        self.declare_parameter("add_pole_collision", False)
-        self.declare_parameter("pole_x",      0.0)
-        self.declare_parameter("pole_y",      0.0)
-        self.declare_parameter("pole_radius", 0.025)
-        self.declare_parameter("pole_height", 0.50)
-
-        # --- Parallel planner parameters ---
-        # Number of planning attempts to run in parallel for Phase 0b approach.
-        # Each attempt uses a different OMPL random seed. The trajectory with the
-        # lowest joint displacement score is selected and presented for confirmation.
-        # Set to 1 to disable parallel planning (single attempt, original behaviour).
-        self.declare_parameter("parallel_plans",   15)
-        # Timeout for the parallel planning pool (seconds).
-        # All n attempts must finish within this window.
-        self.declare_parameter("parallel_timeout", 30.0)
-        # Weight on joint_1 displacement in the scoring function (0.0–1.0).
-        # Higher values penalise base rotation more heavily — reduces circular arcs.
-        self.declare_parameter("j1_weight",        0.4)
-        # Weight on trajectory duration in the scoring function (0.0–1.0).
-        # 0.2 means 20% of the score is duration — breaks ties between paths
-        # with similar displacement but different efficiency.
-        # Increase to 0.4 if short paths are consistently better in your setup.
-        self.declare_parameter("duration_weight",  0.2)
-
-        # --- TF ---
+        # TF
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(
             self.tf_buffer, self, spin_thread=False)
 
-        # --- Joint state snapshot ---
-        self._start_joints: dict = {}
-        self._js_frozen = False
-        self._js_sub = self.create_subscription(
+        # Joint state snapshot
+        self._start_joints = {}
+        self._js_frozen    = False
+        self._js_sub       = self.create_subscription(
             JointState, "/joint_states", self._js_cb, 10,
             callback_group=self._cb_group)
 
-        # --- Service / action clients ---
+        # Clients
         self._plan_cli = self.create_client(
             GetMotionPlan, "/plan_kinematic_path",
             callback_group=self._cb_group)
-
-        self._cartesian_cli = self.create_client(
-            GetCartesianPath, "/compute_cartesian_path",
-            callback_group=self._cb_group)
-
         self._execute_cli = ActionClient(
             self, ExecuteTrajectory, "/execute_trajectory",
             callback_group=self._cb_group)
-
-        # Direct controller client used by _move_to_home to bypass MoveIt's
-        # ExecuteTrajectory (which cannot override the controller's 0.1 rad
-        # path tolerance configured in ros2_controllers.yaml).
         self._fjt_cli = ActionClient(
             self, FollowJointTrajectory,
             "/joint_trajectory_controller/follow_joint_trajectory",
             callback_group=self._cb_group)
 
-        self._active_gh = None
-        self._arm_moved = False
-        self._run_done  = threading.Event()
-        self._action_goal_handle = None   # tracks active action server goal
+        self._active_gh  = None
+        self._arm_moved  = False
+        self._run_done   = threading.Event()
+        self._action_goal_handle = None
 
-        from rclpy.qos import QoSProfile, DurabilityPolicy
-        latched_qos = QoSProfile(depth=1,
-                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self._marker_pub = self.create_publisher(
-            MarkerArray, "/insert_preview", latched_qos)
-
-        # RViz "Motion Planning" display reads this topic to show the ghost
-        # trajectory preview before the arm actually moves.
-        self._display_traj_pub = self.create_publisher(
-            DisplayTrajectory, "/display_planned_path", latched_qos)
-
-        # --- Action server (callable from other scripts) ---
-        # Exposes the insertion sequence as a ROS2 action on /insert_container.
-        # Goal fields (all optional — defaults come from node parameters):
-        #   float64 target_x        container centre X (metres, world frame)
-        #   float64 target_y        container centre Y (metres, world frame)
-        #   float64 hover_above_top how far above container top to hover (metres)
-        #   bool    dry_run         plan but do not move arm
-        #   bool    skip_home_move  skip home move pre-phase
-        # Feedback: string current_phase, float64 progress (0–1)
-        # Result:   bool success, string message
         if _HAS_ACTION_INTERFACE:
             self._action_server = ActionServer(
                 self,
@@ -410,20 +389,9 @@ class ContainerInserter(Node):
                 cancel_callback    = self._action_cancel_cb,
                 callback_group     = self._cb_group,
             )
-            self.get_logger().info(
-                "Action server ready on /insert_container\n"
-                "  Call from another script:\n"
-                "    ros2 action send_goal /insert_container "
-                "surgical_arm_bringup/action/InsertContainer "
-                "'{target_x: 0.299, target_y: -0.192, hover_above_top: 0.03}'")
+            self.get_logger().info("Action server ready on /insert_container")
         else:
-            self.get_logger().warn(
-                "InsertContainer action interface not found — "
-                "action server disabled.\n"
-                "  To enable: add InsertContainer.action to surgical_arm_bringup "
-                "and rebuild.\n"
-                "  Running in standalone timer mode.")
-            self.create_timer(2.0, self._run_once, callback_group=self._cb_group)
+            self.get_logger().warn("InsertContainer action interface not found — Action Server disabled.")
 
         self.add_on_set_parameters_callback(self._parameter_callback)
         self._collision_pub = self.create_publisher(CollisionObject, "/collision_object", 10)
@@ -443,308 +411,482 @@ class ContainerInserter(Node):
                 self.get_logger().info(f"Dynamically updated parameter {p.name} to {p.value}")
         return SetParametersResult(successful=True)
 
-    def _js_cb(self, msg: JointState):
+    def _js_cb(self, msg):
         if self._js_frozen:
             return
         for name, pos in zip(msg.name, msg.position):
             self._start_joints[name] = pos
 
-    def _get_params(self):
-        return dict(
-            target_x        = self.get_parameter("target_x").value,
-            target_y        = self.get_parameter("target_y").value,
-            table_z         = self.get_parameter("table_z").value,
-            container_h     = self.get_parameter("container_height").value,
-            insert_depth    = self.get_parameter("insert_depth_from_top").value,
-            approach        = self.get_parameter("approach_clearance").value,
-            hover_above_top = self.get_parameter("hover_above_top").value,
-            lateral_rise    = self.get_parameter("lateral_rise").value,
-            post_wait       = self.get_parameter("post_insert_wait").value,
-            vel_scale       = self.get_parameter("max_velocity_scaling").value,
-            transit_vel     = self.get_parameter("transition_velocity_scaling").value,
-            execute         = self.get_parameter("execute_motion").value,
-            ret             = self.get_parameter("return_to_start").value,
-            tip_link        = self.get_parameter("tip_link").value,
-            ee_link         = self.get_parameter("ee_link").value,
-            world_frame     = self.get_parameter("world_frame").value,
-            group_name      = self.get_parameter("move_group_name").value,
-            qx              = self.get_parameter("pen_down_qx").value,
-            qy              = self.get_parameter("pen_down_qy").value,
-            qz              = self.get_parameter("pen_down_qz").value,
-            qw              = self.get_parameter("pen_down_qw").value,
-            tilt_tol        = self.get_parameter("vertical_tilt_tol").value,
-            joint_delta     = self.get_parameter("joint_delta_rad").value,
-            tip_ee_ox       = self.get_parameter("tip_ee_offset_x").value,
-            tip_ee_oy       = self.get_parameter("tip_ee_offset_y").value,
-            tip_ee_oz       = self.get_parameter("tip_ee_offset_z").value,
-            descend_step    = self.get_parameter("descend_step").value,
-            descend_jump    = self.get_parameter("descend_jump_threshold").value,
-            parallel_plans  = self.get_parameter("parallel_plans").value,
-            parallel_timeout= self.get_parameter("parallel_timeout").value,
-            j1_weight       = self.get_parameter("j1_weight").value,
-            duration_weight = self.get_parameter("duration_weight").value,
-        )
-
-    # ------------------------------------------------------------------
-    # Shared helpers (unchanged from trace_circle.py)
-    # ------------------------------------------------------------------
-
-    def _extract_end_state(self, traj: RobotTrajectory):
-        jt = traj.joint_trajectory
-        if not jt.points:
-            return None
-        state = RobotState()
-        state.joint_state.name     = list(jt.joint_names)
-        state.joint_state.position = list(jt.points[-1].positions)
-        return state
+    def _get_tf(self, parent, child, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                return self.tf_buffer.lookup_transform(
+                    parent, child, rclpy.time.Time())
+            except Exception:
+                time.sleep(0.1)
+        return None
 
     @staticmethod
-    def _rescale_cartesian_traj(solution: RobotTrajectory, vel_scale: float) -> RobotTrajectory:
-        """Scale Cartesian-path trajectory timestamps/velocities/accels in-place.
-
-        GetCartesianPath.Request has no max_velocity_scaling_factor in Humble;
-        compute_cartesian_path plans at 100% speed. This post-processes the result
-        so the arm moves at vel_scale fraction of maximum joint velocity.
-        After time-scaling, a smooth-velocity pass is applied so the resulting
-        trajectory has natural acceleration/deceleration rather than hard steps.
-        """
-        pts = solution.joint_trajectory.points
-        if not pts or vel_scale <= 0.0 or vel_scale >= 1.0:
-            return solution
-        inv = 1.0 / vel_scale
-        for pt in pts:
-            ns = pt.time_from_start.sec * 1_000_000_000 + pt.time_from_start.nanosec
-            scaled_ns = int(ns * inv)
-            pt.time_from_start.sec     = scaled_ns // 1_000_000_000
-            pt.time_from_start.nanosec = scaled_ns %  1_000_000_000
-            pt.velocities    = [v * vel_scale          for v in pt.velocities]
-            pt.accelerations = [a * vel_scale * vel_scale for a in pt.accelerations]
-        # Re-derive smooth velocities/accelerations from the new timestamps
-        smooth_traj_velocities(solution)
-        return solution
-
-    def _preflight_check(self, p: dict) -> bool:
-        """
-        Run before any motion begins on the real robot.
-
-        Checks:
-          1. TF is alive and pen_tip is being published
-          2. Pen_tip is within a reasonable distance of the target
-             (catches wrong container position parameters)
-          3. Current EE orientation is not wildly different from pen-down
-             (catches arm being in a completely wrong configuration)
-          4. Joint states are being received
-          5. All required services are available
-
-        Returns True if safe to proceed, False to abort.
-        """
-        self.get_logger().info("\n─── Pre-flight safety check ───────────────────────")
-        ok = True
-
-        # 1. Joint states
-        if not self._start_joints:
-            self.get_logger().error(
-                "  [PRE-FLIGHT] FAIL: No /joint_states received.\n"
-                "  Is ros2_control_node running?  Check: ros2 topic hz /joint_states")
-            ok = False
-        else:
-            js_str = {n: round(math.degrees(v), 1)
-                      for n, v in self._start_joints.items()
-                      if n in _GEN3_JOINTS}
-            self.get_logger().info(f"  [PRE-FLIGHT] Joint states OK: {js_str}")
-
-        # 2. TF
-        tip_tf, ee_tf = self._get_tip_tf(p, timeout_sec=3.0)
-        if tip_tf is None:
-            self.get_logger().error(
-                "  [PRE-FLIGHT] FAIL: Cannot read world→pen_tip TF.\n"
-                "  Is robot_state_publisher running?\n"
-                "  Check: ros2 run tf2_ros tf2_echo world pen_tip")
-            ok = False
-        else:
-            t = tip_tf.transform.translation
-            ee_t = ee_tf.transform.translation if ee_tf else None
-
-            # 3. Distance to target + EE needed position
-            dx = t.x - p["target_x"]
-            dy = t.y - p["target_y"]
-            dist_xy = math.sqrt(dx*dx + dy*dy)
-
-            if ee_t is not None:
-                # World-frame EE→tip offset at current arm pose
-                cur_offset_x = ee_t.x - t.x
-                cur_offset_y = ee_t.y - t.y
-                cur_offset_z = ee_t.z - t.z
-                ee_needed_x = p["target_x"] + cur_offset_x
-                ee_needed_y = p["target_y"] + cur_offset_y
-                offset_mag = math.sqrt(cur_offset_x**2 + cur_offset_y**2 + cur_offset_z**2)
-                self.get_logger().info(
-                    f"  [PRE-FLIGHT] pen_tip world:  ({t.x:.3f}, {t.y:.3f}, {t.z:.3f})\n"
-                    f"  [PRE-FLIGHT] EE_origin world: ({ee_t.x:.3f}, {ee_t.y:.3f}, {ee_t.z:.3f})\n"
-                    f"  [PRE-FLIGHT] EE→tip offset (world): "
-                    f"({cur_offset_x:.3f}, {cur_offset_y:.3f}, {cur_offset_z:.3f})"
-                    f"  magnitude={offset_mag*100:.1f} cm  (PDF: 34.8 cm expected)\n"
-                    f"  [PRE-FLIGHT] Container target XY: ({p['target_x']:.3f}, {p['target_y']:.3f})\n"
-                    f"  [PRE-FLIGHT] pen_tip→container distance: {dist_xy*100:.1f} cm\n"
-                    f"  [PRE-FLIGHT] EE must reach: ({ee_needed_x:.3f}, {ee_needed_y:.3f}) "
-                    f"for pen_tip to be over container")
-            else:
-                self.get_logger().info(
-                    f"  [PRE-FLIGHT] pen_tip TF OK: ({t.x:.3f}, {t.y:.3f}, {t.z:.3f})\n"
-                    f"  [PRE-FLIGHT] pen_tip→container distance: {dist_xy*100:.1f} cm")
-
-            if dist_xy > MAX_TARGET_DIST_M:
-                self.get_logger().warn(
-                    f"  [PRE-FLIGHT] WARN: pen_tip is {dist_xy*100:.0f} cm from "
-                    f"target XY — large approach move expected.\n"
-                    f"  To minimise arm motion, place the container directly below\n"
-                    f"  the current pen_tip position and update parameters:\n"
-                    f"    -p target_x:={t.x:.3f} -p target_y:={t.y:.3f}\n"
-                    f"  Or jog arm until pen_tip is over the container, then re-run\n"
-                    f"  with those coordinates.")
-
-        # 4. EE orientation check
-        if ee_tf is not None:
-            r = ee_tf.transform.rotation
-            # Check if qw is near 0 — means arm is near a singularity or flipped
-            if abs(r.w) < 0.05:
-                self.get_logger().warn(
-                    f"  [PRE-FLIGHT] WARN: EE quaternion w={r.w:.3f} is near 0.\n"
-                    f"  The arm may be in a near-singular or flipped configuration.\n"
-                    f"  Consider manually moving to a safer starting pose.")
-
-        # 5. Services
-        for svc_name, cli in [
-            ("/plan_kinematic_path",   self._plan_cli),
-            ("/compute_cartesian_path", self._cartesian_cli),
-        ]:
-            ready = cli.wait_for_service(timeout_sec=2.0)
-            status = "OK" if ready else "FAIL — move_group not running?"
-            level  = self.get_logger().info if ready else self.get_logger().error
-            level(f"  [PRE-FLIGHT] {svc_name}: {status}")
-            if not ready:
-                ok = False
-
-        self.get_logger().info("───────────────────────────────────────────────────")
-
-        # Extra check: warn if approach_clearance is too low relative to current tip height.
-        # If ready_z << cur_tip_z, Phase 0b PTP will descend in joint-space and may
-        # clip the table. The fix is to increase approach_clearance.
-        if tip_tf is not None:
-            cur_tip_z = tip_tf.transform.translation.z
-            container_top = p.get("table_z", -0.03) + p.get("container_h", 0.10)
-            ready_z_val = container_top + p.get("approach", 0.16)
-            correct_clearance = round(cur_tip_z - container_top, 2)
-            gap = cur_tip_z - ready_z_val
-            if abs(gap) > 0.05:
-                self.get_logger().warn(
-                    f"  [PRE-FLIGHT] WARN: ready_z={ready_z_val:.3f} m is "
-                    f"{abs(gap)*100:.0f} cm {'below' if gap > 0 else 'above'} "
-                    f"current tip z={cur_tip_z:.3f} m.\n"
-                    f"  Phase 0b PTP will {'ascend' if gap > 0 else 'descend'} "
-                    f"{abs(gap)*100:.0f} cm in joint-space — risk of table collision.\n"
-                    f"  CORRECT approach_clearance for this home position: "
-                    f"{correct_clearance:.2f} m\n"
-                    f"  → Add: -p approach_clearance:={correct_clearance:.2f}")
-            else:
-                self.get_logger().info(
-                    f"  [PRE-FLIGHT] approach_clearance OK: "
-                    f"ready_z={ready_z_val:.3f} m ≈ tip z={cur_tip_z:.3f} m "
-                    f"(gap={gap*100:.0f} cm)")
-        return ok
-
-
-    def _execute_traj(self, traj: RobotTrajectory, label: str,
-                      timeout_sec: float = 30.0,
-                      use_moveit_execute: bool = False) -> bool:
-        """Execute a trajectory with safety clamping.
-
-        use_moveit_execute=True  — MoveIt /execute_trajectory (OMPL joint-space).
-        use_moveit_execute=False — Direct FJT (Cartesian, overrides 0.1 rad path tol).
-        """
-        clamp_traj_limits(traj)
-
-        if use_moveit_execute:
-            if not self._execute_cli.wait_for_server(timeout_sec=5.0):
-                self.get_logger().error(
-                    f"  /execute_trajectory not available ({label}).")
-                return False
-            goal = ExecuteTrajectory.Goal()
-            goal.trajectory = traj
-            f = self._execute_cli.send_goal_async(goal)
-            gh = self._wait_for_future(f, timeout_sec=10.0)
-            if gh is None or not gh.accepted:
-                self.get_logger().error(f"  Execution goal rejected ({label}).")
-                return False
-            self._active_gh = gh
-            rf = gh.get_result_async()
-            result = self._wait_for_future(rf, timeout_sec=timeout_sec)
-            self._active_gh = None
-            if result is None:
-                self.get_logger().error(
-                    f"  Execution timed out after {timeout_sec:.0f}s ({label}).")
-                return False
-            ec = result.result.error_code.val
-            if ec == 1:
-                self.get_logger().info(f"  [PASS] {label} executed.")
-                self._arm_moved = True
-                return True
-            self.get_logger().warn(f"  [WARN] {label} execution error code {ec}.")
-            return False
-
-        # Direct FJT path — bypasses MoveIt to override 0.1 rad path tolerance.
-        deadline_srv = time.time() + 5.0
-        while not self._fjt_cli.server_is_ready() and time.time() < deadline_srv:
+    def _wait_for_future(future, timeout_sec):
+        deadline = time.time() + timeout_sec
+        while not future.done():
+            if time.time() > deadline:
+                return None
             time.sleep(0.05)
-        if not self._fjt_cli.server_is_ready():
-            self.get_logger().error(
-                f"  follow_joint_trajectory not available ({label}).")
+        return future.result()
+
+    def _build_workspace(self):
+        ws = WorkspaceParameters()
+        ws.header.frame_id = self.get_parameter("world_frame").value
+        ws.min_corner.x = -1.1; ws.min_corner.y = -1.1; ws.min_corner.z = -0.1
+        ws.max_corner.x =  1.1; ws.max_corner.y =  1.1; ws.max_corner.z =  1.2
+        return ws
+
+    # ------------------------------------------------------------------
+    # Trajectory clamping (mirrors insert_to_container)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clamp_traj(traj):
+        pts = traj.joint_trajectory.points
+        for i, pt in enumerate(pts):
+            if not pt.velocities and not pt.accelerations:
+                continue
+            worst = 1.0
+            for v in pt.velocities:
+                if abs(v) > MAX_JOINT_VEL_RAD_S:
+                    worst = max(worst, abs(v) / MAX_JOINT_VEL_RAD_S)
+            for a in pt.accelerations:
+                if abs(a) > MAX_JOINT_ACC_RAD_S2:
+                    worst = max(worst, (abs(a) / MAX_JOINT_ACC_RAD_S2) ** 0.5)
+            if worst <= 1.0:
+                continue
+            prev_ns = (pts[i-1].time_from_start.sec * 1_000_000_000
+                       + pts[i-1].time_from_start.nanosec) if i > 0 else 0
+            cur_ns  = (pt.time_from_start.sec * 1_000_000_000
+                       + pt.time_from_start.nanosec)
+            delta   = int((cur_ns - prev_ns) * worst) - (cur_ns - prev_ns)
+            for j in range(i, len(pts)):
+                ns = (pts[j].time_from_start.sec * 1_000_000_000
+                      + pts[j].time_from_start.nanosec) + delta
+                pts[j].time_from_start.sec     = ns // 1_000_000_000
+                pts[j].time_from_start.nanosec = ns %  1_000_000_000
+            pt.velocities    = [v / worst for v in pt.velocities]
+            pt.accelerations = [a / (worst*worst) for a in pt.accelerations]
+        return traj
+
+    # ------------------------------------------------------------------
+    # Execution helpers
+    # ------------------------------------------------------------------
+    def _execute_moveit(self, traj, label, timeout=120.0):
+        """Execute via MoveIt /execute_trajectory (OMPL / Pilz PTP paths)."""
+        self._clamp_traj(traj)
+        if not self._execute_cli.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error(f"  /execute_trajectory not available ({label}).")
             return False
-
-        # Stamp header: Kortex driver rejects zero/stale stamps (error -5).
-        now_ns   = self.get_clock().now().nanoseconds
-        start_ns = now_ns + int(0.3 * 1e9)
-        traj.joint_trajectory.header.stamp.sec     = start_ns // 1_000_000_000
-        traj.joint_trajectory.header.stamp.nanosec = start_ns %  1_000_000_000
-
-        fjt_goal = FollowJointTrajectory.Goal()
-        fjt_goal.trajectory = traj.joint_trajectory
-        for name in _GEN3_JOINTS:
-            ptol = JointTolerance()
-            ptol.name = name; ptol.position = 5.0
-            ptol.velocity = 0.0; ptol.acceleration = 0.0
-            fjt_goal.path_tolerance.append(ptol)
-            gtol = JointTolerance()
-            gtol.name = name; gtol.position = 0.05
-            gtol.velocity = 0.0; gtol.acceleration = 0.0
-            fjt_goal.goal_tolerance.append(gtol)
-        fjt_goal.goal_time_tolerance = RosDuration(sec=30, nanosec=0)
-
-        f = self._fjt_cli.send_goal_async(fjt_goal)
-        gh = self._wait_for_future(f, timeout_sec=10.0)
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = traj
+        f  = self._execute_cli.send_goal_async(goal)
+        gh = self._wait_for_future(f, 10.0)
         if gh is None or not gh.accepted:
-            self.get_logger().error(f"  Execution goal rejected ({label}).")
+            self.get_logger().error(f"  Goal rejected ({label}).")
             return False
         self._active_gh = gh
-        rf = gh.get_result_async()
-        result = self._wait_for_future(rf, timeout_sec=timeout_sec)
+        rf     = gh.get_result_async()
+        result = self._wait_for_future(rf, timeout)
         self._active_gh = None
         if result is None:
-            self.get_logger().error(
-                f"  Execution timed out after {timeout_sec:.0f}s ({label}).")
+            self.get_logger().error(f"  Timed out ({label}).")
             return False
-        ec = result.result.error_code
-        if ec == FollowJointTrajectory.Result.SUCCESSFUL:
-            self.get_logger().info(f"  [PASS] {label} executed.")
+        if result.result.error_code.val == 1:
+            self.get_logger().info(f"  [PASS] {label}")
             self._arm_moved = True
             return True
-        self.get_logger().warn(f"  [WARN] {label} execution error code {ec}.")
+        self.get_logger().warn(f"  [WARN] {label} error {result.result.error_code.val}")
         return False
 
+    def _execute_fjt(self, traj, label, timeout=60.0):
+        """Execute via direct FJT (Cartesian paths — overrides 0.1 rad path tol)."""
+        self._clamp_traj(traj)
+        deadline = time.time() + 5.0
+        while not self._fjt_cli.server_is_ready() and time.time() < deadline:
+            time.sleep(0.05)
+        if not self._fjt_cli.server_is_ready():
+            self.get_logger().error(f"  FJT not available ({label}).")
+            return False
+        # Stamp header so Kortex driver accepts it
+        now_ns   = self.get_clock().now().nanoseconds
+        start_ns = now_ns + int(0.3e9)
+        traj.joint_trajectory.header.stamp.sec     = start_ns // 1_000_000_000
+        traj.joint_trajectory.header.stamp.nanosec = start_ns %  1_000_000_000
+        fjt = FollowJointTrajectory.Goal()
+        fjt.trajectory = traj.joint_trajectory
+        for name in _GEN3_JOINTS:
+            pt = JointTolerance(); pt.name = name
+            pt.position = 5.0; pt.velocity = 0.0; pt.acceleration = 0.0
+            fjt.path_tolerance.append(pt)
+            gt = JointTolerance(); gt.name = name
+            gt.position = 0.05; gt.velocity = 0.0; gt.acceleration = 0.0
+            fjt.goal_tolerance.append(gt)
+        fjt.goal_time_tolerance = RosDuration(sec=30, nanosec=0)
+        f  = self._fjt_cli.send_goal_async(fjt)
+        gh = self._wait_for_future(f, 10.0)
+        if gh is None or not gh.accepted:
+            self.get_logger().error(f"  FJT goal rejected ({label}).")
+            return False
+        self._active_gh = gh
+        rf     = gh.get_result_async()
+        result = self._wait_for_future(rf, timeout)
+        self._active_gh = None
+        if result is None:
+            self.get_logger().error(f"  FJT timed out ({label}).")
+            return False
+        if result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+            self.get_logger().info(f"  [PASS] {label}")
+            self._arm_moved = True
+            return True
+        self.get_logger().warn(f"  [WARN] {label} FJT error {result.result.error_code}")
         return False
+
+    # ------------------------------------------------------------------
+    # Planning helpers
+    # ------------------------------------------------------------------
+    def _plan(self, req, timeout=45.0):
+        if not self._plan_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error("  /plan_kinematic_path not available.")
+            return False, None
+        svc = GetMotionPlan.Request()
+        svc.motion_plan_request = req
+        f      = self._plan_cli.call_async(svc)
+        result = self._wait_for_future(f, timeout)
+        if result is None:
+            self.get_logger().error("  Planning timed out.")
+            return False, None
+        resp = result.motion_plan_response
+        if resp.error_code.val == 1:
+            return True, resp.trajectory
+        self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
+        return False, None
+
+    def _build_pilz_ptp(self, ee_x, ee_y, ee_z, pen_q, vel_scale,
+                         start_state=None):
+        """Pilz PTP to a single EE pose."""
+        req = MotionPlanRequest()
+        req.group_name   = self.get_parameter("move_group_name").value
+        req.planner_id   = "PTP"
+        req.pipeline_id  = "pilz_industrial_motion_planner"
+        req.num_planning_attempts = 1
+        req.allowed_planning_time = 10.0
+        req.max_velocity_scaling_factor     = vel_scale
+        req.max_acceleration_scaling_factor = vel_scale * 0.5
+        req.workspace_parameters = self._build_workspace()
+        if start_state:
+            req.start_state = start_state
+        else:
+            req.start_state.is_diff = True
+
+        # Joint path constraints to keep IK local
+        if self._start_joints:
+            path_c = Constraints()
+            for name in _GEN3_JOINTS:
+                cur = self._start_joints.get(name)
+                if cur is None:
+                    continue
+                jc = JointConstraint()
+                jc.joint_name = name; jc.position = cur
+                jc.tolerance_above = 1.2; jc.tolerance_below = 1.2
+                jc.weight = 1.0
+                path_c.joint_constraints.append(jc)
+            req.path_constraints = path_c
+
+        sphere = SolidPrimitive(); sphere.type = SolidPrimitive.SPHERE
+        sphere.dimensions = [0.005]
+        bv_pose = Pose()
+        bv_pose.position.x = ee_x; bv_pose.position.y = ee_y
+        bv_pose.position.z = ee_z; bv_pose.orientation = pen_q
+        bv = BoundingVolume()
+        bv.primitives.append(sphere); bv.primitive_poses.append(bv_pose)
+        pos_c = PositionConstraint()
+        pos_c.header.frame_id = self.get_parameter("world_frame").value
+        pos_c.link_name       = self.get_parameter("ee_link").value
+        pos_c.constraint_region = bv; pos_c.weight = 1.0
+        ori_c = OrientationConstraint()
+        ori_c.header.frame_id = self.get_parameter("world_frame").value
+        ori_c.link_name       = self.get_parameter("ee_link").value
+        ori_c.orientation = pen_q
+        ori_c.absolute_x_axis_tolerance = 0.05
+        ori_c.absolute_y_axis_tolerance = 0.05
+        ori_c.absolute_z_axis_tolerance = 0.05
+        ori_c.weight = 1.0
+        goal_c = Constraints()
+        goal_c.position_constraints.append(pos_c)
+        goal_c.orientation_constraints.append(ori_c)
+        req.goal_constraints.append(goal_c)
+        return req
+
+    def _build_pilz_lin(self, ee_x, ee_y, ee_z, pen_q, vel_scale,
+                         start_state=None):
+        """Pilz LIN straight-line Cartesian move to EE pose."""
+        req = MotionPlanRequest()
+        req.group_name   = self.get_parameter("move_group_name").value
+        req.planner_id   = "LIN"
+        req.pipeline_id  = "pilz_industrial_motion_planner"
+        req.num_planning_attempts = 1
+        req.allowed_planning_time = 10.0
+        req.max_velocity_scaling_factor     = vel_scale
+        req.max_acceleration_scaling_factor = vel_scale * 0.5
+        req.workspace_parameters = self._build_workspace()
+        if start_state:
+            req.start_state = start_state
+        else:
+            req.start_state.is_diff = True
+        sphere = SolidPrimitive(); sphere.type = SolidPrimitive.SPHERE
+        sphere.dimensions = [0.005]
+        bv_pose = Pose()
+        bv_pose.position.x = ee_x; bv_pose.position.y = ee_y
+        bv_pose.position.z = ee_z; bv_pose.orientation = pen_q
+        bv = BoundingVolume()
+        bv.primitives.append(sphere); bv.primitive_poses.append(bv_pose)
+        pos_c = PositionConstraint()
+        pos_c.header.frame_id = self.get_parameter("world_frame").value
+        pos_c.link_name       = self.get_parameter("ee_link").value
+        pos_c.constraint_region = bv; pos_c.weight = 1.0
+        ori_c = OrientationConstraint()
+        ori_c.header.frame_id = self.get_parameter("world_frame").value
+        ori_c.link_name       = self.get_parameter("ee_link").value
+        ori_c.orientation = pen_q
+        ori_c.absolute_x_axis_tolerance = 0.01
+        ori_c.absolute_y_axis_tolerance = 0.01
+        ori_c.absolute_z_axis_tolerance = 0.01
+        ori_c.weight = 1.0
+        goal_c = Constraints()
+        goal_c.position_constraints.append(pos_c)
+        goal_c.orientation_constraints.append(ori_c)
+        req.goal_constraints.append(goal_c)
+        return req
+
+    def _build_pilz_circ(self, ee_start, ee_via, ee_end,
+                          q_start, q_via, q_end,
+                          vel_scale, start_state=None):
+        """
+        Pilz CIRC arc from ee_start through ee_via to ee_end.
+
+        Pilz CIRC in MoveIt2 Humble is specified as:
+          - Goal constraints: the END pose (position + orientation)
+          - Path constraints: the VIA pose (position only — Pilz ignores
+            via orientation in path constraints)
+
+        The arc keeps the TCP on a circular path through all three points.
+        When the three EE positions trace a circle, the TCP (assembly_tip)
+        remains fixed at the pivot point while the wrist reorients.
+
+        Parameters
+        ----------
+        ee_start : (x,y,z) EE position at arc start (current pose)
+        ee_via   : (x,y,z) EE position at arc midpoint
+        ee_end   : (x,y,z) EE position at arc end
+        q_start/via/end : Quaternion EE orientation at each point
+        vel_scale : velocity scaling factor
+        """
+        world_frame = self.get_parameter("world_frame").value
+        ee_link     = self.get_parameter("ee_link").value
+        group_name  = self.get_parameter("move_group_name").value
+
+        req = MotionPlanRequest()
+        req.group_name   = group_name
+        req.planner_id   = "CIRC"
+        req.pipeline_id  = "pilz_industrial_motion_planner"
+        req.num_planning_attempts = 1
+        req.allowed_planning_time = 15.0
+        req.max_velocity_scaling_factor     = vel_scale
+        req.max_acceleration_scaling_factor = vel_scale * 0.5
+        if start_state:
+            req.start_state = start_state
+        else:
+            req.start_state.is_diff = True
+
+        # Goal: the END pose (position + orientation)
+        sphere_end = SolidPrimitive(); sphere_end.type = SolidPrimitive.SPHERE
+        sphere_end.dimensions = [0.005]
+        end_pose = Pose()
+        end_pose.position.x = ee_end[0]; end_pose.position.y = ee_end[1]
+        end_pose.position.z = ee_end[2]; end_pose.orientation = q_end
+        bv_end = BoundingVolume()
+        bv_end.primitives.append(sphere_end)
+        bv_end.primitive_poses.append(end_pose)
+        pos_end = PositionConstraint()
+        pos_end.header.frame_id   = world_frame
+        pos_end.link_name         = ee_link
+        pos_end.constraint_region = bv_end
+        pos_end.weight            = 1.0
+        ori_end = OrientationConstraint()
+        ori_end.header.frame_id           = world_frame
+        ori_end.link_name                 = ee_link
+        ori_end.orientation               = q_end
+        ori_end.absolute_x_axis_tolerance = 0.05
+        ori_end.absolute_y_axis_tolerance = 0.05
+        ori_end.absolute_z_axis_tolerance = 0.05
+        ori_end.weight                    = 1.0
+        goal_c = Constraints()
+        goal_c.position_constraints.append(pos_end)
+        goal_c.orientation_constraints.append(ori_end)
+        req.goal_constraints.append(goal_c)
+
+        # Via-point: position only in path constraints (Pilz CIRC convention)
+        sphere_via = SolidPrimitive(); sphere_via.type = SolidPrimitive.SPHERE
+        sphere_via.dimensions = [0.005]
+        via_pose = Pose()
+        via_pose.position.x = ee_via[0]; via_pose.position.y = ee_via[1]
+        via_pose.position.z = ee_via[2]; via_pose.orientation = q_via
+        bv_via = BoundingVolume()
+        bv_via.primitives.append(sphere_via)
+        bv_via.primitive_poses.append(via_pose)
+        pos_via = PositionConstraint()
+        pos_via.header.frame_id   = world_frame
+        pos_via.link_name         = ee_link
+        pos_via.constraint_region = bv_via
+        pos_via.weight            = 1.0
+        path_c = Constraints()
+        path_c.position_constraints.append(pos_via)
+        req.path_constraints = path_c
+
+        return req
+
+    # ------------------------------------------------------------------
+    # EE pose computation
+    # ------------------------------------------------------------------
+    def _ee_from_tip(self, tip_xyz, q_xyzw, ee_world_offset):
+        """Compute EE position from desired tip position and world-frame offset."""
+        wx, wy, wz = ee_world_offset
+        return (tip_xyz[0] + wx, tip_xyz[1] + wy, tip_xyz[2] + wz)
+
+    # ------------------------------------------------------------------
+    # User prompt
+    # ------------------------------------------------------------------
+    def _prompt_target(self):
+        """
+        Prompt user for target point inside container in mm from centre.
+        Returns (offset_x_mm, offset_y_mm, depth_mm) or None to use defaults.
+        """
+        container_half = (CONTAINER_WIDTH_M / 2.0 - CONTAINER_WALL_M) * 1000
+
+        print()
+        print("  ┌──────────────────────────────────────────────────────────┐")
+        print("  │  Target point inside container                           │")
+        print("  │                                                          │")
+        print("  │  Specify offset from container CENTRE (mm):             │")
+        print(f"  │    offset_x : +ve away from robot  (max ±{container_half:.0f} mm)  │")
+        print(f"  │    offset_y : +ve left, -ve right  (max ±{container_half:.0f} mm)  │")
+        print(f"  │    depth    : mm below container top (max {CONTAINER_HEIGHT_M*1000-6:.0f} mm)   │")
+        print("  │                                                          │")
+        print(f"  │  Container: {CONTAINER_WIDTH_M*1000:.0f}×{CONTAINER_WIDTH_M*1000:.0f}×{CONTAINER_HEIGHT_M*1000:.0f} mm   max tilt: {MAX_TILT_DEG:.0f}°         │")
+        print("  │                                                          │")
+        print("  │  Format:  offset_x, offset_y, depth                    │")
+        print("  │  Example: 10, -15, 40  (10mm fwd, 15mm right, 40mm deep)│")
+        print("  │  Press Enter for straight-down (0, 0, 30 mm default)   │")
+        print("  └──────────────────────────────────────────────────────────┘")
+
+        defaults = (
+            self.get_parameter("target_offset_x_mm").value,
+            self.get_parameter("target_offset_y_mm").value,
+            self.get_parameter("target_depth_mm").value,
+        )
+
+        while True:
+            try:
+                raw = input(
+                    f"  Target [offset_x, offset_y, depth mm] "
+                    f"(default {defaults[0]:.0f}, {defaults[1]:.0f}, {defaults[2]:.0f}): "
+                ).strip()
+
+                if not raw:
+                    return defaults
+
+                parts = raw.replace(",", " ").split()
+                if len(parts) == 3:
+                    ox, oy, d = float(parts[0]), float(parts[1]), float(parts[2])
+                elif len(parts) == 1:
+                    # Just depth
+                    ox, oy, d = 0.0, 0.0, float(parts[0])
+                else:
+                    print("  Enter 3 values: offset_x, offset_y, depth (mm)")
+                    continue
+
+                # Validate
+                if d <= 0:
+                    print(f"  Depth must be > 0 mm")
+                    continue
+                if d > (CONTAINER_HEIGHT_M * 1000 - 6):
+                    print(f"  Depth {d:.0f} mm exceeds container ({CONTAINER_HEIGHT_M*1000:.0f} mm - 6 mm margin).")
+                    continue
+
+                ox_m = ox / 1000.0
+                oy_m = oy / 1000.0
+                d_m  = d  / 1000.0
+                ok, msg = check_wall_clearance(ox_m, oy_m, d_m,
+                                               math.atan2(math.sqrt(ox_m**2+oy_m**2), d_m))
+                if not ok:
+                    print(f"  Wall clearance check: {msg}")
+                    print("  Try a smaller offset or shallower depth.")
+                    continue
+
+                tilt = math.degrees(math.atan2(
+                    math.sqrt(ox_m**2 + oy_m**2), d_m))
+                azim = math.degrees(math.atan2(oy_m, ox_m))
+                print(f"  Target: ({ox:.1f}, {oy:.1f}) mm offset, {d:.1f} mm deep")
+                print(f"  Computed: tilt={tilt:.1f}°, azimuth={azim:.1f}°")
+                return (ox, oy, d)
+
+            except ValueError:
+                print("  Invalid input — enter numbers, e.g.  10, -15, 40")
+            except EOFError:
+                return defaults
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
+    def _recovery_return(self, p):
+        if not self._arm_moved:
+            return
+        if not self._start_joints:
+            return
+        self.get_logger().info("\n--- Recovery: returning to start joints ---")
+        req = MotionPlanRequest()
+        req.group_name   = p["group_name"]
+        req.planner_id   = "PTP"
+        req.pipeline_id  = "pilz_industrial_motion_planner"
+        req.num_planning_attempts = 1
+        req.allowed_planning_time = 10.0
+        req.max_velocity_scaling_factor     = p["vel_scale"]
+        req.max_acceleration_scaling_factor = p["vel_scale"] * 0.5
+        req.start_state.is_diff = True
+        goal_c = Constraints()
+        for name, pos in self._start_joints.items():
+            if name not in _GEN3_JOINTS:
+                continue
+            jc = JointConstraint()
+            jc.joint_name = name; jc.position = pos
+            jc.tolerance_above = 0.05; jc.tolerance_below = 0.05
+            jc.weight = 1.0
+            goal_c.joint_constraints.append(jc)
+        req.goal_constraints.append(goal_c)
+        ok, traj = self._plan(req)
+        if ok:
+            p_copy = dict(p); p_copy["execute"] = True
+            self._execute_moveit(traj, "recovery_return")
+
+    # ------------------------------------------------------------------
+    # Action Server Callbacks
+    # ------------------------------------------------------------------
+    def _action_goal_cb(self, goal_request):
+        self.get_logger().info("Received goal request")
+        return GoalResponse.ACCEPT
+
 
     def _cancel_active(self):
         from std_msgs.msg import Empty as EmptyMsg
+        import time
+        import subprocess
         try:
             stop_pub = self.create_publisher(EmptyMsg, "/stop_kortex_cmd", 1)
             stop_pub.publish(EmptyMsg())
@@ -752,10 +894,11 @@ class ContainerInserter(Node):
         except Exception as e:
             self.get_logger().warn(f"  Could not publish /stop_kortex_cmd: {e}")
 
-        gh = self._active_gh
+        gh = getattr(self, '_active_gh', None)
         if gh is not None:
             self.get_logger().warn("  Sending trajectory cancellation...")
             try:
+                import rclpy
                 cancel_f = gh.cancel_goal_async()
                 deadline = time.monotonic() + 3.0
                 while not cancel_f.done() and time.monotonic() < deadline:
@@ -767,2029 +910,528 @@ class ContainerInserter(Node):
         self.get_logger().warn("  Waiting 2s for controller to settle...")
         time.sleep(2.0)
 
-    def _recovery_return(self):
-        if not self._arm_moved:
-            self.get_logger().info("  Arm did not move -- no recovery needed.")
-            return
-        if not self._start_joints:
-            self.get_logger().error(
-                "  No start joints saved -- arm stays in current position.")
-            return
-        self.get_logger().info(
-            "\n--- [Recovery] Returning arm to pre-script position ---")
-        p = self._get_params()
-        p["execute"] = True
-        try:
-            self._return_to_start(p, start_state=None)
-        except Exception as e:
-            self.get_logger().error(f"  Recovery return failed: {e}")
-
-    @staticmethod
-    def _wait_for_future(future, timeout_sec: float):
-        """Poll a future without re-entering the executor.
-
-        rclpy.spin_until_future_complete() called from inside a
-        MultiThreadedExecutor callback causes concurrent wait-set access and
-        crashes Thread-1 (rcl_action 'status subscription out of bounds').
-        This pure-poll approach lets the background executor thread complete
-        futures normally while we wait.
-        """
-        deadline = time.time() + timeout_sec
-        while not future.done():
-            if time.time() > deadline:
-                return None
-            time.sleep(0.05)
-        return future.result()
-
-    def _build_workspace(self, world_frame):
-        ws = WorkspaceParameters()
-        ws.header.frame_id = world_frame
-        ws.min_corner.x = -1.1;  ws.min_corner.y = -1.1;  ws.min_corner.z = -0.1
-        ws.max_corner.x =  1.1;  ws.max_corner.y =  1.1;  ws.max_corner.z =  1.2
-        return ws
-
-    def _apply_pole_collision(self, add: bool, p: dict) -> None:
-        pole_x      = self.get_parameter("pole_x").value
-        pole_y      = self.get_parameter("pole_y").value
-        pole_radius = self.get_parameter("pole_radius").value
-        pole_height = self.get_parameter("pole_height").value
-
-        co = CollisionObject()
-        co.header.frame_id = p["world_frame"]
-        co.id        = "table_pole"
-        co.operation = CollisionObject.ADD if add else CollisionObject.REMOVE
-
-        if add:
-            cyl = SolidPrimitive()
-            cyl.type       = SolidPrimitive.CYLINDER
-            cyl.dimensions = [pole_height, pole_radius]
-            co.primitives.append(cyl)
-
-            cyl_pose = Pose()
-            cyl_pose.position.x   = pole_x
-            cyl_pose.position.y   = pole_y
-            cyl_pose.position.z   = pole_height / 2.0
-            cyl_pose.orientation.w = 1.0
-            co.primitive_poses.append(cyl_pose)
-
-        scene = PlanningScene()
-        scene.world.collision_objects.append(co)
-        scene.is_diff = True
-
-        cli = self.create_client(
-            ApplyPlanningScene, "/apply_planning_scene",
-            callback_group=self._cb_group)
-        if not cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn(
-                "  /apply_planning_scene unavailable — pole not added.")
-            return
-        req = ApplyPlanningScene.Request()
-        req.scene = scene
-        f = cli.call_async(req)
-        self._wait_for_future(f, timeout_sec=5.0)
-        verb = "added" if add else "removed"
-        self.get_logger().info(f"  Pole collision object '{co.id}' {verb}.")
-
-    def _joint_bounds_constraint(self, joint_delta_rad: float) -> Constraints:
-        c = Constraints()
-        for name in _GEN3_JOINTS:
-            pos = self._start_joints.get(name)
-            if pos is None:
-                continue
-            jc = JointConstraint()
-            jc.joint_name      = name
-            jc.position        = pos
-            jc.tolerance_above = joint_delta_rad
-            jc.tolerance_below = joint_delta_rad
-            jc.weight          = 1.0
-            c.joint_constraints.append(jc)
-        return c
-
-    def _call_plan(self, motion_req: MotionPlanRequest):
-        if not self._plan_cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("  /plan_kinematic_path not available.")
-            return False, None
-        svc_req = GetMotionPlan.Request()
-        svc_req.motion_plan_request = motion_req
-        f = self._plan_cli.call_async(svc_req)
-        svc_result = self._wait_for_future(f, timeout_sec=90.0)
-        if svc_result is None:
-            self.get_logger().error("  Planning timed out.")
-            return False, None
-        resp = svc_result.motion_plan_response
-        ec = resp.error_code.val
-        if ec == 1:
-            return True, resp.trajectory
-        self.get_logger().error(f"  Planning failed (error code {ec}).")
-        return False, None
-
-    def _get_tip_tf(self, p, timeout_sec=5.0):
-        """Look up world→pen_tip and world→EE transforms with retry."""
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            try:
-                tip_tf = self.tf_buffer.lookup_transform(
-                    p["world_frame"], p["tip_link"], rclpy.time.Time())
-                ee_tf = self.tf_buffer.lookup_transform(
-                    p["world_frame"], p["ee_link"], rclpy.time.Time())
-                return tip_tf, ee_tf
-            except Exception:
-                time.sleep(0.1)
-        return None, None
-
-    def _get_ee_to_tip_offset_world(self, p, ee_quat_xyzw,
-                                    timeout_sec=3.0):
-        """
-        Compute the world-frame vector from EE_origin to pen_tip by subtracting
-        the two world-frame TF positions directly.
-
-        world_offset = pen_tip_world - EE_origin_world
-
-        Then EE_origin = pen_tip_target + (-world_offset)
-                       = pen_tip_target - (pen_tip_world - EE_origin_world)
-
-        This approach does NOT require end_effector_link to exist as a live TF
-        frame — it only needs world→pen_tip and world→EE, which the script
-        already looks up in _get_tip_tf().  The offset is the current geometric
-        displacement in world coordinates and is valid for any arm orientation.
-
-        Returns (neg_wx, neg_wy, neg_wz) such that EE_origin = pen_tip + offset.
-        """
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            try:
-                tip_tf = self.tf_buffer.lookup_transform(
-                    p["world_frame"], p["tip_link"], rclpy.time.Time())
-                ee_tf  = self.tf_buffer.lookup_transform(
-                    p["world_frame"], p["ee_link"],  rclpy.time.Time())
-
-                tip_w = tip_tf.transform.translation
-                ee_w  = ee_tf.transform.translation
-
-                # Vector from pen_tip to EE_origin in world frame
-                # EE_origin = pen_tip + (ee - tip)
-                neg_wx = ee_w.x - tip_w.x
-                neg_wy = ee_w.y - tip_w.y
-                neg_wz = ee_w.z - tip_w.z
-
-                dist = math.sqrt(neg_wx**2 + neg_wy**2 + neg_wz**2)
-                self.get_logger().info(
-                    f"  [TF offset] pen_tip world: ({tip_w.x:.4f}, {tip_w.y:.4f}, {tip_w.z:.4f})\n"
-                    f"  [TF offset] EE_origin world: ({ee_w.x:.4f}, {ee_w.y:.4f}, {ee_w.z:.4f})\n"
-                    f"  [TF offset] EE→tip offset (world): ({neg_wx:.4f}, {neg_wy:.4f}, {neg_wz:.4f})"
-                    f"  magnitude={dist*100:.1f} cm\n"
-                    f"  [TF offset] Expected from URDF: ~34.8 cm  (PDF confirmed: 348.48 mm)")
-                return neg_wx, neg_wy, neg_wz
-
-            except Exception as e:
-                time.sleep(0.1)
-
-        self.get_logger().warn(
-            f"  [TF offset] Could not look up world→{p['tip_link']} or "
-            f"world→{p['ee_link']} — falling back to tip_ee_offset parameters.\n"
-            f"  Note: '{p['ee_link']}' may not exist in the live TF tree.\n"
-            f"  Check available frames: ros2 run tf2_tools view_frames")
-        return None, None, None
-
-
-
-    # ------------------------------------------------------------------
-    # Single-waypoint Cartesian step
-    # ------------------------------------------------------------------
-    def _cartesian_single_step(self, x, y, z, pen_q, p, start_state, label):
-        """compute_cartesian_path to one waypoint. Returns (ok, end_state)."""
-        wp = Pose()
-        wp.position.x = x; wp.position.y = y; wp.position.z = z
-        wp.orientation = pen_q
-
-        if not self._cartesian_cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error(
-                f"  compute_cartesian_path not available ({label}).")
-            return False, None
-
-        req = GetCartesianPath.Request()
-        req.header.frame_id  = p["world_frame"]
-        req.group_name       = p["group_name"]
-        req.link_name        = p["tip_link"]
-        req.waypoints        = [wp]
-        req.max_step         = 0.005
-        req.jump_threshold   = p["descend_jump"]
-        req.avoid_collisions = True
-
-        if start_state is not None:
-            req.start_state = start_state
-        else:
-            req.start_state = RobotState()
-            req.start_state.is_diff = True
-
-        f = self._cartesian_cli.call_async(req)
-        resp = self._wait_for_future(f, timeout_sec=20.0)
-
-        if resp is None:
-            self.get_logger().error(
-                f"  compute_cartesian_path timed out ({label}).")
-            return False, None
-
-        fraction = resp.fraction
-        self.get_logger().info(
-            f"  [{label}] fraction={fraction:.3f}  "
-            f"traj_pts={len(resp.solution.joint_trajectory.points)}")
-
-        if fraction < 0.99:
-            self.get_logger().error(
-                f"  [{label}] path only {fraction*100:.1f}% reachable.")
-            return False, None
-
-        end_state = self._extract_end_state(resp.solution)
-        if p["execute"]:
-            self._rescale_cartesian_traj(resp.solution, p["vel_scale"])
-            ok = self._execute_traj(resp.solution, label, timeout_sec=60.0)
-            return ok, None
-        return True, end_state
-
-    # ------------------------------------------------------------------
-    # OMPL request: move pen_tip to (cx, cy, safe_z) with loose EE orientation
-    # ------------------------------------------------------------------
-    def _build_ompl_approach_request(self, ee_x, ee_y, ee_z, pen_q, p,
-                                     start_state=None):
-        """
-        OMPL goal: end_effector_link at (ee_x, ee_y, ee_z) within 2 cm,
-        orientation within 0.3 rad of pen_q.
-
-        Both constraints use end_effector_link — the IK tip MoveIt knows —
-        so OMPL can use IK sampling to efficiently generate goal states.
-        Using pen_tip for position + ee_link for orientation (different links)
-        forces rejection sampling instead of IK sampling, causing error 99999.
-        """
-        req = MotionPlanRequest()
-        req.group_name   = p["group_name"]
-        req.planner_id   = "RRTConnectkConfigDefault"
-        req.pipeline_id  = "ompl"
-        req.num_planning_attempts = 20
-        req.allowed_planning_time = 2.0
-        req.max_velocity_scaling_factor     = p.get("transit_vel", p["vel_scale"])
-        # Use 0.3× vel for accel — gentler ramp-in/out, natural-looking motion.
-        req.max_acceleration_scaling_factor = p.get("transit_vel", p["vel_scale"]) * 0.3
-        req.workspace_parameters = self._build_workspace(p["world_frame"])
-
-        if start_state is not None:
-            req.start_state = start_state
-        else:
-            req.start_state.is_diff = True
-
-        # Position goal: EE origin inside a 2 cm sphere at (ee_x, ee_y, ee_z)
-        sphere = SolidPrimitive()
-        sphere.type = SolidPrimitive.SPHERE
-        sphere.dimensions = [0.02]
-
-        bv_pose = Pose()
-        bv_pose.position.x  = ee_x
-        bv_pose.position.y  = ee_y
-        bv_pose.position.z  = ee_z
-        bv_pose.orientation.w = 1.0
-
-        bv = BoundingVolume()
-        bv.primitives.append(sphere)
-        bv.primitive_poses.append(bv_pose)
-
-        pos_c = PositionConstraint()
-        pos_c.header.frame_id   = p["world_frame"]
-        pos_c.link_name         = p["ee_link"]
-        pos_c.constraint_region = bv
-        pos_c.weight            = 1.0
-
-        # Orientation goal: EE within 0.3 rad of pen_q (tip roughly vertical)
-        ori_c = OrientationConstraint()
-        ori_c.header.frame_id = p["world_frame"]
-        ori_c.link_name       = p["ee_link"]
-        ori_c.orientation     = pen_q
-        ori_c.absolute_x_axis_tolerance = 0.3
-        ori_c.absolute_y_axis_tolerance = 0.3
-        ori_c.absolute_z_axis_tolerance = 0.3
-        ori_c.weight          = 1.0
-
-        goal_c = Constraints()
-        goal_c.position_constraints.append(pos_c)
-        goal_c.orientation_constraints.append(ori_c)
-        req.goal_constraints.append(goal_c)
-
-        return req
-
-    # ------------------------------------------------------------------
-    # Pilz PTP request: joint-space move to an EE pose (deterministic IK)
-    # ------------------------------------------------------------------
-    def _build_pilz_ptp_request(self, ee_x, ee_y, ee_z, pen_q, p,
-                                start_state=None):
-        """
-        Pilz PTP to a Cartesian EE goal.
-
-        PTP is deterministic — it always picks the IK solution closest to the
-        current joint configuration, eliminating the 90° wrist-flip problem
-        that OMPL causes.  Orientation is respected exactly (within tilt_tol).
-
-        Joint path constraints are added to keep the IK solver within
-        joint_delta_rad of the current configuration — this prevents the
-        planner from picking a distant IK solution that requires a large
-        circular arc to reach.  Without this, PTP occasionally finds a valid
-        but distant solution and the arm sweeps a wide arc to reach it.
-
-        Use for: home move, approach navigate, return-to-start.
-        """
-        req = MotionPlanRequest()
-        req.group_name   = p["group_name"]
-        req.planner_id   = "PTP"
-        req.pipeline_id  = "pilz_industrial_motion_planner"
-        req.num_planning_attempts = 1          # Pilz is deterministic
-        req.allowed_planning_time = 10.0
-        # Transit phases (approach/return) run at transition_velocity_scaling
-        # for speed; the LIN builders (descend/ascend) use vel_scale for safety.
-        req.max_velocity_scaling_factor     = p.get("transit_vel", p["vel_scale"])
-        # 0.3× vel → gentler S-curve ramp, eliminates abrupt start/stop jerk
-        req.max_acceleration_scaling_factor = p.get("transit_vel", p["vel_scale"]) * 0.3
-        if start_state is not None:
-            req.start_state = start_state
-        else:
-            req.start_state.is_diff = True
-
-        # Joint path constraints — keep IK within joint_delta_rad of current pose.
-        # This prevents the IK solver from picking a distant solution that requires
-        # a 150°+ swing of joint_1 OR a ±180° mirror flip of joint_3.
-        # joint_3 sits near -180° at home; the IK solver can reach the equivalent
-        # +180° solution via a full forearm spin.  A tighter tolerance (1.0 rad)
-        # is applied to joint_1 and joint_3 specifically to block these spins.
-        if self._start_joints:
-            path_c = Constraints()
-            delta = p.get("joint_delta", 1.2)
-            # Joints that need tighter spin-prevention tolerances.
-            _TIGHT_JOINTS = {"joint_1": 1.0, "joint_3": 1.0}
-            for name in _GEN3_JOINTS:
-                cur = self._start_joints.get(name)
-                if cur is None:
-                    continue
-                jc = JointConstraint()
-                jc.joint_name      = name
-                jc.position        = cur
-                tol = _TIGHT_JOINTS.get(name, delta)
-                jc.tolerance_above = tol
-                jc.tolerance_below = tol
-                jc.weight          = 1.0
-                path_c.joint_constraints.append(jc)
-            req.path_constraints = path_c
-
-        sphere = SolidPrimitive()
-        sphere.type = SolidPrimitive.SPHERE
-        sphere.dimensions = [0.005]   # 5 mm — Pilz needs a near-point goal
-
-        bv_pose = Pose()
-        bv_pose.position.x = ee_x; bv_pose.position.y = ee_y
-        bv_pose.position.z = ee_z
-        bv_pose.orientation.x = pen_q.x; bv_pose.orientation.y = pen_q.y
-        bv_pose.orientation.z = pen_q.z; bv_pose.orientation.w = pen_q.w
-        bv = BoundingVolume()
-        bv.primitives.append(sphere)
-        bv.primitive_poses.append(bv_pose)
-
-        pos_c = PositionConstraint()
-        pos_c.header.frame_id   = p["world_frame"]
-        pos_c.link_name         = p["ee_link"]
-        pos_c.constraint_region = bv
-        pos_c.weight            = 1.0
-
-        ori_c = OrientationConstraint()
-        ori_c.header.frame_id           = p["world_frame"]
-        ori_c.link_name                 = p["ee_link"]
-        ori_c.orientation               = pen_q
-        ori_c.absolute_x_axis_tolerance = p["tilt_tol"]
-        ori_c.absolute_y_axis_tolerance = p["tilt_tol"]
-        ori_c.absolute_z_axis_tolerance = p["tilt_tol"]
-        ori_c.weight                    = 1.0
-
-        goal_c = Constraints()
-        goal_c.position_constraints.append(pos_c)
-        goal_c.orientation_constraints.append(ori_c)
-        req.goal_constraints.append(goal_c)
-        return req
-
-    # ------------------------------------------------------------------
-    # Pilz LIN request: straight Cartesian line with locked orientation
-    # ------------------------------------------------------------------
-    def _build_pilz_lin_request(self, ee_x, ee_y, ee_z, pen_q, p,
-                                start_state=None):
-        """
-        Pilz LIN: straight-line TCP motion with orientation held constant.
-
-        This is equivalent to Xbox controller twist-linear mode — the TCP
-        moves in a straight line and the wrist does not rotate.  Zero IK
-        ambiguity.  Use for descend, ascend, and Z-rise phases.
-
-        Pilz LIN requires the goal as a position+orientation constraint
-        on end_effector_link with tight (5 mm) position tolerance.
-        """
-        req = MotionPlanRequest()
-        req.group_name   = p["group_name"]
-        req.planner_id   = "LIN"
-        req.pipeline_id  = "pilz_industrial_motion_planner"
-        req.num_planning_attempts = 1
-        req.allowed_planning_time = 10.0
-        req.max_velocity_scaling_factor     = p["vel_scale"]
-        # LIN phases (descend/ascend) use lower accel for smooth insertion/retraction.
-        req.max_acceleration_scaling_factor = p["vel_scale"] * 0.3
-        if start_state is not None:
-            req.start_state = start_state
-        else:
-            req.start_state.is_diff = True
-
-        sphere = SolidPrimitive()
-        sphere.type = SolidPrimitive.SPHERE
-        sphere.dimensions = [0.005]
-
-        bv_pose = Pose()
-        bv_pose.position.x = ee_x; bv_pose.position.y = ee_y
-        bv_pose.position.z = ee_z
-        bv_pose.orientation.x = pen_q.x; bv_pose.orientation.y = pen_q.y
-        bv_pose.orientation.z = pen_q.z; bv_pose.orientation.w = pen_q.w
-        bv = BoundingVolume()
-        bv.primitives.append(sphere)
-        bv.primitive_poses.append(bv_pose)
-
-        pos_c = PositionConstraint()
-        pos_c.header.frame_id   = p["world_frame"]
-        pos_c.link_name         = p["ee_link"]
-        pos_c.constraint_region = bv
-        pos_c.weight            = 1.0
-
-        ori_c = OrientationConstraint()
-        ori_c.header.frame_id           = p["world_frame"]
-        ori_c.link_name                 = p["ee_link"]
-        ori_c.orientation               = pen_q
-        ori_c.absolute_x_axis_tolerance = 0.01   # LIN locks orientation tightly
-        ori_c.absolute_y_axis_tolerance = 0.01
-        ori_c.absolute_z_axis_tolerance = 0.01
-        ori_c.weight                    = 1.0
-
-        goal_c = Constraints()
-        goal_c.position_constraints.append(pos_c)
-        goal_c.orientation_constraints.append(ori_c)
-        req.goal_constraints.append(goal_c)
-        return req
-
-    def _pilz_single_step(self, ee_x, ee_y, ee_z, pen_q, p,
-                          start_state, label, motion_type="LIN",
-                          fallback_cartesian=True):
-        """
-        Plan and optionally execute a single Pilz LIN or PTP step.
-
-        Falls back to compute_cartesian_path if Pilz fails (LIN only).
-        Returns (ok, end_state).
-        """
-        if motion_type == "LIN":
-            req = self._build_pilz_lin_request(ee_x, ee_y, ee_z, pen_q, p,
-                                               start_state)
-        else:
-            req = self._build_pilz_ptp_request(ee_x, ee_y, ee_z, pen_q, p,
-                                               start_state)
-
-        ok, traj = self._call_plan(req)
-
-        if not ok and motion_type == "LIN" and fallback_cartesian:
-            self.get_logger().warn(
-                f"  [{label}] Pilz LIN failed — falling back to compute_cartesian_path.")
-            # Build a single-waypoint Cartesian request as fallback
-            wp = Pose()
-            wp.position.x = ee_x; wp.position.y = ee_y; wp.position.z = ee_z
-            wp.orientation = pen_q
-            if not self._cartesian_cli.wait_for_service(timeout_sec=5.0):
-                self.get_logger().error(f"  compute_cartesian_path not available ({label}).")
-                return False, None
-            creq = GetCartesianPath.Request()
-            creq.header.frame_id  = p["world_frame"]
-            creq.group_name       = p["group_name"]
-            creq.link_name        = p["tip_link"]
-            creq.waypoints        = [wp]
-            creq.max_step         = 0.005
-            creq.jump_threshold   = p["descend_jump"]
-            creq.avoid_collisions = True
-            if start_state is not None:
-                creq.start_state = start_state
-            else:
-                creq.start_state = RobotState()
-                creq.start_state.is_diff = True
-            f = self._cartesian_cli.call_async(creq)
-            resp = self._wait_for_future(f, timeout_sec=20.0)
-            if resp is None or resp.fraction < 0.99:
-                frac = resp.fraction if resp else 0.0
-                self.get_logger().error(
-                    f"  [{label}] Cartesian fallback also failed (fraction={frac:.2f}).")
-                return False, None
-            traj = resp.solution
-            self._rescale_cartesian_traj(traj, p["vel_scale"])
-            ok = True
-
-        if not ok:
-            self.get_logger().error(f"  [{label}] Pilz {motion_type} planning failed.")
-            return False, None
-
-        real = self.get_parameter("real_robot").value
-        if not validate_trajectory(traj, label, self.get_logger(), self._display_traj_pub, real):
-            return False, None
-
-        end_state = self._extract_end_state(traj)
-        if p["execute"]:
-            exec_ok = self._execute_traj(traj, label, timeout_sec=120.0,
-                                         use_moveit_execute=True)
-            return exec_ok, None
-        return True, end_state
-
-
-    def _approach(self, cx, cy, ready_z, cur_x, cur_y, cur_z, p, live_q, pen_q,
-                  ee_world_offset=None):
-        """
-        Phase 0a  Z rise   — Pilz LIN: lift straight up, orientation locked.
-        Phase 0b  Navigate — Pilz PTP: deterministic IK, no wrist-flip.
-
-        ee_world_offset: (wx, wy, wz) in world frame such that EE_origin = pen_tip + offset.
-                         Computed from TF lookup (preferred) or tip_ee_offset params.
-        """
-        # safe_z: tip height BEFORE the XY navigate move.
-        # When cur_z ≈ ready_z (arm already at approach height), skip the rise.
-        # When cur_z > ready_z significantly, cap safe_z at cur_z + a small buffer
-        # rather than adding lateral_rise — Pilz LIN fails on large vertical rises
-        # because the IK can't find a solution far from the current configuration.
-        # The PTP in Phase 0b handles any remaining height adjustment.
-        if abs(cur_z - ready_z) <= 0.05:
-            # Already at approach height — no rise needed, go straight to PTP
-            safe_z = cur_z
-        elif cur_z > ready_z:
-            # Arm is above approach height — no rise, PTP will descend safely
-            safe_z = cur_z
-        else:
-            # Arm is below approach height — rise to ready_z + 5cm buffer
-            # Cap rise at 10cm max for Pilz LIN reliability
-            rise_needed = ready_z - cur_z + 0.05
-            safe_z = cur_z + min(rise_needed, 0.10)
-        end_state = None
-
-        need_rise = safe_z > cur_z + 0.02
-
-        # Compute EE target at ready_z
-        if ee_world_offset is not None:
-            wx, wy, wz = ee_world_offset
-            ee_x = cx + wx
-            ee_y = cy + wy
-            ee_z = ready_z + wz
-        else:
-            ee_x, ee_y, ee_z = _tip_to_ee_pose(
-                cx, cy, ready_z,
-                (pen_q.x, pen_q.y, pen_q.z, pen_q.w),
-                (p["tip_ee_ox"], p["tip_ee_oy"], p["tip_ee_oz"]))
-
-        # Sanity check: EE target must be within arm reach
-        ee_dist = math.sqrt(ee_x**2 + ee_y**2 + ee_z**2)
-        tip_to_ee_dist = math.sqrt((ee_x-cx)**2 + (ee_y-cy)**2 + (ee_z-ready_z)**2)
-        if ee_dist > 0.95:
-            self.get_logger().error(
-                f"  [APPROACH] EE target ({ee_x:.3f}, {ee_y:.3f}, {ee_z:.3f}) "
-                f"is {ee_dist:.3f} m from base — OUTSIDE arm reach (max 0.902 m).\n"
-                f"  The tip_ee_offset is wrong for the current arm orientation.\n"
-                f"  Run: ros2 run tf2_ros tf2_echo end_effector_link pen_tip\n"
-                f"  and set use_tf_offset:=true or update tip_ee_offset_x/y/z.")
-            return False, None
-        if tip_to_ee_dist > 0.50:
-            self.get_logger().warn(
-                f"  [APPROACH] WARN: EE is {tip_to_ee_dist*100:.0f} cm from pen_tip target "
-                f"(expected ~{math.sqrt(p['tip_ee_ox']**2+p['tip_ee_oy']**2+p['tip_ee_oz']**2)*100:.0f} cm).\n"
-                f"  Check tip_ee_offset vs URDF pen_tip joint xyz.")
-
-        self.get_logger().info(
-            f"\n--- [Phase 0] Approach (Pilz PTP+LIN) ---\n"
-            f"  current tip: ({cur_x:.3f}, {cur_y:.3f}, {cur_z:.3f})\n"
-            f"  safe_z={safe_z:.3f} "
-            f"({'rise ' + f'{(safe_z-cur_z)*100:.0f} cm' if need_rise else 'already clear'})"
-            f"  ready_z={ready_z:.3f}\n"
-            f"  pen_tip target: ({cx:.3f}, {cy:.3f}, {ready_z:.3f})\n"
-            f"  EE   target:    ({ee_x:.3f}, {ee_y:.3f}, {ee_z:.3f})"
-            f"  dist_from_base={ee_dist:.3f} m  tip_to_ee={tip_to_ee_dist*100:.1f} cm")
-
-        if need_rise:
-            if ee_world_offset is not None:
-                er_x, er_y, er_z = cur_x+wx, cur_y+wy, safe_z+wz
-            else:
-                er_x, er_y, er_z = _tip_to_ee_pose(
-                    cur_x, cur_y, safe_z,
-                    (live_q.x, live_q.y, live_q.z, live_q.w),
-                    (p["tip_ee_ox"], p["tip_ee_oy"], p["tip_ee_oz"]))
-            self.get_logger().info(
-                f"  Phase 0a: Pilz LIN rise  z={cur_z:.3f} → {safe_z:.3f}")
-            ok, end_state = self._pilz_single_step(
-                er_x, er_y, er_z, live_q, p,
-                end_state, "0a_z_rise", motion_type="LIN")
-            if not ok:
-                return False, None
-        else:
-            self.get_logger().info(
-                f"  Phase 0a: skipped (already above safe_z={safe_z:.3f})")
-
-        self.get_logger().info(
-            f"  Phase 0b: Pilz PTP navigate → ({cx:.3f}, {cy:.3f}, {ready_z:.3f})")
-        ok, ptp_end = self._pilz_single_step(
-            ee_x, ee_y, ee_z, pen_q, p,
-            end_state, "0b_navigate_ptp", motion_type="PTP",
-            fallback_cartesian=False)
-
-        if ok:
-            end_state = ptp_end
-        else:
-            # Parallel OMPL fallback — run N attempts, pick lowest displacement.
-            self.get_logger().warn(
-                "  Phase 0b: Pilz PTP failed — falling back to parallel OMPL.\n"
-                f"  Running {p.get('parallel_plans', 5)} attempts simultaneously "
-                "and selecting the most direct path.")
-
-            def _build_ompl():
-                return self._build_ompl_approach_request(
-                    ee_x, ee_y, ee_z, pen_q, p, start_state=end_state)
-
-            ok, traj = self._plan_parallel(_build_ompl, p, label="0b_ompl")
-
-            if not ok:
-                self.get_logger().error(
-                    "  Phase 0b failed (Pilz PTP and parallel OMPL both failed).\n"
-                    "  Verify: ros2 run tf2_ros tf2_echo world assembly_tip")
-                return False, None
-            end_state = self._extract_end_state(traj)
-            if p["execute"]:
-                real = self.get_parameter("real_robot").value
-                if not validate_trajectory(traj, "0b_navigate_ompl", self.get_logger(), self._display_traj_pub, real):
-                    return False, None
-                ok = self._execute_traj(traj, "0b_navigate_ompl",
-                                        timeout_sec=120.0, use_moveit_execute=True)
-                if not ok:
-                    return False, None
-                end_state = None
-            else:
-                self.get_logger().info("  [PASS] Phase 0b parallel OMPL planned.")
-
-        self.get_logger().info("  [PASS] Approach complete.")
-        return True, end_state
-
-    def _descend(self, cx, cy, ready_z, target_z, p, pen_q,
-                 start_state=None, ee_world_offset=None):
-        """Phase 1: Pilz LIN straight down — orientation locked, no IK ambiguity."""
-        self.get_logger().info(
-            f"\n--- [Phase 1] Descend (Pilz LIN) -- "
-            f"z={ready_z:.3f} → z={target_z:.3f} m ---")
-        if ee_world_offset is not None:
-            wx, wy, wz = ee_world_offset
-            ee_x, ee_y, ee_z = cx+wx, cy+wy, target_z+wz
-        else:
-            ee_x, ee_y, ee_z = _tip_to_ee_pose(
-                cx, cy, target_z,
-                (pen_q.x, pen_q.y, pen_q.z, pen_q.w),
-                (p["tip_ee_ox"], p["tip_ee_oy"], p["tip_ee_oz"]))
-        ok, end_state = self._pilz_single_step(
-            ee_x, ee_y, ee_z, pen_q, p, start_state, "Descend", motion_type="LIN")
-        if not ok:
-            return False, None
-        self.get_logger().info("  [PASS] Descend complete.")
-        return True, end_state
-
-    # ------------------------------------------------------------------
-    # Phase 2 -- Hold at insert position
-    # ------------------------------------------------------------------
-    def _hold_at_target(self, cx, cy, target_z, p):
-        self.get_logger().info(
-            f"\n--- [Phase 2] Hold at insert position -- "
-            f"x={cx:.3f}  y={cy:.3f}  z={target_z:.3f} ---")
-
-        if p["execute"]:
-            self.get_logger().info(
-                f"  Holding for {p['post_wait']:.1f} s...")
-            time.sleep(p["post_wait"])
-            self.get_logger().info("  [PASS] Hold complete.")
-        else:
-            self.get_logger().info(
-                "  Dry-run -- hold skipped.  "
-                "Add -p execute_motion:=true to move.")
-
-        return True, None
-
-    # ------------------------------------------------------------------
-    # Phase 2.5 -- Ascend (Cartesian, mirror of descend)
-    # ------------------------------------------------------------------
-
-    def _ascend(self, cx, cy, target_z, ready_z, p, pen_q,
-                start_state=None, ee_world_offset=None):
-        """Phase 2.5: Pilz LIN straight up — orientation locked, mirror of descend."""
-        self.get_logger().info(
-            f"\n--- [Phase 2.5] Ascend (Pilz LIN) -- "
-            f"z={target_z:.3f} → z={ready_z:.3f} m ---")
-        if ee_world_offset is not None:
-            wx, wy, wz = ee_world_offset
-            ee_x, ee_y, ee_z = cx+wx, cy+wy, ready_z+wz
-        else:
-            ee_x, ee_y, ee_z = _tip_to_ee_pose(
-                cx, cy, ready_z,
-                (pen_q.x, pen_q.y, pen_q.z, pen_q.w),
-                (p["tip_ee_ox"], p["tip_ee_oy"], p["tip_ee_oz"]))
-        ok, end_state = self._pilz_single_step(
-            ee_x, ee_y, ee_z, pen_q, p, start_state, "Ascend", motion_type="LIN")
-        if not ok:
-            self.get_logger().warn(
-                "  Ascend failed — proceeding to return from current height.")
-            return True, None
-        self.get_logger().info("  [PASS] Ascend complete.")
-        return True, end_state
-
-    def _return_to_start(self, p, start_state=None):
-        self.get_logger().info("\n--- [Phase 3] Return to start joints ---")
-
-        goal_joints = {n: self._start_joints.get(n) for n in _GEN3_JOINTS}
-        missing = [n for n, v in goal_joints.items() if v is None]
-        if missing:
-            self.get_logger().warn(
-                f"  Missing joint states for {missing} -- skipping return.")
-            return
-
-        current_joints = {}
-        if start_state is not None and start_state.joint_state.name:
-            for name, pos in zip(start_state.joint_state.name,
-                                 start_state.joint_state.position):
-                if name in _GEN3_JOINTS:
-                    current_joints[name] = pos
-        else:
-            current_joints = dict(self._start_joints)
-
-        def _build_path_c(delta_rad):
-            c = Constraints()
-            for name in _GEN3_JOINTS:
-                cur  = current_joints.get(name, goal_joints.get(name, 0.0))
-                goal = goal_joints.get(name, cur)
-                mid  = (cur + goal) / 2.0
-                half_range = abs(cur - goal) / 2.0 + delta_rad
-                jc = JointConstraint()
-                jc.joint_name      = name
-                jc.position        = mid
-                jc.tolerance_above = half_range
-                jc.tolerance_below = half_range
-                jc.weight          = 1.0
-                c.joint_constraints.append(jc)
-            return c
-
-        def _build_ompl_return_req(attempts, plan_time, path_constraints=None):
-            req = MotionPlanRequest()
-            req.group_name   = p["group_name"]
-            req.planner_id   = "RRTConnectkConfigDefault"
-            req.pipeline_id  = "ompl"
-            req.num_planning_attempts = attempts
-            req.allowed_planning_time = plan_time
-            # Return-to-start uses transition speed (50%) — safe because it is a
-            # free-space joint move with no constraints near the container.
-            req.max_velocity_scaling_factor     = p.get("transit_vel", p["vel_scale"])
-            # Lower accel scaling → smooth ramp-out after the insertion is complete.
-            req.max_acceleration_scaling_factor = p.get("transit_vel", p["vel_scale"]) * 0.3
-            req.workspace_parameters = self._build_workspace(p["world_frame"])
-            if path_constraints is not None:
-                req.path_constraints = path_constraints
-            if start_state is not None:
-                req.start_state = start_state
-            else:
-                req.start_state.is_diff = True
-            goal_c = Constraints()
-            for name, position in goal_joints.items():
-                jc = JointConstraint()
-                jc.joint_name      = name
-                jc.position        = position
-                jc.tolerance_above = 0.01
-                jc.tolerance_below = 0.01
-                jc.weight          = 1.0
-                goal_c.joint_constraints.append(jc)
-            req.goal_constraints.append(goal_c)
-            return req
-
-        def _build_pilz_ptp_return_req():
-            """Pilz PTP to return to start joints — deterministic, minimal motion."""
-            req = MotionPlanRequest()
-            req.group_name   = p["group_name"]
-            req.planner_id   = "PTP"
-            req.pipeline_id  = "pilz_industrial_motion_planner"
-            req.num_planning_attempts = 1
-            req.allowed_planning_time = 10.0
-            # Return-to-start uses transition speed (50%) — safe free-space PTP.
-            req.max_velocity_scaling_factor     = p.get("transit_vel", p["vel_scale"])
-            # Gentle accel for smooth return to home.
-            req.max_acceleration_scaling_factor = p.get("transit_vel", p["vel_scale"]) * 0.3
-            if start_state is not None:
-                req.start_state = start_state
-            else:
-                req.start_state.is_diff = True
-            goal_c = Constraints()
-            for name, position in goal_joints.items():
-                jc = JointConstraint()
-                jc.joint_name      = name
-                jc.position        = position
-                jc.tolerance_above = 0.05
-                jc.tolerance_below = 0.05
-                jc.weight          = 1.0
-                goal_c.joint_constraints.append(jc)
-            req.goal_constraints.append(goal_c)
-            return req
-
-        # Try Pilz PTP first — deterministic, minimal motion, no random IK flips.
-        self.get_logger().info("  Planning return (Pilz PTP — deterministic)...")
-        ok, traj = self._call_plan(_build_pilz_ptp_return_req())
-        if ok:
-            self.get_logger().info("  [PASS] Return planned via Pilz PTP.")
-        else:
-            self.get_logger().warn(
-                "  Pilz PTP return failed — falling back to OMPL.")
-            self.get_logger().info(
-                "  Planning return (OMPL midpoint-centred constraint, +/-1.5 rad)...")
-            ok, traj = self._call_plan(
-                _build_ompl_return_req(20, 3.0, _build_path_c(1.5)))
-
-        if ok:
-            self.get_logger().info("  [PASS] Return planned (constrained, 1.5 rad).")
-        else:
-            self.get_logger().warn("  Attempt 1 failed -- loosening to +/-2.5 rad.")
-            ok, traj = self._call_plan(
-                _build_ompl_return_req(20, 3.0, _build_path_c(2.5)))
-            if ok:
-                self.get_logger().info(
-                    "  [PASS] Return planned (constrained, 2.5 rad).")
-            else:
-                self.get_logger().warn(
-                    "  Attempt 2 failed -- planning without path constraint.")
-                ok, traj = self._call_plan(_build_ompl_return_req(20, 3.0, None))
-                if not ok:
-                    self.get_logger().warn(
-                        "  Return planning failed -- arm stays at current position.")
-                    return
-                self.get_logger().info("  [PASS] Return planned (unconstrained OMPL).")
-
-        if p["execute"]:
-            real = self.get_parameter("real_robot").value
-            if validate_trajectory(traj, "Return", self.get_logger(), self._display_traj_pub, real):
-                self._execute_traj(traj, "Return", timeout_sec=120.0,
-                                   use_moveit_execute=True)
-
-    # ------------------------------------------------------------------
-    # Pre-phase: move to MoveIt Home (real robot gate)
-    # ------------------------------------------------------------------
-    def _normalize_home_joints(self) -> dict:
-        """
-        Normalize _GEN3_HOME_JOINTS so each target is within π rad of the
-        current joint position.
-
-        The canonical issue: joint_3 in _GEN3_HOME_JOINTS is -π (-180°), but
-        the arm reports +π (+180°) from /joint_states — both are the same
-        physical pose.  Normalizing only joint_3 removes the ambiguity in how
-        that pose is expressed. Other joints are left absolute to prevent shifting
-        to unreachable/invalid 2π wraps.
-        """
-        normalized = {}
-        for name, target in _GEN3_HOME_JOINTS.items():
-            cur = self._start_joints.get(name)
-            if cur is None:
-                normalized[name] = target
-                continue
-            
-            if name == "joint_3":
-                # Only normalize joint_3 because it's at the -π boundary (-180°)
-                diff = (target - cur + math.pi) % (2 * math.pi) - math.pi
-                best = cur + diff
-                if abs(best - target) > 1e-4:
-                    self.get_logger().info(
-                        f"  [home-norm] {name}: {math.degrees(target):.1f}° → "
-                        f"{math.degrees(best):.1f}° (normalized to current "
-                        f"{math.degrees(cur):.1f}°)")
-                normalized[name] = best
-            else:
-                normalized[name] = target
-        return normalized
-
-    def _move_to_home(self, p: dict) -> bool:
-        """
-        Move the arm to _GEN3_HOME_JOINTS using the best available path.
-
-        Strategy (three attempts in order):
-          1. Pilz PTP — deterministic, fastest to plan.
-             Accepted if the result passes _is_suspicious_trajectory.
-          2. Parallel OMPL — if Pilz PTP is suspicious (large joint_1 swing,
-             mid-path jump, etc.), run p['parallel_plans'] OMPL attempts
-             simultaneously and pick the lowest-scoring valid result.
-          3. Unconstrained OMPL fallback — if all parallel attempts fail or
-             are filtered, plan once without path constraints as last resort.
-
-        This mirrors the parallel planning used in Phase 0b so the home move
-        benefits from the same path quality guarantees when starting from an
-        unknown arm position.
-        """
-        self.get_logger().info("\n--- [Pre-phase] Move to Home position ---")
-        
-        # Ensure joint states are populated before doing any normalization or planning
-        self.get_logger().info("  Waiting for joint states to be populated...")
-        start_wait = time.time()
-        timeout = 5.0
-        while len(self._start_joints) < len(_GEN3_JOINTS) and (time.time() - start_wait) < timeout:
-            time.sleep(0.1)
-            
-        if len(self._start_joints) < len(_GEN3_JOINTS):
-            self.get_logger().error(
-                f"  Failed to populate joint states within {timeout}s!\n"
-                f"  Current joints in cache: {list(self._start_joints.keys())}")
-            return False
-
-        home_vel = max(p["vel_scale"], 0.15)
-
-        # Normalise home joint targets relative to the current arm position.
-        norm_home = self._normalize_home_joints()
-        self.get_logger().info(
-            f"  Normalised home targets (°): "
-            + ", ".join(f"{n}={math.degrees(v):.1f}" for n, v in norm_home.items()))
-
-        def _build_joint_goal_req(use_ompl: bool = False,
-                                  n_attempts: int = 1) -> MotionPlanRequest:
-            req = MotionPlanRequest()
-            req.group_name = p["group_name"]
-            if use_ompl:
-                req.planner_id   = "RRTConnectkConfigDefault"
-                req.pipeline_id  = "ompl"
-                req.num_planning_attempts = n_attempts
-                req.allowed_planning_time = 15.0
-                # No path constraints for the home move.
-                #
-                # Path constraints centred at the current configuration (±1.2 rad)
-                # prevent OMPL from reaching home when the arm starts far away.
-                # Example: current joint_6 = +55° (0.96 rad), home = -102.7°
-                # (-1.79 rad) → 2.75 rad apart, well outside the ±1.2 rad window.
-                # OMPL would "succeed" but settle at the closest reachable point
-                # (e.g. joint_6 ≈ 64°, joint_7 ≈ 74°) rather than true home.
-                #
-                # The home move is purely joint-space so OMPL doesn't need
-                # path constraints to avoid Cartesian-space hazards.
-                # _is_suspicious_trajectory still filters out 360° spins / arcs.
-            else:
-                req.planner_id   = "PTP"
-                req.pipeline_id  = "pilz_industrial_motion_planner"
-                req.num_planning_attempts = 1
-                req.allowed_planning_time = 10.0
-            req.max_velocity_scaling_factor     = home_vel
-            # Gentle acceleration keeps home move smooth even at 15%+ velocity.
-            req.max_acceleration_scaling_factor = home_vel * 0.3
-            req.workspace_parameters = self._build_workspace(p["world_frame"])
-            req.start_state.is_diff = True
-            goal_c = Constraints()
-            for name, position in norm_home.items():
-                jc = JointConstraint()
-                jc.joint_name      = name
-                jc.position        = position
-                jc.tolerance_above = 0.05
-                jc.tolerance_below = 0.05
-                jc.weight          = 1.0
-                goal_c.joint_constraints.append(jc)
-            req.goal_constraints.append(goal_c)
-            return req
-
-        # ── Attempt 1: Pilz PTP ───────────────────────────────────────────
-        self.get_logger().info("  Planning home move via Pilz PTP...")
-        ok, traj = self._call_plan(_build_joint_goal_req(use_ompl=False))
-        chosen_method = "Pilz PTP"
-
-        if ok and traj:
-            suspicious, reason = self._is_suspicious_trajectory(traj, p, 0.0)
-            if suspicious:
-                self.get_logger().warn(
-                    f"  Pilz PTP home path rejected — {reason}.\n"
-                    f"  Falling back to parallel OMPL for home move.")
-                ok = False   # force fallback
-
-        # ── Attempt 2: Parallel OMPL ──────────────────────────────────────
-        if not ok:
-            n = int(p.get("parallel_plans", 5))
-            self.get_logger().info(
-                f"  Planning home move via parallel OMPL "
-                f"({n} attempts)...")
-            ok, traj = self._plan_parallel(
-                lambda: _build_joint_goal_req(use_ompl=True, n_attempts=1),
-                p, label="home_ompl")
-            chosen_method = f"parallel OMPL ({n} attempts)"
-
-        # ── Attempt 3: Unconstrained OMPL fallback ────────────────────────
-        if not ok:
-            self.get_logger().warn(
-                "  Parallel OMPL home also failed — "
-                "trying unconstrained OMPL as last resort.")
-            req = _build_joint_goal_req(use_ompl=True, n_attempts=20)
-            req.path_constraints = Constraints()   # clear constraints
-            req.allowed_planning_time = 30.0
-            ok, traj = self._call_plan(req)
-            chosen_method = "unconstrained OMPL (last resort)"
-
-        if not ok or traj is None:
-            self.get_logger().error("  Home move planning failed on all attempts.")
-            return False
-
-        # ── Validate and report ───────────────────────────────────────────
-        real = self.get_parameter("real_robot").value
-        if not validate_trajectory(traj, "move_to_home", self.get_logger(), self._display_traj_pub, real):
-            return False
-
-        pts = traj.joint_trajectory.points
-        dur = (pts[-1].time_from_start.sec + pts[-1].time_from_start.nanosec * 1e-9
-               ) if pts else 0.0
-        _, stats = self._score_trajectory(
-            traj, p.get("j1_weight", 0.4), p.get("duration_weight", 0.2))
-        self.get_logger().info(
-            f"  [PASS] Home move planned via {chosen_method}\n"
-            f"    duration  = {dur:.1f} s at {home_vel*100:.0f}% velocity\n"
-            f"    joint_1   = {math.degrees(stats.get('j1_disp', 0)):.1f}°\n"
-            f"    total disp= {stats.get('total_disp', 0):.3f} rad")
-
-        if not p["execute"]:
-            return True
-
-        # ── Execute via direct FJT (loose path tolerance, avoids -4 CONTROL_FAILED) ──
-        # MoveIt's /execute_trajectory enforces the 0.1 rad path tolerance from
-        # ros2_controllers.yaml.  If the arm falls even slightly behind the commanded
-        # trajectory (common near joint limits or at velocity peaks), the controller
-        # trips this tolerance and aborts with error -4 — the "moves halfway then
-        # stops" symptom.  The direct FJT path sets path_tolerance = 5.0 rad
-        # (effectively disabled) so the arm tracks to completion.
-        clamp_traj_limits(traj)
-        ok = self._execute_traj(traj, "move_to_home",
-                                timeout_sec=dur + 60.0,
-                                use_moveit_execute=False)
-        if ok:
-            self.get_logger().info("  [PASS] move_to_home executed.")
-            self._arm_moved = True
-            
-            # Settle and verify that the physical joints actually reached the home position
-            self.get_logger().info("  Verifying physical joint positions at home...")
-            time.sleep(1.0)
-            current_joints = dict(self._start_joints)
-            reached_home = True
-            tolerance = 0.05 # rad (~2.8 degrees)
-            
-            for name, target in _GEN3_HOME_JOINTS.items():
-                cur = current_joints.get(name)
-                if cur is None:
-                    self.get_logger().error(f"  [VERIFY] Missing joint state for {name} after home move.")
-                    reached_home = False
-                    break
-                    
-                if name == "joint_3":
-                    # For joint_3, check target and target + 2π equivalents
-                    diff = (target - cur + math.pi) % (2 * math.pi) - math.pi
-                    err = abs(diff)
-                else:
-                    err = abs(target - cur)
-                    
-                if err > tolerance:
-                    self.get_logger().error(
-                        f"  [VERIFY] Joint {name} failed to reach home!\n"
-                        f"    Target: {math.degrees(target):.2f}°, Current: {math.degrees(cur):.2f}° "
-                        f"(Err: {math.degrees(err):.2f}° > {math.degrees(tolerance):.1f}°)")
-                    reached_home = False
-                    
-            if not reached_home:
-                self.get_logger().error("  [VERIFY] Robot did not reach calibrated home position. Aborting.")
-                return False
-                
-            self.get_logger().info("  [VERIFY] Arm successfully verified at calibrated home position.")
-            
-        return ok
-
-    # ------------------------------------------------------------------
-    # Insert target preview marker (RViz)
-    # ------------------------------------------------------------------
-    def _publish_target_marker(self, cx, cy, target_z, ready_z,
-                               container_h, table_z, world_frame):
-        """
-        Publish a MarkerArray to /insert_preview for RViz verification.
-
-        id=0  CYLINDER  — approximate container outline (semi-transparent)
-        id=1  SPHERE    — insert target point (yellow)
-        id=2  ARROW     — approach: from ready_z down to target_z (green)
-        id=3  TEXT      — label with key numbers
-        """
-        now = self.get_clock().now().to_msg()
-        markers = MarkerArray()
-
-        def _base(mid, mtype, r, g, b, a=1.0):
-            m = Marker()
-            m.header.frame_id = world_frame
-            m.header.stamp    = now
-            m.ns              = "insert_preview"
-            m.id              = mid
-            m.type            = mtype
-            m.action          = Marker.ADD
-            m.color           = ColorRGBA(r=r, g=g, b=b, a=a)
-            m.pose.orientation.w = 1.0
-            m.lifetime.sec    = 0
-            m.lifetime.nanosec = 0
-            return m
-
-        # id 0: container outline (cylinder)
-        cont = _base(0, Marker.CYLINDER, 0.2, 0.6, 1.0, 0.25)
-        cont.pose.position.x = cx
-        cont.pose.position.y = cy
-        cont.pose.position.z = table_z + container_h / 2.0
-        cont.scale.x = 0.08   # approximate 8 cm diameter
-        cont.scale.y = 0.08
-        cont.scale.z = container_h
-        markers.markers.append(cont)
-
-        # id 1: insert target sphere
-        target = _base(1, Marker.SPHERE, 1.0, 1.0, 0.0)  # yellow
-        target.pose.position.x = cx
-        target.pose.position.y = cy
-        target.pose.position.z = target_z
-        target.scale.x = 0.015
-        target.scale.y = 0.015
-        target.scale.z = 0.015
-        markers.markers.append(target)
-
-        # id 2: approach arrow (from ready_z down to target_z)
-        arrow = _base(2, Marker.ARROW, 0.0, 1.0, 0.2)   # green
-        arrow.scale.x = 0.008
-        arrow.scale.y = 0.016
-        arrow.scale.z = 0.020
-        arrow.points = [
-            Point(x=cx, y=cy, z=ready_z),
-            Point(x=cx, y=cy, z=target_z),
-        ]
-        markers.markers.append(arrow)
-
-        # id 3: text label
-        label = _base(3, Marker.TEXT_VIEW_FACING, 1.0, 1.0, 1.0)
-        label.pose.position.x = cx
-        label.pose.position.y = cy
-        label.pose.position.z = table_z + container_h + 0.06
-        label.scale.z = 0.035
-        label.text = (
-            f"insert target ({cx:.3f}, {cy:.3f}, {target_z:.3f})\n"
-            f"container_height={container_h*100:.0f} cm\n"
-            f"approach z={ready_z:.3f} m"
-        )
-        markers.markers.append(label)
-
-        self._marker_pub.publish(markers)
-        self.get_logger().info(
-            f"  [Marker] Insert preview published to /insert_preview\n"
-            f"           In RViz2: Add -> By topic -> /insert_preview -> MarkerArray\n"
-            f"           Fixed Frame must be '{world_frame}'"
-        )
-
-    # ------------------------------------------------------------------
-    # Parallel planner — run N planning attempts simultaneously, pick best
-    # ------------------------------------------------------------------
-
-    def _score_trajectory(self, traj: RobotTrajectory,
-                          j1_weight:       float = 0.4,
-                          duration_weight: float = 0.2) -> tuple:
-        """
-        Score a trajectory for path quality selection.  Returns a tuple
-        (score, stats_dict) where lower score = more preferred path.
-
-        Scoring formula (all components normalised to comparable units):
-          displacement_score = (1 - j1_weight) * total_disp
-                             + j1_weight * 3.0  * j1_disp
-          duration_score     = duration / 30.0   (normalised; 30s ≈ typical long path)
-          combined_score     = (1 - duration_weight) * displacement_score
-                             + duration_weight       * duration_score
-
-        Why include duration:
-          Duration and joint displacement are correlated for normal paths — a
-          short, direct path moves fewer joints and takes less time.  However,
-          OMPL occasionally produces paths with low displacement but long
-          duration (many waypoints, small steps, inefficient timing) or vice
-          versa.  Including duration breaks ties between similar displacement
-          scores and catches these edge cases.
-
-        Parameters
-        ----------
-        j1_weight       : 0–1, weight on joint_1 vs other joints (default 0.4).
-                          Higher = penalise base rotation more.
-        duration_weight : 0–1, weight on duration vs displacement (default 0.2).
-                          0.2 means 20% of the score comes from duration.
-                          Increase to 0.4 if you observe fast but odd paths being
-                          rejected in favour of slow normal ones.
-
-        Returns
-        -------
-        (score, stats) — score is float (lower = better),
-                         stats is dict with keys: total_disp, j1_disp, duration,
-                         max_single_jump, waypoints, displacement_score, duration_score
-        """
-        pts   = traj.joint_trajectory.points
-        names = traj.joint_trajectory.joint_names
-        stats = dict(total_disp=0.0, j1_disp=0.0, duration=0.0,
-                     max_single_jump=0.0, waypoints=len(pts),
-                     displacement_score=float('inf'), duration_score=float('inf'))
-
-        if len(pts) < 2:
-            return float('inf'), stats
-
-        j1_idx = names.index("joint_1") if "joint_1" in names else -1
-
-        total_disp     = 0.0
-        j1_disp        = 0.0
-        max_jump       = 0.0   # largest single-step joint displacement anywhere
-
-        for i in range(1, len(pts)):
-            step_max = 0.0
-            for j, _ in enumerate(names):
-                if j >= len(pts[i].positions) or j >= len(pts[i-1].positions):
-                    continue
-                d = abs(pts[i].positions[j] - pts[i-1].positions[j])
-                total_disp += d
-                step_max    = max(step_max, d)
-                if j == j1_idx:
-                    j1_disp += d
-            max_jump = max(max_jump, step_max)
-
-        last = pts[-1].time_from_start
-        duration = last.sec + last.nanosec * 1e-9
-
-        disp_score = (1.0 - j1_weight) * total_disp + j1_weight * 3.0 * j1_disp
-        dur_score  = duration / 30.0   # normalise to [0, 1] range for typical paths
-
-        combined = (1.0 - duration_weight) * disp_score + duration_weight * dur_score
-
-        stats.update(dict(
-            total_disp        = total_disp,
-            j1_disp           = j1_disp,
-            duration          = duration,
-            max_single_jump   = max_jump,
-            waypoints         = len(pts),
-            displacement_score= disp_score,
-            duration_score    = dur_score,
-        ))
-        return combined, stats
-
-    def _is_suspicious_trajectory(self, traj: RobotTrajectory,
-                                   p: dict,
-                                   ready_z: float) -> tuple:
-        """
-        Filter out geometrically suspicious trajectories before scoring.
-
-        Returns (is_suspicious, reason_string).  Suspicious trajectories are
-        discarded from the parallel results pool rather than scored — this
-        prevents a low-displacement-but-odd path from being selected.
-
-        Checks
-        ------
-        1. Max single-step joint displacement > SUSPICIOUS_STEP_RAD.
-           Normal smooth paths have steps < 0.1 rad per waypoint.
-        2. Joint_1 total displacement > 120° (2.09 rad).
-           Any path requiring > 120° base rotation is a circular arc.
-        3. Joint_3 total displacement > 120° (2.09 rad).
-           Joint_3 sits near ±180° at home; the IK solver can pick the mirror
-           solution causing a full forearm spin.  Same limit as joint_1.
-        4. Duration is suspiciously short (< 1.5 s) for a path with many
-           waypoints — indicates velocity scaling was ignored.
-        5. Trajectory is excessively long (> 60 s) — planning artefact.
-        """
-        pts   = traj.joint_trajectory.points
-        names = traj.joint_trajectory.joint_names
-        if len(pts) < 2:
-            return True, "empty trajectory"
-
-        j1_idx    = names.index("joint_1") if "joint_1" in names else -1
-        j3_idx    = names.index("joint_3") if "joint_3" in names else -1
-        j1_total  = 0.0
-        j3_total  = 0.0
-        max_step  = 0.0
-
-        for i in range(1, len(pts)):
-            for j, _ in enumerate(names):
-                if j >= len(pts[i].positions) or j >= len(pts[i-1].positions):
-                    continue
-                d = abs(pts[i].positions[j] - pts[i-1].positions[j])
-                if d > max_step:
-                    max_step = d
-                if j == j1_idx:
-                    j1_total += d
-                if j == j3_idx:
-                    j3_total += d
-
-        last     = pts[-1].time_from_start
-        duration = last.sec + last.nanosec * 1e-9
-
-        if max_step > SUSPICIOUS_STEP_RAD:
-            return True, (f"large mid-path jump {math.degrees(max_step):.1f}°/step "
-                          f"> {math.degrees(SUSPICIOUS_STEP_RAD):.1f}°")
-        if j1_idx >= 0 and j1_total > math.radians(120):
-            return True, f"joint_1 swings {math.degrees(j1_total):.1f}° > 120° (circular arc)"
-        if j3_idx >= 0 and j3_total > math.radians(120):
-            return True, f"joint_3 spins {math.degrees(j3_total):.1f}° > 120° (IK mirror flip)"
-        if len(pts) > 10 and duration < 1.5:
-            return True, f"suspiciously short duration {duration:.2f}s for {len(pts)} waypoints"
-        if duration > 60.0:
-            return True, f"excessively long duration {duration:.1f}s"
-
-        return False, ""
-
-    def _call_plan_threadsafe(self, motion_req: MotionPlanRequest):
-        """
-        Thread-safe planning call using a per-call service client.
-
-        The shared self._plan_cli cannot be called from multiple threads
-        simultaneously (the Future object is not thread-safe).  Creating a
-        new client per call is safe because MoveIt's /plan_kinematic_path
-        service handles concurrent requests correctly on the server side.
-        """
-        cli = self.create_client(
-            GetMotionPlan, "/plan_kinematic_path",
-            callback_group=self._cb_group)
-        if not cli.wait_for_service(timeout_sec=5.0):
-            return False, None
-        svc_req = GetMotionPlan.Request()
-        svc_req.motion_plan_request = motion_req
-        f = cli.call_async(svc_req)
-        result = self._wait_for_future(f, timeout_sec=45.0)
-        if result is None:
-            return False, None
-        resp = result.motion_plan_response
-        if resp.error_code.val == 1:
-            return True, resp.trajectory
-        return False, None
-
-    def _plan_parallel(self, build_req_fn, p: dict, label: str = "parallel"):
-        """
-        Run p['parallel_plans'] planning calls simultaneously, filter suspicious
-        results, score the rest, and return the best trajectory.
-
-        Each attempt uses a fresh MotionPlanRequest so OMPL uses a different
-        random seed.  Results are filtered through _is_suspicious_trajectory
-        before scoring — this prevents geometrically odd paths (circular arcs,
-        velocity-scaling violations) from being selected even if their raw
-        displacement score happens to be low.
-
-        The scoring table is printed for every run so you can see why each
-        path was accepted/rejected and what was selected.
-
-        Parameters (from p dict)
-        ------------------------
-        parallel_plans   : number of simultaneous attempts (default 5, use 10-15)
-        parallel_timeout : seconds to wait for all attempts (default 30)
-        j1_weight        : joint_1 penalty weight in scorer (default 0.4)
-        duration_weight  : duration penalty weight in scorer (default 0.2)
-        """
-        n            = int(p.get("parallel_plans",   5))
-        timeout      = float(p.get("parallel_timeout", 30.0))
-        j1_w         = float(p.get("j1_weight",       0.4))
-        dur_w        = float(p.get("duration_weight",  0.2))
-
-        if n <= 1:
-            return self._call_plan(build_req_fn())
-
-        self.get_logger().info(
-            f"  [Parallel] Starting {n} attempts "
-            f"(j1_weight={j1_w:.1f}, duration_weight={dur_w:.1f})...")
-
-        # (score, attempt_idx, trajectory, stats_dict)
-        results   = []
-        discarded = []   # (attempt_idx, reason)
-        lock      = threading.Lock()
-
-        def _attempt(idx):
-            req = build_req_fn()
-            req.num_planning_attempts = idx + 1   # different OMPL seed per attempt
-            ok, traj = self._call_plan_threadsafe(req)
-            if not ok or not traj:
-                with lock:
-                    discarded.append((idx, "planning failed"))
-                return
-
-            suspicious, reason = self._is_suspicious_trajectory(traj, p, 0.0)
-            if suspicious:
-                with lock:
-                    discarded.append((idx, f"filtered: {reason}"))
-                return
-
-            score, stats = self._score_trajectory(traj, j1_w, dur_w)
-            with lock:
-                results.append((score, idx, traj, stats))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
-            futures = [pool.submit(_attempt, i) for i in range(n)]
-            concurrent.futures.wait(futures, timeout=timeout)
-
-        # Print summary table
-        all_rows = []
-        for score, idx, _, stats in results:
-            all_rows.append((idx, "✓ accepted", score, stats))
-        for idx, reason in discarded:
-            all_rows.append((idx, reason, float('inf'),
-                             dict(j1_disp=0, duration=0, total_disp=0,
-                                  max_single_jump=0, waypoints=0)))
-        all_rows.sort(key=lambda r: r[0])
-
-        header = (f"  {'#':>2}  {'status':<26}  "
-                  f"{'score':>7}  {'dur(s)':>6}  "
-                  f"{'j1(°)':>6}  {'tot(rad)':>8}  {'pts':>4}")
-        self.get_logger().info(f"\n  [Parallel] Results ({len(results)} valid / {n} total):\n"
-                               + header + "\n" + "  " + "-"*72)
-        for idx, status, score, stats in all_rows:
-            j1_deg = math.degrees(stats.get("j1_disp", 0))
-            dur    = stats.get("duration", 0)
-            tot    = stats.get("total_disp", 0)
-            pts    = stats.get("waypoints", 0)
-            sc_str = f"{score:.3f}" if score < float('inf') else "  —  "
-            self.get_logger().info(
-                f"  {idx:>2}  {status:<26}  "
-                f"{sc_str:>7}  {dur:>6.1f}  "
-                f"{j1_deg:>6.1f}  {tot:>8.3f}  {pts:>4}")
-
-        if not results:
-            # All attempts filtered — relax filtering and try once more
-            self.get_logger().warn(
-                "  [Parallel] All attempts were filtered as suspicious.\n"
-                "  Relaxing filter and accepting best unfiltered result...")
-            fallback_results = []
-            for idx, reason in discarded:
-                if "planning failed" not in reason:
-                    # Re-plan this attempt without filtering
-                    req = build_req_fn()
-                    req.num_planning_attempts = idx + 1
-                    ok, traj = self._call_plan_threadsafe(req)
-                    if ok and traj:
-                        score, stats = self._score_trajectory(traj, j1_w, dur_w)
-                        fallback_results.append((score, idx, traj, stats))
-            if not fallback_results:
-                self.get_logger().error(
-                    f"  [Parallel] All {n} planning attempts failed.")
-                return False, None
-            fallback_results.sort(key=lambda r: r[0])
-            best = fallback_results[0]
-            self.get_logger().warn(
-                f"  [Parallel] Using fallback attempt {best[1]} "
-                f"score={best[0]:.3f} — verify trajectory in RViz before executing.")
-            return True, best[2]
-
-        results.sort(key=lambda r: r[0])
-        best_score, best_idx, best_traj, best_stats = results[0]
-        worst_score = results[-1][0]
-        improvement = (1 - best_score / worst_score) * 100 if worst_score > 0 else 0
-
-        self.get_logger().info(
-            f"\n  [Parallel] ★ Selected attempt {best_idx}:\n"
-            f"    score       = {best_score:.3f}\n"
-            f"    duration    = {best_stats['duration']:.1f} s\n"
-            f"    joint_1     = {math.degrees(best_stats['j1_disp']):.1f}°\n"
-            f"    total disp  = {best_stats['total_disp']:.3f} rad\n"
-            f"    waypoints   = {best_stats['waypoints']}\n"
-            f"    improvement = {improvement:.0f}% vs worst accepted path")
-
-        return True, best_traj
-
-    # ------------------------------------------------------------------
-    # Action server callbacks
-    # ------------------------------------------------------------------
-
-    def _action_goal_cb(self, goal_request):
-        """Accept or reject incoming action goals."""
-        if self._action_goal_handle is not None:
-            self.get_logger().warn(
-                "Action server: rejecting new goal — insertion already in progress.")
-            return GoalResponse.REJECT
-        self.get_logger().info(
-            f"Action server: accepted goal "
-            f"target=({goal_request.target_x:.3f}, {goal_request.target_y:.3f})"
-            f"  hover={goal_request.hover_above_top:.3f} m"
-            f"  dry_run={goal_request.dry_run}")
-        return GoalResponse.ACCEPT
-
     def _action_cancel_cb(self, goal_handle):
-        """Handle cancellation — stop the arm immediately."""
         self.get_logger().warn("Action server: cancel requested — stopping arm.")
         self._cancel_active()
         return CancelResponse.ACCEPT
 
     def _action_execute_cb(self, goal_handle):
-        """
-        Execute the full insertion sequence for an action goal.
-
-        The goal overrides target_x, target_y, hover_above_top, and dry_run.
-        All other parameters come from the node's ROS parameters.
-        Uses the same _run_once_impl logic but publishes feedback at each phase
-        and returns a structured result instead of logging only.
-        """
         self._action_goal_handle = goal_handle
-        goal = goal_handle.request
+        result = InsertContainer.Result()
+        result.success = False
 
-        # Build feedback and result objects
-        if _HAS_ACTION_INTERFACE:
-            feedback = InsertContainer.Feedback()
-            result   = InsertContainer.Result()
-        else:
-            return  # should not reach here
+        def _pub_fb(phase, prog):
+            fb = InsertContainer.Feedback()
+            fb.current_phase = phase
+            fb.progress = float(prog)
+            goal_handle.publish_feedback(fb)
 
-        def fb(phase: str, progress: float):
-            if goal_handle.is_active:
-                feedback.current_phase = phase
-                feedback.progress      = float(progress)
-                goal_handle.publish_feedback(feedback)
-            self.get_logger().info(
-                f"  [Action] Phase: {phase}  progress={progress*100:.0f}%")
-
-        def abort(msg: str):
-            result.success = False
-            result.message = msg
-            self.get_logger().error(f"  [Action] Aborting: {msg}")
-            self._recovery_return()
-            goal_handle.abort(result)
-            self._action_goal_handle = None
-            return result
-
-        # Override parameters from goal
-        p = self._get_params()
-        # Goal can specify target in metres (target_x/y) OR centimetres (forward_cm/sideways_cm).
-        # Centimetre inputs take priority if non-zero — this lets calling scripts
-        # use the same natural cm convention as the interactive prompt.
-        if hasattr(goal, 'forward_cm') and goal.forward_cm != 0.0:
-            p["target_x"] = goal.forward_cm  / 100.0
-            p["target_y"] = goal.sideways_cm / 100.0
-            self.get_logger().info(
-                f"  [Action] Using cm input: "
-                f"{goal.forward_cm:.0f} cm fwd, {goal.sideways_cm:.0f} cm side → "
-                f"({p['target_x']:.3f}, {p['target_y']:.3f}) m")
-        else:
-            p["target_x"] = goal.target_x
-            p["target_y"] = goal.target_y
-        p["hover_above_top"] = goal.hover_above_top
-        p["execute"]         = not goal.dry_run
-
-        # --- Home move (optional) ---
-        fb("home_move", 0.0)
-        if not goal.skip_home_move and not goal.dry_run:
-            if not self._move_to_home(p):
-                return abort("Home move failed")
-            time.sleep(1.5)
-
-        # Freeze joints
-        self._js_frozen = True
-
-        # --- Pre-flight ---
-        fb("preflight", 0.05)
-        if not self._preflight_check(p):
-            return abort("Pre-flight check failed")
-
-        # --- Compute geometry (same as _run_once_impl) ---
-        container_top = p["table_z"] + p["container_h"]
-        target_z      = container_top + p["hover_above_top"]
-        ready_z       = container_top + p["approach"]
-        cx, cy        = p["target_x"], p["target_y"]
-        p["ready_z"]  = ready_z
-        p["target_z"] = target_z
-
-        self._publish_target_marker(
-            cx, cy, target_z, ready_z,
-            p["container_h"], p["table_z"], p["world_frame"])
-
-        tip_tf, ee_tf = self._get_tip_tf(p, timeout_sec=5.0)
-        if tip_tf is None:
-            return abort("TF lookup failed — is robot_state_publisher running?")
-
-        t = tip_tf.transform.translation
-        cur_x, cur_y, cur_z = t.x, t.y, t.z
-        r = ee_tf.transform.rotation
-        live_q = Quaternion(x=r.x, y=r.y, z=r.z, w=r.w)
-        pen_q  = live_q if self.get_parameter("use_current_orientation").value \
-                       else Quaternion(x=p["qx"], y=p["qy"], z=p["qz"], w=p["qw"])
-
-        # Compute EE world offset from TF
-        ee_world_offset = None
         try:
-            wx = ee_tf.transform.translation.x - cur_x
-            wy = ee_tf.transform.translation.y - cur_y
-            wz = ee_tf.transform.translation.z - cur_z
-            ee_world_offset = (wx, wy, wz)
-        except Exception:
-            pass
+            self._run_impl(goal_handle, _pub_fb)
+            result.success = True
+            result.message = "Insertion complete."
+            goal_handle.succeed()
+        except Exception as e:
+            self.get_logger().error(f"Execution failed: {e}")
+            result.message = str(e)
+            goal_handle.abort()
+        finally:
+            self._action_goal_handle = None
+            self._arm_moved = False
+            self._js_frozen = False
 
-        # --- Phase 0: Approach ---
-        fb("approach", 0.10)
-        if goal_handle.is_cancel_requested:
-            return abort("Cancelled before approach")
-        ok, level_end = self._approach(cx, cy, ready_z, cur_x, cur_y, cur_z,
-                                       p, live_q, pen_q,
-                                       ee_world_offset=ee_world_offset)
-        if not ok:
-            return abort("Approach failed")
-
-        # --- Phase 1: Descend ---
-        fb("descend", 0.35)
-        if goal_handle.is_cancel_requested:
-            return abort("Cancelled before descend")
-        ok, descend_end = self._descend(cx, cy, ready_z, target_z, p, pen_q,
-                                        start_state=level_end,
-                                        ee_world_offset=ee_world_offset)
-        if not ok:
-            return abort("Descend failed")
-
-        # --- Phase 2: Hold ---
-        fb("hold", 0.60)
-        ok, _ = self._hold_at_target(cx, cy, target_z, p)
-        if not ok:
-            return abort("Hold failed")
-
-        # --- Phase 2.5: Ascend ---
-        fb("ascend", 0.75)
-        if goal_handle.is_cancel_requested:
-            return abort("Cancelled before ascend")
-        ok, ascend_end = self._ascend(cx, cy, target_z, ready_z, p, pen_q,
-                                      start_state=descend_end,
-                                      ee_world_offset=ee_world_offset)
-        if not ok:
-            return abort("Ascend failed")
-
-        # --- Phase 3: Return ---
-        fb("return", 0.90)
-        if p["ret"]:
-            return_from = ascend_end if ascend_end is not None else descend_end
-            self._return_to_start(p, start_state=return_from)
-
-        fb("complete", 1.0)
-        result.success = True
-        result.message = f"Insertion complete at ({cx:.3f}, {cy:.3f})"
-        goal_handle.succeed(result)
-        self._action_goal_handle = None
-        self.get_logger().info(f"  [Action] {result.message}")
         return result
 
-    # ------------------------------------------------------------------
-    # Interactive container position prompt
-    # ------------------------------------------------------------------
+    def _run_impl(self, goal_handle, pub_fb):
+        vel_scale  = self.get_parameter("max_velocity_scaling").value
+        execute    = not goal_handle.request.dry_run
+        real_robot = self.get_parameter("real_robot").value
+        world_frame= self.get_parameter("world_frame").value
+        tip_link   = self.get_parameter("tip_link").value
+        ee_link    = self.get_parameter("ee_link").value
+        group_name = self.get_parameter("move_group_name").value
+        table_z    = self.get_parameter("table_z").value
+        cont_h     = self.get_parameter("container_height").value
+        hover_top  = goal_handle.request.hover_above_top
+        approach   = self.get_parameter("approach_clearance").value
+        ret        = self.get_parameter("return_to_start").value
+        post_wait  = self.get_parameter("post_insert_wait").value
 
-    def _prompt_target_position(self, default_x: float,
-                                 default_y: float) -> tuple:
-        """
-        Ask the user to enter the container centre position in centimetres
-        from the robot base.  Returns (x_metres, y_metres).
-
-        Coordinate convention (matches the robot world frame):
-          forward_cm  : distance in front of the robot base along X axis.
-                        Always positive.  Example: 43 cm → x = 0.430 m
-          sideways_cm : distance left (+) or right (−) along Y axis.
-                        Right is negative.  Example: -20 cm → y = −0.200 m
-
-        The current default values (from parameters) are shown so the user
-        can just press Enter to keep them.
-
-        Input format accepted:
-          "43, -20"    →  x=0.430, y=-0.200
-          "43 -20"     →  x=0.430, y=-0.200  (space separator also works)
-          "43"         →  x=0.430, y=default_y  (only X provided)
-          ""  (Enter)  →  use defaults unchanged
-        """
-        default_fwd_cm  = default_x * 100.0
-        default_side_cm = default_y * 100.0
-
-        print()
-        print("  ┌─────────────────────────────────────────────────────────┐")
-        print("  │  Container position (cm from robot base)                │")
-        print("  │                                                         │")
-        print("  │  Coordinate convention:                                 │")
-        print("  │    forward_cm   : +ve = away from robot  (→ target_x)  │")
-        print("  │    sideways_cm  : -ve = right, +ve = left (→ target_y)  │")
-        print("  │                                                         │")
-        print(f"  │  Current defaults: {default_fwd_cm:.0f} cm fwd, "
-              f"{default_side_cm:.0f} cm side               │")
-        print("  │  Enter two values: e.g.  43, -20                       │")
-        print("  │  Press Enter to keep current defaults.                  │")
-        print("  └─────────────────────────────────────────────────────────┘")
-
-        while True:
-            try:
-                raw = input("  Container position [forward_cm, sideways_cm]: ").strip()
-
-                if not raw:
-                    # Keep defaults
-                    self.get_logger().info(
-                        f"  Using default position: "
-                        f"{default_fwd_cm:.0f} cm fwd, "
-                        f"{default_side_cm:.0f} cm side → "
-                        f"({default_x:.3f}, {default_y:.3f}) m")
-                    return default_x, default_y
-
-                # Accept comma or space as separator
-                parts = raw.replace(",", " ").split()
-                if len(parts) == 1:
-                    fwd_cm  = float(parts[0])
-                    side_cm = default_side_cm
-                elif len(parts) == 2:
-                    fwd_cm  = float(parts[0])
-                    side_cm = float(parts[1])
-                else:
-                    print("  Please enter one or two numbers, e.g.  43  or  43, -20")
-                    continue
-
-                x_m = fwd_cm  / 100.0
-                y_m = side_cm / 100.0
-
-                # Basic sanity check — Gen3 reach is 902 mm
-                dist = math.sqrt(x_m**2 + y_m**2)
-                if dist > 0.90:
-                    print(f"  Warning: {fwd_cm:.0f} cm fwd, {side_cm:.0f} cm side "
-                          f"is {dist*100:.0f} cm from base — near/outside arm reach "
-                          f"(max ~90 cm).")
-                    confirm = input("  Continue anyway? [y/N]: ").strip().lower()
-                    if confirm != "y":
-                        continue
-
-                self.get_logger().info(
-                    f"  Container position set: "
-                    f"{fwd_cm:.0f} cm fwd, {side_cm:.0f} cm side → "
-                    f"({x_m:.3f}, {y_m:.3f}) m")
-                return x_m, y_m
-
-            except ValueError:
-                print("  Invalid input — please enter numbers, e.g.  43, -20")
-            except EOFError:
-                # Non-interactive environment — use defaults
-                return default_x, default_y
+        p = dict(group_name=group_name, vel_scale=vel_scale,
+                 execute=execute, world_frame=world_frame,
+                 tip_link=tip_link, ee_link=ee_link)
 
 
-    def _run_once(self):
-        if self._done:
-            return
-        self._done = True
-        try:
-            self._run_once_impl()
-        finally:
-            self._run_done.set()
-
-    def _run_once_impl(self):
-        p = self._get_params()
-
-        if self.get_parameter("real_robot").value:
-            skip_home = self.get_parameter("skip_home_move").value
-            if skip_home:
-                self.get_logger().info(
-                    "\n[Real robot] skip_home_move:=true — skipping home move.\n"
-                    "  Ensure arm is in a safe upright pose before continuing.")
-                input("[Real robot] Press ENTER when arm is ready ...")
-            else:
-                input(
-                    "\n[Real robot] Press ENTER to move arm to Home position ...\n"
-                    "  (If already near Home, re-run with -p skip_home_move:=true)")
-                if not self._move_to_home(p):
-                    self.get_logger().error("Home move failed — aborting.")
+        pub_fb("home_move", 0.0)
+        # Home move
+        if real_robot and not goal_handle.request.skip_home_move:
+            self.get_logger().info("Moving arm to Home...")
+            req = MotionPlanRequest()
+            req.group_name = group_name
+            req.planner_id = "PTP"
+            req.pipeline_id = "pilz_industrial_motion_planner"
+            req.num_planning_attempts = 1
+            req.allowed_planning_time = 10.0
+            req.max_velocity_scaling_factor     = max(vel_scale, 0.15)
+            req.max_acceleration_scaling_factor = max(vel_scale, 0.15) * 0.5
+            req.start_state.is_diff = True
+            goal_c = Constraints()
+            for name, position in _GEN3_HOME_JOINTS.items():
+                jc = JointConstraint(); jc.joint_name = name
+                jc.position = position
+                jc.tolerance_above = 0.05; jc.tolerance_below = 0.05
+                jc.weight = 1.0
+                goal_c.joint_constraints.append(jc)
+            req.goal_constraints.append(goal_c)
+            ok, traj = self._plan(req)
+            if not ok:
+                self.get_logger().error("Home move planning failed.")
+                return
+            if execute:
+                if not self._execute_moveit(traj, "home_move", timeout=90.0):
+                    self.get_logger().error("Home move failed.")
                     return
-                time.sleep(1.5)
-                input("[Real robot] Arm is at Home. Press ENTER to begin insertion ...")
+            time.sleep(1.5)
+            self.get_logger().info("Arm at Home.")
 
-            self._js_frozen = True
-            if not self._start_joints:
-                self.get_logger().warn(
-                    "No joint states received yet -- return-to-start may skip.")
-            else:
-                self.get_logger().info(
-                    "  Start joints frozen — recovery will return here.")
+        self._js_frozen = True
+        if real_robot:
+            self.get_logger().info("Arm is ready.")
 
-        # --- Container position ---
-        # If interactive_target is set, prompt the user to enter the container
-        # position in centimetres.  Otherwise use the target_x / target_y params.
-        if self.get_parameter("interactive_target").value:
-            new_x, new_y = self._prompt_target_position(
-                p["target_x"], p["target_y"])
-            p["target_x"] = new_x
-            p["target_y"] = new_y
-
-        # If use_dynamic_tf is set to True, look up the target center from the TF tree
-        if self.get_parameter("use_dynamic_tf").value:
-            try:
-                # Look up latest transform from world to marker_square_center
-                tf_target = self.tf_buffer.lookup_transform(
-                    p["world_frame"],
-                    "marker_square_center",
-                    rclpy.time.Time(),
-                    timeout=RclpyDuration(seconds=2.0)
-                )
-                p["target_x"] = tf_target.transform.translation.x
-                p["target_y"] = tf_target.transform.translation.y
-                self.get_logger().info(
-                    f"[TF Lookup] Dynamically loaded container target from TF frame "
-                    f"'marker_square_center': x={p['target_x']:.3f}, y={p['target_y']:.3f}")
-            except Exception as e:
-                self.get_logger().error(
-                    f"[TF Lookup] Failed to look up 'marker_square_center' transform: {e}. "
-                    f"Falling back to default target parameters.")
+        # Get container position
+        cont_x = goal_handle.request.target_x
+        cont_y = goal_handle.request.target_y
         if getattr(self, '_camera_target', None) is not None:
-            p["target_x"] = self._camera_target.pose.position.x
-            p["target_y"] = self._camera_target.pose.position.y
-            self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({p['target_x']:.3f}, {p['target_y']:.3f})")
+            cont_x = self._camera_target.pose.position.x
+            cont_y = self._camera_target.pose.position.y
+            self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({cont_x:.3f}, {cont_y:.3f})")
 
+        container_top = table_z + cont_h
+        hover_z  = container_top + hover_top
+        ready_z  = container_top + approach
 
-        # Compute world-frame Z values from container parameters.
-        #   container top  = table_z + container_height
-        #   target_z       = container top + hover_above_top
-        #   ready_z        = container top + approach_clearance
-        container_top = p["table_z"] + p["container_h"]
-        target_z      = container_top + p["hover_above_top"]  # hover above, not insert
-        ready_z       = container_top + p["approach"]
+        # Get target inside container
+        if self.get_parameter("interactive_target").value:
+            ox_mm, oy_mm, d_mm = self._prompt_target()
+        else:
+            ox_mm = self.get_parameter("target_offset_x_mm").value
+            oy_mm = self.get_parameter("target_offset_y_mm").value
+            d_mm  = self.get_parameter("target_depth_mm").value
 
-        cx = p["target_x"]
-        cy = p["target_y"]
+        ox_m = ox_mm / 1000.0
+        oy_m = oy_mm / 1000.0
+        d_m  = d_mm  / 1000.0
 
-        self.get_logger().info("=" * 60)
-        self.get_logger().info("insert_to_container")
+        # Target point in world frame
+        target_xyz = (cont_x + ox_m, cont_y + oy_m, container_top - d_m)
+        hover_xyz  = (cont_x, cont_y, hover_z)
+
+        # Compute tilt geometry
+        geo = compute_tilt_geometry(hover_xyz, target_xyz)
+
+        
+        try:
+            co = CollisionObject()
+            co.header.frame_id = world_frame
+            co.id = "physical_container"
+            box = SolidPrimitive()
+            box.type = SolidPrimitive.BOX
+            box.dimensions = [0.15, 0.15, cont_h]
+            co.primitives.append(box)
+            box_pose = Pose()
+            box_pose.position.x = cont_x
+            box_pose.position.y = cont_y
+            box_pose.position.z = table_z + (cont_h / 2.0)
+            box_pose.orientation.w = 1.0
+            co.primitive_poses.append(box_pose)
+            co.operation = CollisionObject.ADD
+            self._collision_pub.publish(co)
+            self.get_logger().info("Published dynamic container CollisionObject.")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to publish CollisionObject: {e}")
+
+        
+        # --- Telemetry: Start Rosbag ---
+        bag_process = None
+        bag_name = f"insertion_bag_{int(time.time())}"
+        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
+        try:
+            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
+        except Exception as e:
+            self.get_logger().warn(f"Failed to start rosbag: {e}")
+
+        self.get_logger().info("=" * 62)
+        self.get_logger().info("angled_insert — geometry")
         self.get_logger().info(
-            f"  container centre: x={cx:.3f}  y={cy:.3f}")
+            f"  Container centre: ({cont_x:.3f}, {cont_y:.3f})")
         self.get_logger().info(
-            f"  container top:    z={container_top:.3f} m  "
-            f"(table_z={p['table_z']:.3f} + height={p['container_h']*100:.0f} cm)")
+            f"  Hover position:   ({hover_xyz[0]:.3f}, {hover_xyz[1]:.3f}, "
+            f"{hover_xyz[2]:.3f})")
         self.get_logger().info(
-            f"  hover target:     z={target_z:.3f} m  "
-            f"({p['hover_above_top']*1000:.0f} mm above container top)")
+            f"  Target:           ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
+            f"{target_xyz[2]:.3f})")
         self.get_logger().info(
-            f"  approach height:  z={ready_z:.3f} m  "
-            f"({p['approach']*100:.0f} cm above container top)")
+            f"  Offset:           ({ox_mm:.1f} mm fwd, {oy_mm:.1f} mm side, "
+            f"{d_mm:.1f} mm deep)")
         self.get_logger().info(
-            f"  execute={p['execute']}")
-        self.get_logger().info("=" * 60)
+            f"  Tilt:             {math.degrees(geo['tilt_rad']):.2f}°")
+        self.get_logger().info(
+            f"  Azimuth:          {math.degrees(geo['azimuth_rad']):.2f}°")
+        self.get_logger().info(
+            f"  Descent:          {geo['descent_m']*1000:.1f} mm")
+        self.get_logger().info(f"  execute={execute}")
+        
+        # --- Telemetry: Start Rosbag ---
+        bag_process = None
+        bag_name = f"insertion_bag_{int(time.time())}"
+        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
+        try:
+            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
+        except Exception as e:
+            self.get_logger().warn(f"Failed to start rosbag: {e}")
 
-        if not self.get_parameter("real_robot").value:
-            self._js_frozen = True
-        if not self._start_joints:
-            self.get_logger().warn(
-                "No joint states received yet -- return-to-start skipped.")
+        self.get_logger().info("=" * 62)
 
-        # Run pre-flight safety check before any planning or motion.
-        if not self._preflight_check(p):
-            self.get_logger().error(
-                "Pre-flight check failed — fix the issues above before running.\n"
-                "No motion will occur.")
+        # Wall clearance check
+        ok, msg = check_wall_clearance(ox_m, oy_m, d_m, geo["tilt_rad"])
+        if not ok:
+            self.get_logger().error(f"  Wall clearance FAIL: {msg}\n  Aborting.")
             return
+        self.get_logger().info(f"  Wall clearance: {msg}")
 
-        # Inject ready_z and target_z into params dict for downstream methods
-        p["ready_z"]  = ready_z
-        p["target_z"] = target_z
-
-        # Publish RViz marker for visual verification
-        self._publish_target_marker(
-            cx, cy, target_z, ready_z,
-            p["container_h"], p["table_z"], p["world_frame"])
-
-        if self.get_parameter("add_pole_collision").value:
-            self.get_logger().info("  Adding pole collision object to planning scene...")
-            self._apply_pole_collision(add=True, p=p)
-
-        # Read current pen_tip position and actual EE orientation from TF.
-        # Using the live TF orientation preserves whatever orientation the arm
-        # is already in — avoids any large reorientation at startup.
-        tip_tf, ee_tf = self._get_tip_tf(p, timeout_sec=5.0)
+        # Get live TF — tip and EE positions
+        tip_tf = self._get_tf(world_frame, tip_link)
+        ee_tf  = self._get_tf(world_frame, ee_link)
         if tip_tf is None or ee_tf is None:
-            self.get_logger().error(
-                "  Could not get TF (world→pen_tip / world→EE). "
-                "Is robot_state_publisher running?")
+            self.get_logger().error("  TF lookup failed.")
             return
-        t = tip_tf.transform.translation
-        cur_x, cur_y, cur_z = t.x, t.y, t.z
+
+        tip_w = tip_tf.transform.translation
+        ee_w  = ee_tf.transform.translation
+        cur_tip = (tip_w.x, tip_w.y, tip_w.z)
+
+        # World-frame EE→tip offset at current arm pose
+        ee_world_offset = (ee_w.x - tip_w.x,
+                           ee_w.y - tip_w.y,
+                           ee_w.z - tip_w.z)
+        self.get_logger().info(
+            f"  EE→tip world offset: "
+            f"({ee_world_offset[0]:.4f}, {ee_world_offset[1]:.4f}, "
+            f"{ee_world_offset[2]:.4f})  "
+            f"mag={math.sqrt(sum(v**2 for v in ee_world_offset))*100:.1f} cm")
+
+        # Current orientation
         r = ee_tf.transform.rotation
-        # live_q: the arm's actual current EE orientation from TF.
-        live_q = Quaternion(x=r.x, y=r.y, z=r.z, w=r.w)
-
-        use_live = self.get_parameter("use_current_orientation").value
-        use_tf   = self.get_parameter("use_tf_offset").value
-
-        if use_live:
-            pen_q = live_q
-            self.get_logger().info(
-                f"  Current pen_tip: ({cur_x:.3f}, {cur_y:.3f}, {cur_z:.3f})\n"
-                f"  EE orientation (live, used as pen-down): "
-                f"qx={r.x:.4f}  qy={r.y:.4f}  qz={r.z:.4f}  qw={r.w:.4f}\n"
-                f"  use_current_orientation:=true — arm must already point tip down.")
+        if self.get_parameter("use_current_orientation").value:
+            q_vertical_xyzw = (r.x, r.y, r.z, r.w)
         else:
-            pen_q = Quaternion(x=p["qx"], y=p["qy"], z=p["qz"], w=p["qw"])
-            self.get_logger().info(
-                f"  Current pen_tip: ({cur_x:.3f}, {cur_y:.3f}, {cur_z:.3f})\n"
-                f"  EE orientation (live):  qx={r.x:.4f}  qy={r.y:.4f}  qz={r.z:.4f}  qw={r.w:.4f}\n"
-                f"  Pen-down target quat:   qx={p['qx']:.4f}  qy={p['qy']:.4f}  "
-                f"qz={p['qz']:.4f}  qw={p['qw']:.4f}")
+            q_vertical_xyzw = (0.5, 0.5, 0.5, 0.5)  # pen-down default
 
-        # Compute world-frame EE-to-tip offset.
-        # EE_origin = pen_tip_target + world_offset
-        # Best source: subtract world→EE from world→pen_tip (already have both from TF).
-        ee_world_offset = None
-        if use_tf:
-            wx, wy, wz = self._get_ee_to_tip_offset_world(p, None)
-            if wx is not None:
-                ee_world_offset = (wx, wy, wz)
-                self.get_logger().info(
-                    f"  EE→tip world offset (TF-based, direct subtraction): "
-                    f"({wx:.4f}, {wy:.4f}, {wz:.4f})")
+        q_vertical = Quaternion(x=q_vertical_xyzw[0], y=q_vertical_xyzw[1],
+                                z=q_vertical_xyzw[2], w=q_vertical_xyzw[3])
 
-        if ee_world_offset is None:
-            # Fallback: compute from current world TF positions directly.
-            # EE_origin_world - pen_tip_world gives the world-frame offset.
-            # This is equivalent to the TF method but uses the already-looked-up transforms.
+        # Compute tilted quaternion
+        q_tilted_xyzw = _tilt_quaternion(
+            q_vertical_xyzw, geo["azimuth_rad"], geo["tilt_rad"])
+        q_tilted = Quaternion(x=q_tilted_xyzw[0], y=q_tilted_xyzw[1],
+                              z=q_tilted_xyzw[2], w=q_tilted_xyzw[3])
+
+        # Intermediate quaternion at half tilt (for CIRC via-point)
+        q_via_xyzw = _quat_slerp(q_vertical_xyzw, q_tilted_xyzw, 0.5)
+        q_via = Quaternion(x=q_via_xyzw[0], y=q_via_xyzw[1],
+                           z=q_via_xyzw[2], w=q_via_xyzw[3])
+
+        self.get_logger().info(
+            f"  Vertical quat:  ({q_vertical_xyzw[0]:.4f}, {q_vertical_xyzw[1]:.4f}, "
+            f"{q_vertical_xyzw[2]:.4f}, {q_vertical_xyzw[3]:.4f})")
+        self.get_logger().info(
+            f"  Tilted quat:    ({q_tilted_xyzw[0]:.4f}, {q_tilted_xyzw[1]:.4f}, "
+            f"{q_tilted_xyzw[2]:.4f}, {q_tilted_xyzw[3]:.4f})")
+
+        # ── Phase 0: Approach above container ────────────────────────────
+        self.get_logger().info(
+            f"\n--- [Phase 0] Approach above container ---")
+        ee_ready = self._ee_from_tip(
+            (cont_x, cont_y, ready_z), q_vertical_xyzw, ee_world_offset)
+        self.get_logger().info(
+            f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
+        req = self._build_pilz_ptp(*ee_ready, q_vertical, vel_scale)
+        ok, traj = self._plan(req)
+        if not ok:
+            self.get_logger().error("  Phase 0 planning failed.")
+            return
+        if execute and not self._execute_moveit(traj, "Phase0_approach"):
+            self._recovery_return(p); return
+
+        # ── Phase 1: Vertical descent to hover_z ─────────────────────────
+        self.get_logger().info(f"\n--- [Phase 1] Vertical descent to hover_z ---")
+        ee_hover = self._ee_from_tip(
+            hover_xyz, q_vertical_xyzw, ee_world_offset)
+        self.get_logger().info(
+            f"  EE hover: ({ee_hover[0]:.3f}, {ee_hover[1]:.3f}, {ee_hover[2]:.3f})")
+        req = self._build_pilz_lin(*ee_hover, q_vertical, vel_scale)
+        ok, traj = self._plan(req)
+        if not ok:
+            self.get_logger().error("  Phase 1 planning failed.")
+            return
+        if execute and not self._execute_fjt(traj, "Phase1_vertical_descent"):
+            self._recovery_return(p); return
+
+        # ── Phase 2: Print geometry summary and optionally confirm ─────────
+        self.get_logger().info(
+            f"\n--- [Phase 2] Tilt geometry ---\n"
+            f"  Tip fixed at: ({hover_xyz[0]:.3f}, {hover_xyz[1]:.3f}, "
+            f"{hover_xyz[2]:.3f})\n"
+            f"  Tilt:    {math.degrees(geo['tilt_rad']):.2f}°\n"
+            f"  Azimuth: {math.degrees(geo['azimuth_rad']):.2f}°\n"
+            f"  Descent: {geo['descent_m']*1000:.1f} mm along tilted axis")
+
+        # ── Phase 3: CIRC rotation keeping tip fixed ──────────────────────
+        self.get_logger().info(f"\n--- [Phase 3] CIRC rotation about tip ---")
+
+        # EE sweeps a circular arc while tip stays fixed at hover_xyz.
+        # The arc is defined by three EE positions corresponding to:
+        #   start: vertical orientation  (current after Phase 1)
+        #   via:   half-tilt orientation (at mid-arc)
+        #   end:   full-tilt orientation (target)
+        #
+        # For each EE position, tip is fixed at hover_xyz:
+        #   EE = tip + R(q) * tip_to_ee_local
+        # Since we track the world-frame offset directly:
+        #   At start: ee_hover (already computed above)
+        #   At via:   EE when orientation is q_via and tip at hover_xyz
+        #   At end:   EE when orientation is q_tilted and tip at hover_xyz
+        #
+        # The EE→tip offset IN WORLD FRAME changes with orientation.
+        # We recompute it by rotating the local offset by each quaternion.
+        # Local EE→tip offset (in EE frame, from URDF):
+        local_tip_offset = (
+            _ASSEMBLY_TIP_OFFSET["x"],
+            _ASSEMBLY_TIP_OFFSET["y"],
+            _ASSEMBLY_TIP_OFFSET["z"],
+        )
+
+        def _ee_at_orientation(q_xyzw):
+            """EE position when tip is at hover_xyz and EE has orientation q."""
+            # tip = EE + R * local_offset  →  EE = tip - R * local_offset
+            rot_offset = rotate_vector_by_quat(local_tip_offset, q_xyzw)
+            return (hover_xyz[0] - rot_offset[0],
+                    hover_xyz[1] - rot_offset[1],
+                    hover_xyz[2] - rot_offset[2])
+
+        ee_start_circ = ee_hover                          # = _ee_at_orientation(q_vertical_xyzw)
+        ee_via_circ   = _ee_at_orientation(q_via_xyzw)
+        ee_end_circ   = _ee_at_orientation(q_tilted_xyzw)
+
+        self.get_logger().info(
+            f"  EE arc start: ({ee_start_circ[0]:.4f}, {ee_start_circ[1]:.4f}, "
+            f"{ee_start_circ[2]:.4f})\n"
+            f"  EE arc via:   ({ee_via_circ[0]:.4f},  {ee_via_circ[1]:.4f},  "
+            f"{ee_via_circ[2]:.4f})\n"
+            f"  EE arc end:   ({ee_end_circ[0]:.4f},  {ee_end_circ[1]:.4f},  "
+            f"{ee_end_circ[2]:.4f})")
+
+        # Arc radius check — should equal the EE→tip distance
+        arc_r = math.sqrt(sum((a-b)**2 for a,b in
+                              zip(ee_start_circ, hover_xyz)))
+        self.get_logger().info(
+            f"  Arc radius (EE from tip): {arc_r*100:.1f} cm  "
+            f"(expected {math.sqrt(sum(v**2 for v in local_tip_offset))*100:.1f} cm)")
+
+        req = self._build_pilz_circ(
+            ee_start_circ, ee_via_circ, ee_end_circ,
+            q_vertical, q_via, q_tilted,
+            vel_scale)
+        ok, traj = self._plan(req, timeout=20.0)
+
+        if not ok:
+            self.get_logger().warn(
+                "  Pilz CIRC failed — falling back to two sequential Pilz LIN "
+                "moves (via half-tilt, then full tilt).\n"
+                "  Tip will move slightly during rotation (< 2mm for small tilts).")
+            # Fallback: LIN to via then LIN to end
+            req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
+            ok_via, traj_via = self._plan(req_via)
+            req_end = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
+            ok_end, traj_end = self._plan(req_end)
+            if not ok_via or not ok_end:
+                self.get_logger().error("  Rotation fallback planning failed.")
+                self._recovery_return(p); return
+            if execute:
+                if not self._execute_fjt(traj_via, "Phase3a_rotate_via"):
+                    self._recovery_return(p); return
+                if not self._execute_fjt(traj_end, "Phase3b_rotate_end"):
+                    self._recovery_return(p); return
+            traj = None   # signal that CIRC was not used
+        else:
+            self.get_logger().info("  [PASS] CIRC rotation planned.")
+            if execute and not self._execute_fjt(traj, "Phase3_circ_rotate"):
+                self._recovery_return(p); return
+
+        # ── Phase 4: Angled descent to target ─────────────────────────────
+        self.get_logger().info(f"\n--- [Phase 4] Angled descent to target ---")
+
+        # EE position at target: tip is at target_xyz, EE has tilted orientation
+        ee_target = _ee_at_orientation(q_tilted_xyzw)
+        ee_target = (target_xyz[0] - rotate_vector_by_quat(
+                         local_tip_offset, q_tilted_xyzw)[0],
+                     target_xyz[1] - rotate_vector_by_quat(
+                         local_tip_offset, q_tilted_xyzw)[1],
+                     target_xyz[2] - rotate_vector_by_quat(
+                         local_tip_offset, q_tilted_xyzw)[2])
+
+        self.get_logger().info(
+            f"  Tip target:  ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
+            f"{target_xyz[2]:.3f})\n"
+            f"  EE target:   ({ee_target[0]:.3f}, {ee_target[1]:.3f}, "
+            f"{ee_target[2]:.3f})\n"
+            f"  Descent:     {geo['descent_m']*1000:.1f} mm along "
+            f"{math.degrees(geo['tilt_rad']):.1f}° axis")
+
+        req = self._build_pilz_lin(*ee_target, q_tilted, vel_scale)
+        ok, traj_descent = self._plan(req)
+        if not ok:
+            self.get_logger().error("  Phase 4 angled descent planning failed.")
+            self._recovery_return(p); return
+        if execute and not self._execute_fjt(traj_descent, "Phase4_angled_descent"):
+            self._recovery_return(p); return
+
+        # ── Phase 5: Hold ──────────────────────────────────────────────────
+        self.get_logger().info(f"\n--- [Phase 5] Hold at target ---")
+        if execute:
             try:
-                ee_w_x = ee_tf.transform.translation.x
-                ee_w_y = ee_tf.transform.translation.y
-                ee_w_z = ee_tf.transform.translation.z
-                wx = ee_w_x - cur_x
-                wy = ee_w_y - cur_y
-                wz = ee_w_z - cur_z
-                ee_world_offset = (wx, wy, wz)
-                dist = math.sqrt(wx**2 + wy**2 + wz**2)
-                self.get_logger().info(
-                    f"  EE→tip world offset (from existing TF lookups): "
-                    f"({wx:.4f}, {wy:.4f}, {wz:.4f})  magnitude={dist*100:.1f} cm")
-            except Exception:
-                # Last resort: rotate local offset by pen_q
-                q_for_offset = (pen_q.x, pen_q.y, pen_q.z, pen_q.w)
-                wx, wy, wz = rotate_vector_by_quat(
-                    (p["tip_ee_ox"], p["tip_ee_oy"], p["tip_ee_oz"]), q_for_offset)
-                ee_world_offset = (wx, wy, wz)
-                self.get_logger().warn(
-                    f"  EE→tip world offset (rotated params — may be wrong for qw≈0): "
-                    f"({wx:.4f}, {wy:.4f}, {wz:.4f})\n"
-                    f"  If EE target looks wrong, check tip_ee_offset parameters.")
-
-        # Phase 0 -- Pilz approach above container
-        ok, level_end = self._approach(cx, cy, ready_z, cur_x, cur_y, cur_z,
-                                       p, live_q, pen_q,
-                                       ee_world_offset=ee_world_offset)
-        if not ok:
-            self._recovery_return()
-            return
-
-        # Phase 1 -- descend into container
-        ok, descend_end = self._descend(
-            cx, cy, ready_z, target_z, p, pen_q,
-            start_state=level_end, ee_world_offset=ee_world_offset)
-        if not ok:
-            self._recovery_return()
-            return
-
-        # Phase 2 -- hold at insert depth
-        ok, _ = self._hold_at_target(cx, cy, target_z, p)
-        if not ok:
-            self._recovery_return()
-            return
-
-        # Phase 2.5 -- ascend back to approach height
-        ok, ascend_end = self._ascend(
-            cx, cy, target_z, ready_z, p, pen_q,
-            start_state=descend_end, ee_world_offset=ee_world_offset)
-        if not ok:
-            self._recovery_return()
-            return
-
-        # Phase 3 -- return to start
-        if p["ret"]:
-            return_from = ascend_end if ascend_end is not None else descend_end
-            self._return_to_start(p, start_state=return_from)
+                input(f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
+                      f"{target_xyz[2]:.3f}).  Press ENTER to reverse ...")
+            except EOFError:
+                time.sleep(post_wait)
         else:
-            self.get_logger().info("Return skipped (return_to_start:=false).")
+            self.get_logger().info("  Dry-run — skipping hold.")
 
-        if self.get_parameter("add_pole_collision").value:
-            self._apply_pole_collision(add=False, p=p)
+        # ── Phase 6a: Reverse angled ascent ───────────────────────────────
+        self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
+        req = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
+        ok, traj_asc = self._plan(req)
+        if ok:
+            if execute and not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
+                self._recovery_return(p); return
+        else:
+            self.get_logger().warn("  Angled ascent planning failed — attempting recovery.")
+            self._recovery_return(p); return
 
-        self.get_logger().info("=" * 60)
-        self.get_logger().info("insert_to_container complete.")
-        self.get_logger().info("=" * 60)
+        # ── Phase 6b: Reverse CIRC rotation back to vertical ──────────────
+        self.get_logger().info(f"\n--- [Phase 6b] Reverse CIRC rotation to vertical ---")
+        req = self._build_pilz_circ(
+            ee_end_circ, ee_via_circ, ee_start_circ,
+            q_tilted, q_via, q_vertical,
+            vel_scale)
+        ok, traj_circ_rev = self._plan(req, timeout=20.0)
+        if not ok:
+            # Fallback: two LIN moves back
+            self.get_logger().warn("  Reverse CIRC failed — using LIN fallback.")
+            req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
+            req_vert= self._build_pilz_lin(*ee_start_circ, q_vertical, vel_scale)
+            ok_v, t_v = self._plan(req_via)
+            ok_r, t_r = self._plan(req_vert)
+            if execute:
+                if ok_v:
+                    self._execute_fjt(t_v, "Phase6b_via")
+                if ok_r:
+                    self._execute_fjt(t_r, "Phase6b_vertical")
+        else:
+            self.get_logger().info("  [PASS] Reverse CIRC planned.")
+            if execute:
+                self._execute_fjt(traj_circ_rev, "Phase6b_circ_reverse")
+
+        # ── Phase 7: Vertical ascent + return ─────────────────────────────
+        self.get_logger().info(f"\n--- [Phase 7] Vertical ascent to approach height ---")
+        req = self._build_pilz_lin(*ee_ready, q_vertical, vel_scale)
+        ok, traj_up = self._plan(req)
+        if ok:
+            if execute:
+                self._execute_fjt(traj_up, "Phase7_vertical_ascent")
+        else:
+            self.get_logger().warn("  Vertical ascent failed — skipping.")
+
+        if ret and self._start_joints:
+            self.get_logger().info(f"\n--- [Phase 8] Return to start joints ---")
+            req = MotionPlanRequest()
+            req.group_name = group_name
+            req.planner_id = "PTP"
+            req.pipeline_id = "pilz_industrial_motion_planner"
+            req.num_planning_attempts = 1
+            req.allowed_planning_time = 10.0
+            req.max_velocity_scaling_factor = vel_scale
+            req.max_acceleration_scaling_factor = vel_scale * 0.5
+            req.start_state.is_diff = True
+            goal_c = Constraints()
+            for name, pos in self._start_joints.items():
+                if name not in _GEN3_JOINTS:
+                    continue
+                jc = JointConstraint(); jc.joint_name = name; jc.position = pos
+                jc.tolerance_above = 0.05; jc.tolerance_below = 0.05
+                jc.weight = 1.0; goal_c.joint_constraints.append(jc)
+            req.goal_constraints.append(goal_c)
+            ok, traj = self._plan(req)
+            if ok and execute:
+                self._execute_moveit(traj, "Phase8_return", timeout=90.0)
+
+        
+        # --- Telemetry: Start Rosbag ---
+        bag_process = None
+        bag_name = f"insertion_bag_{int(time.time())}"
+        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
+        try:
+            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
+        except Exception as e:
+            self.get_logger().warn(f"Failed to start rosbag: {e}")
+
+        self.get_logger().info("=" * 62)
+        self.get_logger().info("angled_insert complete.")
+        
+        # --- Telemetry: Start Rosbag ---
+        bag_process = None
+        bag_name = f"insertion_bag_{int(time.time())}"
+        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
+        try:
+            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
+        except Exception as e:
+            self.get_logger().warn(f"Failed to start rosbag: {e}")
+
+        self.get_logger().info("=" * 62)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ContainerInserter()
+    node = AngledInserter()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
 
     _interrupted = threading.Event()
 
-    def _sigint_handler(sig, frame):
+    def _sigint(sig, frame):
         if _interrupted.is_set():
-            print("\n[Ctrl+C] Force-quitting.", file=sys.stderr)
             sys.exit(1)
         _interrupted.set()
         node._run_done.set()
 
-    signal.signal(signal.SIGINT, _sigint_handler)
+    signal.signal(signal.SIGINT, _sigint)
 
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
-
     node._run_done.wait()
-
     executor.shutdown(timeout_sec=2.0)
     spin_thread.join(timeout=3.0)
 
     if _interrupted.is_set():
+        print("\n[Ctrl+C] Stopping arm...")
         try:
-            node.get_logger().warn(
-                "\n[Ctrl+C] Interrupt received.\n"
-                "  Stopping arm and returning to pre-script position...\n"
-                "  Press Ctrl+C again to force-quit without returning.")
-            node._cancel_active()
-            time.sleep(0.5)
-            node._recovery_return()
+            node._recovery_return(dict(
+                group_name=node.get_parameter("move_group_name").value,
+                vel_scale=node.get_parameter("max_velocity_scaling").value,
+                execute=True,
+            ))
         except Exception as e:
-            print(f"Recovery error: {e}", file=sys.stderr)
+            print(f"Recovery error: {e}")
 
     node.destroy_node()
     try:
