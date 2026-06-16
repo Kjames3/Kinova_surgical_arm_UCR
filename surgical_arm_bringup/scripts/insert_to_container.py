@@ -210,9 +210,13 @@ def _tilt_quaternion(q_vertical, azimuth_rad, tilt_rad):
     """
     # Step 1: rotation about world Z by azimuth
     q_az = _quat_from_axis_angle((0, 0, 1), azimuth_rad)
-    # Step 2: rotation about world X (after azimuth rotation) by tilt
-    # The tilt axis in world frame is perpendicular to azimuth in XY plane
-    tilt_ax = (-math.sin(azimuth_rad), math.cos(azimuth_rad), 0.0)
+    # Step 2: tilt the (downward) tool axis toward the azimuth direction.
+    # The tilt axis is horizontal, 90° clockwise from the azimuth heading, so
+    # that azimuth=0 leans the tool toward world +X (matching the geometry in
+    # _run_impl, which places hover on the −X side and descends toward +X).
+    # The previous (-sin, +cos) axis leaned toward −X — the opposite way —
+    # which put the wrist on the wrong side and made the EE pose unreachable.
+    tilt_ax = (math.sin(azimuth_rad), -math.cos(azimuth_rad), 0.0)
     q_tilt  = _quat_from_axis_angle(tilt_ax, tilt_rad)
     # Compose: q_new = q_tilt * q_az * q_vertical
     q_new = quat_multiply(q_tilt, quat_multiply(q_az, q_vertical))
