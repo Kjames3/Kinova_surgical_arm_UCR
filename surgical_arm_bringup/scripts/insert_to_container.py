@@ -268,7 +268,8 @@ def compute_tilt_geometry(hover_xyz, target_xyz):
 
 
 def check_wall_clearance(offset_x_m, offset_y_m, depth_m,
-                          tilt_rad, tip_radius_m=0.003):
+                          tilt_rad, tip_radius_m=0.003,
+                          max_tilt_deg=MAX_TILT_DEG):
     """
     Check that the tilted assembly does not hit the container wall.
 
@@ -284,9 +285,9 @@ def check_wall_clearance(offset_x_m, offset_y_m, depth_m,
         return False, (f"Target is {r_target*1000:.1f} mm from centre — "
                        f"outside inner radius {CONTAINER_INNER_R*1000:.1f} mm")
 
-    if tilt_rad > math.radians(MAX_TILT_DEG):
+    if tilt_rad > math.radians(max_tilt_deg):
         return False, (f"Tilt {math.degrees(tilt_rad):.1f}° > "
-                       f"max {MAX_TILT_DEG}°")
+                       f"max {max_tilt_deg}°")
 
     # At full depth, the assembly body's lateral extent
     lateral = depth_m * math.tan(tilt_rad)
@@ -327,6 +328,9 @@ class AngledInserter(Node):
         # These are overridden by the interactive prompt when interactive_target=true.
         self.declare_parameter("insertion_angle_deg",  45.0)
         self.declare_parameter("insertion_azimuth_deg",  0.0)
+        # Hard cap on tilt angle (deg). The geometric wall-clearance check still
+        # runs regardless; this just rejects obviously-too-steep angles early.
+        self.declare_parameter("max_tilt_deg",         45.0)
         self.declare_parameter("target_depth_mm",     30.0)    # mm below container top
 
         # If true, prompt user to enter target in mm at runtime
@@ -1116,7 +1120,9 @@ class AngledInserter(Node):
         self.get_logger().info("=" * 62)
 
         # Wall clearance check
-        ok, msg = check_wall_clearance(ox_m, oy_m, d_m, geo["tilt_rad"])
+        ok, msg = check_wall_clearance(
+            ox_m, oy_m, d_m, geo["tilt_rad"],
+            max_tilt_deg=self.get_parameter("max_tilt_deg").value)
         if not ok:
             self.get_logger().error(f"  Wall clearance FAIL: {msg}\n  Aborting.")
             return
