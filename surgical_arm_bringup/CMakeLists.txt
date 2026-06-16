@@ -22,7 +22,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 install(PROGRAMS
   scripts/kortex_utils.py
   scripts/insert_to_container.py
-  scripts/angled_insert.py
   scripts/combine_cameras.py
   scripts/handeye_calibration.py
   scripts/handeye_calibration_eye_in_hand.py
