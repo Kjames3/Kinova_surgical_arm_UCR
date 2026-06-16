@@ -145,6 +145,12 @@ CONTAINER_INNER_R  = (CONTAINER_WIDTH_M / 2.0) - CONTAINER_WALL_M  # 42 mm
 
 MAX_TILT_DEG = 25.0   # hard limit — beyond this hits the wall at shallow depths
 
+# ee_link (bracelet_link) → assembly_tip offset, expressed in the ee_link frame.
+# Mirrors surgical_arm_description/thesis_ee/urdf/thesis_ee_macro.xacro:
+#   <joint name="assembly_tip_joint"> <origin xyz="-0.027 0 -0.414"/>
+# If you change the xacro, change this too.
+_ASSEMBLY_TIP_OFFSET = {"x": -0.027, "y": 0.0, "z": -0.414}
+
 MAX_JOINT_VEL_RAD_S  = 0.8
 MAX_JOINT_ACC_RAD_S2 = 0.4
 
@@ -354,7 +360,23 @@ class AngledInserter(Node):
         # use_current_orientation: use live EE quaternion as pen-down target
         # (same meaning as insert_to_container — keep true unless you've
         #  measured the exact pen-down quaternion separately)
-        self.declare_parameter("use_current_orientation", True)
+        self.declare_parameter("use_current_orientation", False)
+
+        # Tool-down ("vertical") orientation of ee_link (bracelet_link), used
+        # when use_current_orientation is False. Measured 2026-06-16 by jogging
+        # assembly_tip straight down and reading `tf2_echo world assembly_tip`
+        # (assembly_tip == bracelet_link orientation: fixed joint, rpy 0). At
+        # tool-down, bracelet_link is ~aligned with world (near identity).
+        # Re-measure if the arm/assembly is reconfigured.
+        self.declare_parameter("vertical_quat_x", -0.003)
+        self.declare_parameter("vertical_quat_y", -0.007)
+        self.declare_parameter("vertical_quat_z",  0.000)
+        self.declare_parameter("vertical_quat_w",  1.000)
+
+        # Joint path-constraint half-width (rad) for the Phase 0 reorientation
+        # PTP. Wider than the 1.2 used elsewhere because reaching tool-down from
+        # a horizontal home can require a ~90° wrist swing.
+        self.declare_parameter("approach_joint_band", 2.6)
 
         # CIRC arc parameters
         # n_circ_via_points: number of intermediate via-points for the arc.
@@ -582,7 +604,7 @@ class AngledInserter(Node):
         return False, None
 
     def _build_pilz_ptp(self, ee_x, ee_y, ee_z, pen_q, vel_scale,
-                         start_state=None):
+                         start_state=None, joint_band=1.2):
         """Pilz PTP to a single EE pose."""
         req = MotionPlanRequest()
         req.group_name   = self.get_parameter("move_group_name").value
@@ -607,7 +629,7 @@ class AngledInserter(Node):
                     continue
                 jc = JointConstraint()
                 jc.joint_name = name; jc.position = cur
-                jc.tolerance_above = 1.2; jc.tolerance_below = 1.2
+                jc.tolerance_above = joint_band; jc.tolerance_below = joint_band
                 jc.weight = 1.0
                 path_c.joint_constraints.append(jc)
             req.path_constraints = path_c
@@ -772,6 +794,21 @@ class AngledInserter(Node):
         """Compute EE position from desired tip position and world-frame offset."""
         wx, wy, wz = ee_world_offset
         return (tip_xyz[0] + wx, tip_xyz[1] + wy, tip_xyz[2] + wz)
+
+    def _ee_for_tip(self, tip_xyz, q_xyzw):
+        """EE (ee_link) position so assembly_tip lands at tip_xyz with EE orientation q.
+
+        tip = EE + R(q) * local_offset  →  EE = tip - R(q) * local_offset.
+
+        Unlike _ee_from_tip (which assumes a fixed world-frame offset measured at
+        one pose), this rotates the URDF EE→tip offset by the *target* orientation,
+        so it is correct for any orientation — matching how Phases 3/4 compute EE.
+        """
+        local = (_ASSEMBLY_TIP_OFFSET["x"],
+                 _ASSEMBLY_TIP_OFFSET["y"],
+                 _ASSEMBLY_TIP_OFFSET["z"])
+        rot = rotate_vector_by_quat(local, q_xyzw)
+        return (tip_xyz[0] - rot[0], tip_xyz[1] - rot[1], tip_xyz[2] - rot[2])
 
     # ------------------------------------------------------------------
     # User prompt
@@ -1154,7 +1191,12 @@ class AngledInserter(Node):
         if self.get_parameter("use_current_orientation").value:
             q_vertical_xyzw = (r.x, r.y, r.z, r.w)
         else:
-            q_vertical_xyzw = (0.5, 0.5, 0.5, 0.5)  # pen-down default
+            q_vertical_xyzw = _quat_normalize((
+                self.get_parameter("vertical_quat_x").value,
+                self.get_parameter("vertical_quat_y").value,
+                self.get_parameter("vertical_quat_z").value,
+                self.get_parameter("vertical_quat_w").value,
+            ))
 
         q_vertical = Quaternion(x=q_vertical_xyzw[0], y=q_vertical_xyzw[1],
                                 z=q_vertical_xyzw[2], w=q_vertical_xyzw[3])
@@ -1180,11 +1222,12 @@ class AngledInserter(Node):
         # ── Phase 0: Approach above container ────────────────────────────
         self.get_logger().info(
             f"\n--- [Phase 0] Approach above container ---")
-        ee_ready = self._ee_from_tip(
-            (cont_x, cont_y, ready_z), q_vertical_xyzw, ee_world_offset)
+        ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
         self.get_logger().info(
             f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
-        req = self._build_pilz_ptp(*ee_ready, q_vertical, vel_scale)
+        req = self._build_pilz_ptp(
+            *ee_ready, q_vertical, vel_scale,
+            joint_band=self.get_parameter("approach_joint_band").value)
         ok, traj = self._plan(req)
         if not ok:
             self.get_logger().error("  Phase 0 planning failed.")
@@ -1194,8 +1237,7 @@ class AngledInserter(Node):
 
         # ── Phase 1: Vertical descent to hover_z ─────────────────────────
         self.get_logger().info(f"\n--- [Phase 1] Vertical descent to hover_z ---")
-        ee_hover = self._ee_from_tip(
-            hover_xyz, q_vertical_xyzw, ee_world_offset)
+        ee_hover = self._ee_for_tip(hover_xyz, q_vertical_xyzw)
         self.get_logger().info(
             f"  EE hover: ({ee_hover[0]:.3f}, {ee_hover[1]:.3f}, {ee_hover[2]:.3f})")
         req = self._build_pilz_lin(*ee_hover, q_vertical, vel_scale)
@@ -1242,11 +1284,7 @@ class AngledInserter(Node):
 
         def _ee_at_orientation(q_xyzw):
             """EE position when tip is at hover_xyz and EE has orientation q."""
-            # tip = EE + R * local_offset  →  EE = tip - R * local_offset
-            rot_offset = rotate_vector_by_quat(local_tip_offset, q_xyzw)
-            return (hover_xyz[0] - rot_offset[0],
-                    hover_xyz[1] - rot_offset[1],
-                    hover_xyz[2] - rot_offset[2])
+            return self._ee_for_tip(hover_xyz, q_xyzw)
 
         ee_start_circ = ee_hover                          # = _ee_at_orientation(q_vertical_xyzw)
         ee_via_circ   = _ee_at_orientation(q_via_xyzw)
@@ -1301,13 +1339,7 @@ class AngledInserter(Node):
         self.get_logger().info(f"\n--- [Phase 4] Angled descent to target ---")
 
         # EE position at target: tip is at target_xyz, EE has tilted orientation
-        ee_target = _ee_at_orientation(q_tilted_xyzw)
-        ee_target = (target_xyz[0] - rotate_vector_by_quat(
-                         local_tip_offset, q_tilted_xyzw)[0],
-                     target_xyz[1] - rotate_vector_by_quat(
-                         local_tip_offset, q_tilted_xyzw)[1],
-                     target_xyz[2] - rotate_vector_by_quat(
-                         local_tip_offset, q_tilted_xyzw)[2])
+        ee_target = self._ee_for_tip(target_xyz, q_tilted_xyzw)
 
         self.get_logger().info(
             f"  Tip target:  ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
