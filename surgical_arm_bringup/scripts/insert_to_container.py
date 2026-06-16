@@ -58,22 +58,26 @@ Safety limits
 
 Usage
 -----
-  ros2 run surgical_arm_bringup angled_insert.py \\
-      --ros-args -p real_robot:=true -p execute_motion:=true \\
-      -p skip_home_move:=true
+  # Standalone (default): runs ONE insertion from parameters, then exits.
+  # Dry-run first (plans, no motion):
+  ros2 run surgical_arm_bringup insert_to_container.py \\
+      --ros-args -p real_robot:=true \\
+      -p target_x:=0.45 -p target_y:=-0.20 \\
+      -p insertion_angle_deg:=45.0
 
-  # Specify target at launch (mm from container centre, depth below top):
-  ros2 run surgical_arm_bringup angled_insert.py \\
+  # Execute for real (add execute_motion:=true):
+  ros2 run surgical_arm_bringup insert_to_container.py \\
       --ros-args -p real_robot:=true -p execute_motion:=true \\
-      -p skip_home_move:=true \\
-      -p target_offset_x_mm:=10.0 \\
-      -p target_offset_y_mm:=-15.0 \\
-      -p target_depth_mm:=40.0
+      -p target_x:=0.45 -p target_y:=-0.20 \\
+      -p insertion_angle_deg:=45.0 -p target_depth_mm:=30.0
 
-  # Or use interactive prompt (default):
-  ros2 run surgical_arm_bringup angled_insert.py \\
-      --ros-args -p real_robot:=true -p execute_motion:=true \\
-      -p skip_home_move:=true -p interactive_target:=true
+  # Go to calibrated vertical home first (recommended for a true 45° from vertical):
+  #   omit skip_home_move (defaults true) -> set it false:
+  #   -p skip_home_move:=false
+
+  # Action-server mode (legacy): wait for goals on /insert_container instead:
+  ros2 run surgical_arm_bringup insert_to_container.py \\
+      --ros-args -p use_action_server:=true -p real_robot:=true
 """
 
 import math
@@ -307,9 +311,10 @@ class AngledInserter(Node):
         super().__init__("angled_inserter")
         self._cb_group = ReentrantCallbackGroup()
 
-        # Container position (same defaults as insert_to_container)
-        self.declare_parameter("container_x",          0.260)  # m, world frame
-        self.declare_parameter("container_y",          0.000)  # m, world frame
+        # Container position (world frame). In standalone mode these drive the
+        # insertion directly; in action-server mode they are the goal fallback.
+        self.declare_parameter("target_x",             0.260)  # m, world frame — container centre X
+        self.declare_parameter("target_y",             0.000)  # m, world frame — container centre Y
         self.declare_parameter("table_z",             -0.030)  # m
         self.declare_parameter("container_height",     0.086)  # m — 86 mm
         self.declare_parameter("hover_above_top",      0.030)  # m above container top
@@ -330,6 +335,9 @@ class AngledInserter(Node):
         # Motion parameters
         self.declare_parameter("max_velocity_scaling", 0.15)
         self.declare_parameter("execute_motion",       False)
+        # Run mode: False = standalone (run one insertion from params, then exit);
+        # True = action server (wait for goals on /insert_container).
+        self.declare_parameter("use_action_server",    False)
         self.declare_parameter("real_robot",           False)
         self.declare_parameter("skip_home_move",       True)
         self.declare_parameter("return_to_start",      True)
@@ -379,19 +387,20 @@ class AngledInserter(Node):
         self._run_done   = threading.Event()
         self._action_goal_handle = None
 
-        if _HAS_ACTION_INTERFACE:
-            self._action_server = ActionServer(
-                self,
-                InsertContainer,
-                "insert_container",
-                execute_callback   = self._action_execute_cb,
-                goal_callback      = self._action_goal_cb,
-                cancel_callback    = self._action_cancel_cb,
-                callback_group     = self._cb_group,
-            )
-            self.get_logger().info("Action server ready on /insert_container")
-        else:
-            self.get_logger().warn("InsertContainer action interface not found — Action Server disabled.")
+        if self.get_parameter("use_action_server").value:
+            if _HAS_ACTION_INTERFACE:
+                self._action_server = ActionServer(
+                    self,
+                    InsertContainer,
+                    "insert_container",
+                    execute_callback   = self._action_execute_cb,
+                    goal_callback      = self._action_goal_cb,
+                    cancel_callback    = self._action_cancel_cb,
+                    callback_group     = self._cb_group,
+                )
+                self.get_logger().info("Action server ready on /insert_container")
+            else:
+                self.get_logger().warn("InsertContainer action interface not found — Action Server disabled.")
 
         self.add_on_set_parameters_callback(self._parameter_callback)
         self._collision_pub = self.create_publisher(CollisionObject, "/collision_object", 10)
@@ -1432,7 +1441,36 @@ def main(args=None):
 
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
-    node._run_done.wait()
+
+    if node.get_parameter("use_action_server").value:
+        # Action-server mode: wait for goals on /insert_container.
+        node.get_logger().info("Running as action server — waiting for goals on /insert_container.")
+        node._run_done.wait()
+    else:
+        # Standalone mode: run a single insertion from parameters, then exit.
+        import types
+        node.get_logger().info(
+            "Running standalone — one insertion from parameters "
+            "(set use_action_server:=true to wait for action goals instead).")
+        req = types.SimpleNamespace(
+            target_x        = node.get_parameter("target_x").value,
+            target_y        = node.get_parameter("target_y").value,
+            hover_above_top = node.get_parameter("hover_above_top").value,
+            dry_run         = not node.get_parameter("execute_motion").value,
+            skip_home_move  = node.get_parameter("skip_home_move").value,
+        )
+        gh = types.SimpleNamespace(request=req)
+
+        def _pub_fb(phase, prog):
+            node.get_logger().info(f"  [feedback] {phase}: {float(prog)*100:.0f}%")
+
+        try:
+            node._run_impl(gh, _pub_fb)
+            node.get_logger().info("Standalone insertion finished.")
+        except Exception as e:
+            node.get_logger().error(f"Standalone insertion error: {e}")
+        node._run_done.set()
+
     executor.shutdown(timeout_sec=2.0)
     spin_thread.join(timeout=3.0)
 
