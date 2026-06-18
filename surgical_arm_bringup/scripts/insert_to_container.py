@@ -1098,25 +1098,9 @@ class AngledInserter(Node):
         ox_m = 0.0
         oy_m = 0.0
 
-        try:
-            co = CollisionObject()
-            co.header.frame_id = world_frame
-            co.id = "physical_container"
-            box = SolidPrimitive()
-            box.type = SolidPrimitive.BOX
-            box.dimensions = [0.15, 0.15, cont_h]
-            co.primitives.append(box)
-            box_pose = Pose()
-            box_pose.position.x = cont_x
-            box_pose.position.y = cont_y
-            box_pose.position.z = table_z + (cont_h / 2.0)
-            box_pose.orientation.w = 1.0
-            co.primitive_poses.append(box_pose)
-            co.operation = CollisionObject.ADD
-            self._collision_pub.publish(co)
-            self.get_logger().info("Published dynamic container CollisionObject.")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to publish CollisionObject: {e}")
+        # Removed dynamic container CollisionObject publication. 
+        # A solid BOX primitive prevents MoveIt from planning the insertion.
+        # The hollow container mesh should be published by setup_planning_scene.py instead.
 
         
         # --- Telemetry: Start Rosbag ---
