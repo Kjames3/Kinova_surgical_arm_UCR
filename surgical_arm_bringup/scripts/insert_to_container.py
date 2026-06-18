@@ -1322,6 +1322,11 @@ class AngledInserter(Node):
             req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
             ok_via, traj_via = self._plan(req_via)
             req_end = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
+            if ok_via:
+                rs = req_end.start_state
+                rs.is_diff = True
+                rs.joint_state.name = traj_via.joint_trajectory.joint_names
+                rs.joint_state.position = traj_via.joint_trajectory.points[-1].positions
             ok_end, traj_end = self._plan(req_end)
             if not ok_via or not ok_end:
                 self.get_logger().error("  Rotation fallback planning failed.")
@@ -1394,6 +1399,11 @@ class AngledInserter(Node):
             req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
             req_vert= self._build_pilz_lin(*ee_start_circ, q_vertical, vel_scale)
             ok_v, t_v = self._plan(req_via)
+            if ok_v:
+                rs = req_vert.start_state
+                rs.is_diff = True
+                rs.joint_state.name = t_v.joint_trajectory.joint_names
+                rs.joint_state.position = t_v.joint_trajectory.points[-1].positions
             ok_r, t_r = self._plan(req_vert)
             if execute:
                 if ok_v:
