@@ -565,7 +565,7 @@ class AngledInserter(Node):
             pt.position = 5.0; pt.velocity = 0.0; pt.acceleration = 0.0
             fjt.path_tolerance.append(pt)
             gt = JointTolerance(); gt.name = name
-            gt.position = 0.05; gt.velocity = 0.0; gt.acceleration = 0.0
+            gt.position = 0.1; gt.velocity = 0.1; gt.acceleration = 0.0
             fjt.goal_tolerance.append(gt)
         fjt.goal_time_tolerance = RosDuration(sec=30, nanosec=0)
         f  = self._fjt_cli.send_goal_async(fjt)
@@ -790,6 +790,19 @@ class AngledInserter(Node):
         req.path_constraints = path_c
 
         return req
+
+
+    def _wait_for_user(self, label):
+        if not self.get_parameter("step_by_step").value:
+            return True
+        try:
+            ans = input(f"  [Step] Execute {label}? [Y/n]: ").strip().lower()
+            if ans in ('', 'y', 'yes'):
+                return True
+            self.get_logger().warn(f"  Skipping {label} by user request.")
+            return False
+        except EOFError:
+            return False
 
     # ------------------------------------------------------------------
     # EE pose computation
@@ -1041,7 +1054,7 @@ class AngledInserter(Node):
             if not ok:
                 self.get_logger().error("Home move planning failed.")
                 return
-            if execute:
+            if execute and self._wait_for_user("home_move"):
                 if not self._execute_moveit(traj, "home_move", timeout=90.0):
                     self.get_logger().error("Home move failed.")
                     return
@@ -1220,7 +1233,7 @@ class AngledInserter(Node):
         if not ok:
             self.get_logger().error("  Phase 0 planning failed.")
             return
-        if execute and not self._execute_moveit(traj, "Phase0_approach"):
+        if execute and self._wait_for_user("Phase0_approach") and not self._execute_moveit(traj, "Phase0_approach"):
             self._recovery_return(p); return
 
         # ── Phase 1: Vertical descent to hover_z ─────────────────────────
@@ -1233,7 +1246,7 @@ class AngledInserter(Node):
         if not ok:
             self.get_logger().error("  Phase 1 planning failed.")
             return
-        if execute and not self._execute_fjt(traj, "Phase1_vertical_descent"):
+        if execute and self._wait_for_user("Phase1_vertical_descent") and not self._execute_fjt(traj, "Phase1_vertical_descent"):
             self._recovery_return(p); return
 
         # ── Phase 2: Print geometry summary and optionally confirm ─────────
@@ -1313,14 +1326,14 @@ class AngledInserter(Node):
                 self.get_logger().error("  Rotation fallback planning failed.")
                 self._recovery_return(p); return
             if execute:
-                if not self._execute_fjt(traj_via, "Phase3a_rotate_via"):
+                if self._wait_for_user("Phase3a_rotate_via") and not self._execute_fjt(traj_via, "Phase3a_rotate_via"):
                     self._recovery_return(p); return
-                if not self._execute_fjt(traj_end, "Phase3b_rotate_end"):
+                if self._wait_for_user("Phase3b_rotate_end") and not self._execute_fjt(traj_end, "Phase3b_rotate_end"):
                     self._recovery_return(p); return
             traj = None   # signal that CIRC was not used
         else:
             self.get_logger().info("  [PASS] CIRC rotation planned.")
-            if execute and not self._execute_fjt(traj, "Phase3_circ_rotate"):
+            if execute and self._wait_for_user("Phase3_circ_rotate") and not self._execute_fjt(traj, "Phase3_circ_rotate"):
                 self._recovery_return(p); return
 
         # ── Phase 4: Angled descent to target ─────────────────────────────
@@ -1342,7 +1355,7 @@ class AngledInserter(Node):
         if not ok:
             self.get_logger().error("  Phase 4 angled descent planning failed.")
             self._recovery_return(p); return
-        if execute and not self._execute_fjt(traj_descent, "Phase4_angled_descent"):
+        if execute and self._wait_for_user("Phase4_angled_descent") and not self._execute_fjt(traj_descent, "Phase4_angled_descent"):
             self._recovery_return(p); return
 
         # ── Phase 5: Hold ──────────────────────────────────────────────────
@@ -1361,7 +1374,7 @@ class AngledInserter(Node):
         req = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
         ok, traj_asc = self._plan(req)
         if ok:
-            if execute and not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
+            if execute and self._wait_for_user("Phase6a_angled_ascent") and not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
                 self._recovery_return(p); return
         else:
             self.get_logger().warn("  Angled ascent planning failed — attempting recovery.")
@@ -1383,13 +1396,13 @@ class AngledInserter(Node):
             ok_r, t_r = self._plan(req_vert)
             if execute:
                 if ok_v:
-                    self._execute_fjt(t_v, "Phase6b_via")
+                    if self._wait_for_user("Phase6b_via"): self._execute_fjt(t_v, "Phase6b_via")
                 if ok_r:
-                    self._execute_fjt(t_r, "Phase6b_vertical")
+                    if self._wait_for_user("Phase6b_vertical"): self._execute_fjt(t_r, "Phase6b_vertical")
         else:
             self.get_logger().info("  [PASS] Reverse CIRC planned.")
             if execute:
-                self._execute_fjt(traj_circ_rev, "Phase6b_circ_reverse")
+                if self._wait_for_user("Phase6b_circ_reverse"): self._execute_fjt(traj_circ_rev, "Phase6b_circ_reverse")
 
         # ── Phase 7: Vertical ascent + return ─────────────────────────────
         self.get_logger().info(f"\n--- [Phase 7] Vertical ascent to approach height ---")
@@ -1397,7 +1410,7 @@ class AngledInserter(Node):
         ok, traj_up = self._plan(req)
         if ok:
             if execute:
-                self._execute_fjt(traj_up, "Phase7_vertical_ascent")
+                if self._wait_for_user("Phase7_vertical_ascent"): self._execute_fjt(traj_up, "Phase7_vertical_ascent")
         else:
             self.get_logger().warn("  Vertical ascent failed — skipping.")
 
@@ -1421,7 +1434,7 @@ class AngledInserter(Node):
                 jc.weight = 1.0; goal_c.joint_constraints.append(jc)
             req.goal_constraints.append(goal_c)
             ok, traj = self._plan(req)
-            if ok and execute:
+            if ok and execute and self._wait_for_user("Phase8_return"):
                 self._execute_moveit(traj, "Phase8_return", timeout=90.0)
 
         
