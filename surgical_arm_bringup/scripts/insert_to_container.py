@@ -354,6 +354,7 @@ class AngledInserter(Node):
         self.declare_parameter("use_action_server",    False)
         self.declare_parameter("real_robot",           False)
         self.declare_parameter("skip_home_move",       True)
+        self.declare_parameter("step_by_step",         False)
         self.declare_parameter("return_to_start",      True)
         self.declare_parameter("post_insert_wait",     2.0)
         self.declare_parameter("tip_link",             "assembly_tip")
