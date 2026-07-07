@@ -22,6 +22,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 install(PROGRAMS
   scripts/kortex_utils.py
   scripts/insert_to_container.py
+  scripts/insertion.py
   scripts/combine_cameras.py
   scripts/handeye_calibration.py
   scripts/handeye_calibration_eye_in_hand.py
@@ -30,6 +31,11 @@ install(PROGRAMS
   scripts/test_pen_tip_offset.py
   scripts/calibrate_camera_offsets.py
   scripts/calibration_for_cameras.py
+  scripts/impedance.py
+  scripts/curobo_planner_protocol.py
+  scripts/curobo_planner_server.py
+  scripts/curobo_planner_client.py
+  scripts/test_curobo_wiring.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
