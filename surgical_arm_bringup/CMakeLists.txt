@@ -36,6 +36,7 @@ install(PROGRAMS
   scripts/curobo_planner_server.py
   scripts/curobo_planner_client.py
   scripts/test_curobo_wiring.py
+  scripts/gamepad_teleop.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

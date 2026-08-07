@@ -1,0 +1,150 @@
+<mujoco model="kinova_gen3_7dof_no_ee">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.001" integrator="implicitfast" gravity="0 0 -9.81"/>
+
+  <default>
+    <default class="gen3">
+      <joint damping="0.1" armature="0.01" frictionloss="0.05"/>
+      <geom rgba="0.75 0.75 0.78 1" contype="1" conaffinity="1"/>
+      <default class="gen3_visual">
+        <geom contype="0" conaffinity="0" group="1" rgba="0.75 0.75 0.78 1"/>
+      </default>
+      <default class="gen3_collision">
+        <geom group="3" rgba="0.5 0.6 0.7 0.3"/>
+      </default>
+      <default class="big_motor">
+        <motor ctrlrange="-39 39" forcerange="-39 39"/>
+      </default>
+      <default class="small_motor">
+        <motor ctrlrange="-9 9" forcerange="-9 9"/>
+      </default>
+    </default>
+  </default>
+
+  <worldbody>
+    <light name="top" pos="0 0 2" dir="0 0 -1" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
+    <light name="side" pos="1 -1 1.5" dir="-1 1 -1" diffuse="0.4 0.4 0.4"/>
+    <geom name="floor" type="plane" size="2 2 0.05" rgba="0.85 0.85 0.85 1" contype="1" conaffinity="1"/>
+
+    <!-- base_link: fixed to world (base_joint fixed in URDF) -->
+    <body name="base_link" pos="0 0 0" childclass="gen3">
+      <inertial pos="-0.000648 -0.000166 0.084487" mass="1.697"
+                fullinertia="0.004622 0.004495 0.002079 9e-06 6e-05 9e-06"/>
+      <geom class="gen3_visual" type="cylinder" pos="0 0 0.05" size="0.055 0.05" rgba="0.2 0.2 0.22 1"/>
+      <geom class="gen3_visual" type="cylinder" pos="0 0 0.12" size="0.045 0.02" rgba="0.6 0.6 0.65 1"/>
+      <geom class="gen3_collision" type="cylinder" pos="0 0 0.078" size="0.06 0.078"/>
+
+      <!-- shoulder_link: joint_1 continuous, xyz 0 0 0.15643, rpy 3.1416 0 0 -->
+      <body name="shoulder_link" pos="0 0 0.15643" quat="0 1 0 0">
+        <joint name="joint_1" type="hinge" axis="0 0 1" range="-6.2832 6.2832" limited="false"/>
+        <inertial pos="-2.3e-05 -0.010364 -0.07336" mass="1.3773"
+                  fullinertia="0.00457 0.004831 0.001409 1e-06 2e-06 0.000448"/>
+        <geom class="gen3_visual" type="cylinder" pos="0 0 -0.03" size="0.045 0.03" rgba="0.2 0.2 0.22 1"/>
+        <geom class="gen3_visual" type="capsule" fromto="0 0 -0.06 0 0.005 -0.115" size="0.045" rgba="0.75 0.75 0.78 1"/>
+        <geom class="gen3_collision" type="capsule" fromto="0 0 -0.02 0 0.005 -0.115" size="0.05"/>
+
+        <!-- half_arm_1_link: joint_2 revolute, xyz 0 0.005375 -0.12838, rpy 1.5708 0 0 -->
+        <body name="half_arm_1_link" pos="0 0.005375 -0.12838" quat="0.7071068 0.7071068 0 0">
+          <joint name="joint_2" type="hinge" axis="0 0 1" range="-2.24 2.24"/>
+          <inertial pos="-4.4e-05 -0.09958 -0.013278" mass="1.1636"
+                    fullinertia="0.011088 0.001072 0.011255 5e-06 0 -0.000691"/>
+          <geom class="gen3_visual" type="cylinder" pos="0 0 0" size="0.045 0.025" rgba="0.2 0.2 0.22 1" euler="1.5708 0 0"/>
+          <geom class="gen3_visual" type="capsule" fromto="0 -0.02 -0.005 0 -0.19 -0.005" size="0.04" rgba="0.75 0.75 0.78 1"/>
+          <geom class="gen3_collision" type="capsule" fromto="0 -0.02 -0.005 0 -0.2 -0.006" size="0.045"/>
+
+          <!-- half_arm_2_link: joint_3 continuous, xyz 0 -0.21038 -0.006375, rpy -1.5708 0 0 -->
+          <body name="half_arm_2_link" pos="0 -0.21038 -0.006375" quat="0.7071068 -0.7071068 0 0">
+            <joint name="joint_3" type="hinge" axis="0 0 1" range="-6.2832 6.2832" limited="false"/>
+            <inertial pos="-4.4e-05 -0.006641 -0.117892" mass="1.1636"
+                      fullinertia="0.010932 0.011127 0.001043 0 -7e-06 0.000606"/>
+            <geom class="gen3_visual" type="cylinder" pos="0 0 0" size="0.04 0.025" rgba="0.2 0.2 0.22 1"/>
+            <geom class="gen3_visual" type="capsule" fromto="0 -0.005 -0.03 0 -0.005 -0.19" size="0.038" rgba="0.75 0.75 0.78 1"/>
+            <geom class="gen3_collision" type="capsule" fromto="0 -0.005 -0.02 0 -0.006 -0.2" size="0.043"/>
+
+            <!-- forearm_link: joint_4 revolute, xyz 0 0.006375 -0.21038, rpy 1.5708 0 0 -->
+            <body name="forearm_link" pos="0 0.006375 -0.21038" quat="0.7071068 0.7071068 0 0">
+              <joint name="joint_4" type="hinge" axis="0 0 1" range="-2.57 2.57"/>
+              <inertial pos="-1.8e-05 -0.075478 -0.015006" mass="0.9302"
+                        fullinertia="0.008147 0.000631 0.008316 -1e-06 0 -0.0005"/>
+              <geom class="gen3_visual" type="cylinder" pos="0 0 0" size="0.04 0.025" rgba="0.2 0.2 0.22 1" euler="1.5708 0 0"/>
+              <geom class="gen3_visual" type="capsule" fromto="0 -0.02 -0.005 0 -0.18 -0.005" size="0.035" rgba="0.75 0.75 0.78 1"/>
+              <geom class="gen3_collision" type="capsule" fromto="0 -0.02 -0.006 0 -0.19 -0.006" size="0.04"/>
+
+              <!-- spherical_wrist_1_link: joint_5 continuous, xyz 0 -0.20843 -0.006375, rpy -1.5708 0 0 -->
+              <body name="spherical_wrist_1_link" pos="0 -0.20843 -0.006375" quat="0.7071068 -0.7071068 0 0">
+                <joint name="joint_5" type="hinge" axis="0 0 1" range="-6.2832 6.2832" limited="false"/>
+                <inertial pos="1e-06 -0.009432 -0.063883" mass="0.6781"
+                          fullinertia="0.001596 0.001607 0.000399 0 0 0.000256"/>
+                <geom class="gen3_visual" type="cylinder" pos="0 0 -0.02" size="0.035 0.02" rgba="0.2 0.2 0.22 1"/>
+                <geom class="gen3_visual" type="capsule" fromto="0 -0.005 -0.04 0 -0.01 -0.1" size="0.032" rgba="0.75 0.75 0.78 1"/>
+                <geom class="gen3_collision" type="capsule" fromto="0 -0.005 -0.03 0 -0.01 -0.1" size="0.037"/>
+
+                <!-- spherical_wrist_2_link: joint_6 revolute, xyz 0 0.00017505 -0.10593, rpy 1.5708 0 0 -->
+                <body name="spherical_wrist_2_link" pos="0 0.00017505 -0.10593" quat="0.7071068 0.7071068 0 0">
+                  <joint name="joint_6" type="hinge" axis="0 0 1" range="-2.09 2.09"/>
+                  <inertial pos="1e-06 -0.045483 -0.00965" mass="0.6781"
+                            fullinertia="0.001641 0.00041 0.001641 0 0 -0.000278"/>
+                  <geom class="gen3_visual" type="cylinder" pos="0 0 0" size="0.035 0.02" rgba="0.2 0.2 0.22 1" euler="1.5708 0 0"/>
+                  <geom class="gen3_visual" type="capsule" fromto="0 -0.02 -0.005 0 -0.09 -0.005" size="0.03" rgba="0.75 0.75 0.78 1"/>
+                  <geom class="gen3_collision" type="capsule" fromto="0 -0.02 -0.006 0 -0.1 -0.006" size="0.035"/>
+
+                  <!-- bracelet_link: joint_7 continuous, xyz 0 -0.10593 -0.00017505, rpy -1.5708 0 0 -->
+                  <body name="bracelet_link" pos="0 -0.10593 -0.00017505" quat="0.7071068 -0.7071068 0 0">
+                    <joint name="joint_7" type="hinge" axis="0 0 1" range="-6.2832 6.2832" limited="false"/>
+                    <inertial pos="0.000281 0.011402 -0.029798" mass="0.5"
+                              fullinertia="0.000587 0.000369 0.000609 3e-06 3e-06 -0.000118"/>
+                    <geom class="gen3_visual" type="cylinder" pos="0 0 -0.015" size="0.035 0.015" rgba="0.2 0.2 0.22 1"/>
+                    <geom class="gen3_visual" type="cylinder" pos="0 0 -0.04" size="0.03 0.02" rgba="0.75 0.75 0.78 1"/>
+                    <geom class="gen3_collision" type="capsule" fromto="0 0 -0.005 0 0 -0.06" size="0.035"/>
+
+                    <!-- end_effector_link site: fixed frame at bracelet tip, used as EE reference -->
+                    <site name="end_effector" pos="0 0 -0.0615525" size="0.008" rgba="1 0 0 1"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Torque actuators: gear=1 => ctrl is torque in Nm directly.
+         Big joints (1-4) saturate at 39 Nm, wrist joints (5-7) at 9 Nm,
+         matching TAU_MAX in impedance.py. -->
+    <motor class="big_motor"   name="actuator_1" joint="joint_1" gear="1"/>
+    <motor class="big_motor"   name="actuator_2" joint="joint_2" gear="1"/>
+    <motor class="big_motor"   name="actuator_3" joint="joint_3" gear="1"/>
+    <motor class="big_motor"   name="actuator_4" joint="joint_4" gear="1"/>
+    <motor class="small_motor" name="actuator_5" joint="joint_5" gear="1"/>
+    <motor class="small_motor" name="actuator_6" joint="joint_6" gear="1"/>
+    <motor class="small_motor" name="actuator_7" joint="joint_7" gear="1"/>
+  </actuator>
+
+  <sensor>
+    <jointpos name="q1" joint="joint_1"/>
+    <jointpos name="q2" joint="joint_2"/>
+    <jointpos name="q3" joint="joint_3"/>
+    <jointpos name="q4" joint="joint_4"/>
+    <jointpos name="q5" joint="joint_5"/>
+    <jointpos name="q6" joint="joint_6"/>
+    <jointpos name="q7" joint="joint_7"/>
+    <jointvel name="dq1" joint="joint_1"/>
+    <jointvel name="dq2" joint="joint_2"/>
+    <jointvel name="dq3" joint="joint_3"/>
+    <jointvel name="dq4" joint="joint_4"/>
+    <jointvel name="dq5" joint="joint_5"/>
+    <jointvel name="dq6" joint="joint_6"/>
+    <jointvel name="dq7" joint="joint_7"/>
+    <framepos name="ee_pos" objtype="site" objname="end_effector"/>
+    <framequat name="ee_quat" objtype="site" objname="end_effector"/>
+  </sensor>
+
+  <keyframe>
+    <!-- Home / retract: arm folded up, joint_2 and joint_4 bent to avoid singularity. -->
+    <key name="home" qpos="0 0.26 3.1416 -2.27 0 -0.96 1.57"/>
+    <!-- Zero pose: all joints at 0 (stretched straight up along -world_z given base flip). -->
+    <key name="zero" qpos="0 0 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>

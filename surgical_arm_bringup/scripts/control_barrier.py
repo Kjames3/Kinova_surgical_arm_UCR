@@ -1,0 +1,349 @@
+"""Table-avoidance safety layer for the Kinova Gen3 low-level torque loop.
+
+Two independent mechanisms, deliberately kept separate:
+
+  1. HOCBF filter (`compute_table_hocbf_rows` + `filter_control_qp`)
+     A *constraint*. Projects the commanded joint acceleration onto the set that
+     keeps every monitored point above the table. It guarantees non-penetration
+     but exerts no restoring force -- at the boundary it only forbids further
+     downward acceleration, so a hand pushing the arm into the table feels the
+     motion stop rather than feeling pushed back.
+
+  2. Virtual wall (`table_wall_torque`)
+     A *force*. An explicit spring-damper repulsion that switches on within a
+     standoff band above the barrier. This is what the operator actually feels,
+     and it is what makes the arm resist rather than merely stop. It also gives
+     the CBF margin to work with, since it starts decelerating the arm early
+     instead of at the last instant.
+
+Both act on every monitored link, not just the end effector, so the elbow and
+forearm are covered too.
+
+Agnostic to the robot backend: it consumes kinematics/dynamics state and
+returns joint-space quantities.
+"""
+
+import numpy as np
+
+
+def compute_table_hocbf_rows(z, J_z, dJdq_z, dq, z_min,
+                             alpha1=10.0, alpha2=10.0):
+    """Build the HOCBF rows ``A @ ddq <= b`` keeping points above ``z_min``.
+
+    Vectorised over monitored points: pass arrays and get one constraint row
+    per point.
+
+    The barrier is h1 = z - z_min, which has relative degree 2 w.r.t. joint
+    acceleration, so a second-order (high-order) CBF is used:
+
+        h2      = h1_dot + alpha1 * h1
+        enforce   h2_dot + alpha2 * h2 >= 0
+
+    Expanding h2_dot = J_z @ ddq + dJ_z @ dq and rearranging into A @ ddq <= b:
+
+        A =  -J_z
+        b =   dJdq_z + alpha1 * h1_dot + alpha2 * h2
+
+    Args:
+        z (array_like): Height of each monitored point, base frame (m,)
+        J_z (array_like): Row 2 (linear z) of each point's Jacobian (m, n)
+        dJdq_z (array_like): z-component of the Jacobian-derivative product
+            ``dJ @ dq`` for each point (m,). This is the Coriolis/centrifugal
+            term of the barrier -- passing zeros makes the guarantee only
+            approximate and increasingly wrong as the arm speeds up.
+        dq (array_like): Joint velocities (n,)
+        z_min (float): Minimum allowed height (table surface + margin)
+        alpha1, alpha2 (float): HOCBF gains, both > 0. Larger = the barrier
+            tolerates faster approach and intervenes later/harder.
+
+    Returns:
+        A (np.ndarray): (m, n) constraint matrix
+        b (np.ndarray): (m,) constraint vector
+    """
+    z = np.atleast_1d(np.asarray(z, dtype=float))
+    J_z = np.atleast_2d(np.asarray(J_z, dtype=float))
+    dJdq_z = np.atleast_1d(np.asarray(dJdq_z, dtype=float))
+    dq = np.asarray(dq, dtype=float)
+
+    h1 = z - z_min                 # (m,) clearance
+    h1_dot = J_z @ dq              # (m,) vertical speed of each point
+    h2 = h1_dot + alpha1 * h1
+
+    A = -J_z
+    b = dJdq_z + alpha1 * h1_dot + alpha2 * h2
+    return A, b
+
+
+def compute_table_hocbf_constraints(q, dq, z_ee, J_ee, dJ_ee, z_min,
+                                    alpha1=10.0, alpha2=10.0):
+    """Single-point HOCBF rows from a full 6xN Jacobian and its derivative.
+
+    Thin wrapper kept for callers that already hold the full matrices; the
+    per-point path (`compute_table_hocbf_rows`) avoids materialising them.
+    """
+    J_ee = np.asarray(J_ee, dtype=float)
+    dJ_ee = np.asarray(dJ_ee, dtype=float)
+    return compute_table_hocbf_rows(z_ee, J_ee[2, :], dJ_ee[2, :] @ dq, dq,
+                                    z_min, alpha1, alpha2)
+
+
+def torque_limit_rows(M, tau_bias, tau_max):
+    """Rows enforcing ``|M @ ddq + tau_bias| <= tau_max`` as ``A @ ddq <= b``.
+
+    Stack these under the barrier rows before calling `filter_control_qp`.
+
+    Without them the filter certifies an acceleration the actuators cannot
+    deliver: the caller maps ddq back through ``tau = M @ ddq + tau_bias`` and
+    then saturates to the per-joint limit, and that saturation silently voids
+    the barrier's guarantee at exactly the moment it matters -- a hard stop
+    above the table is when the torque demand peaks. Folding the limits into
+    the same projection means the returned ddq is one the arm can actually
+    produce, and the downstream clamp becomes a no-op instead of a leak.
+
+    Making the problem infeasible is a real possibility (the barrier may demand
+    more torque than the wrist has), and that is the point: `filter_control_qp`
+    then reports "degraded" and the caller can say so, rather than the conflict
+    being hidden inside a clip.
+
+    Args:
+        M (array_like): (n, n) joint-space inertia matrix
+        tau_bias (array_like): (n,) torque that buys no acceleration -- the
+            gravity feedforward plus the Coriolis/centrifugal term. Must be the
+            SAME bias the caller uses to form ddq_nom and to map the filtered
+            ddq back to a torque, or the limits are enforced on a quantity the
+            arm never commands.
+        tau_max (array_like): (n,) per-joint torque limit, symmetric
+
+    Returns:
+        A (np.ndarray): (2n, n) constraint matrix
+        b (np.ndarray): (2n,) constraint vector
+    """
+    M = np.asarray(M, dtype=float)
+    tau_bias = np.asarray(tau_bias, dtype=float)
+    tau_max = np.abs(np.asarray(tau_max, dtype=float))
+
+    A = np.vstack((M, -M))
+    b = np.concatenate((tau_max - tau_bias, tau_max + tau_bias))
+    return A, b
+
+
+def filter_control_qp(ddq_nom, A, b, iters=24):
+    """Project ``ddq_nom`` onto ``{x : A x <= b}`` in the least-squares sense.
+
+    Solves  minimize ||x - ddq_nom||^2  s.t.  A x <= b.
+
+    No external QP solver, and bounded latency by construction -- both matter
+    because this runs inside the 1 kHz torque loop with the position safety
+    envelope disabled, where an iterative solver's variable iteration count
+    shows up directly as cycle jitter.
+
+      * m == 1 (one barrier): exact closed-form halfspace projection.
+      * m  > 1: exact dual active-set solve. With P = I, stationarity gives
+        x = ddq_nom - A' lam and the dual is
+        minimize_{lam >= 0} 0.5 lam' (A A') lam - lam' (A ddq_nom - b).
+        The routine maintains a working set of active rows, solves the small
+        equality-constrained system on it exactly, drops rows whose multiplier
+        goes negative and adds the most-violated row otherwise. That terminates
+        finitely (typically in 1-3 passes, since usually only the lowest link
+        is binding) and returns the exact projection, not an approximation.
+
+        An iterative scheme was tried first and rejected: an under-converged
+        sweep leaves lam too SMALL, i.e. a correction too WEAK, which for a
+        safety filter is the unsafe direction rather than a conservative one.
+        `iters` bounds the pass count so worst-case latency stays fixed.
+
+    Args:
+        ddq_nom (np.ndarray): Nominal desired joint accelerations (n,)
+        A (np.ndarray): (m, n) inequality matrix
+        b (np.ndarray): (m,) inequality vector
+        iters (int): Max active-set passes for the multi-row case.
+
+    Returns:
+        ddq_safe (np.ndarray): Safe joint accelerations (n,). Returns the input
+            array object itself when no constraint is active, so callers can
+            skip downstream work with an `is` check.
+        status (str): Which path produced it, so a caller can log a filter that
+            is no longer giving the exact answer.
+
+            * ``"inactive"`` -- nominal command already feasible (no-op).
+            * ``"exact"``    -- exact projection onto the feasible set.
+            * ``"blocked"``  -- the only violated rows are unactuated in this
+              configuration; nothing is expressible, input returned unchanged.
+            * ``"degraded"`` -- the active set did not converge, so the
+              residual was spread across the violated rows by least squares.
+              Constraints may still be violated; this is NOT a certificate.
+    """
+    A = np.atleast_2d(A)
+    b = np.atleast_1d(b)
+
+    resid = A @ ddq_nom - b
+    if np.all(resid <= 0.0):
+        # Nominal command is already feasible -- the common case away from the
+        # table. Return the input object so callers can detect the no-op.
+        return ddq_nom, "inactive"
+
+    if A.shape[0] == 1:
+        a = A[0]
+        aa = float(a @ a)
+        if aa < 1e-12:
+            # Degenerate row: this point's height is unactuated in the current
+            # configuration, so no correction is expressible.
+            return ddq_nom, "blocked"
+        return ddq_nom - (float(resid[0]) / aa) * a, "exact"
+
+    # --- Multi-row: exact dual active-set solve ------------------------------
+    G = A @ A.T
+    # Rows with a ~zero gradient cannot be corrected at all (that point's
+    # height is unactuated here); never admit them to the working set.
+    dead = np.diag(G) < 1e-12
+
+    tol = 1e-9
+    work = []                       # indices of the active (binding) rows
+    x = ddq_nom
+    feasible = False
+
+    for _ in range(iters):
+        over = A @ x - b
+        over[dead] = -np.inf
+        worst = int(np.argmax(over))
+        if over[worst] <= tol:
+            feasible = True         # exact projection reached
+            break
+        if worst in work:
+            # Zigzag: this row was dropped earlier for a negative multiplier
+            # and is violated again, but the working set cannot grow to fix it.
+            # There is no step-length rule here (each pass jumps straight to
+            # the working-set solution), so re-solving would reproduce this
+            # exact x for the rest of the budget. Stop now and degrade instead
+            # of burning ~20 pointless solves inside a 1 ms cycle.
+            break
+        work.append(worst)
+
+        # Solve G_ww lam_w = r_w on the working set, dropping any row whose
+        # multiplier turns negative (that constraint wants to push the wrong
+        # way, so it is not really binding).
+        while work:
+            idx = np.array(work)
+            try:
+                lam_w = np.linalg.solve(G[np.ix_(idx, idx)], resid[idx])
+            except np.linalg.LinAlgError:
+                # Dependent rows (parallel barriers): least-squares still gives
+                # a valid stationary point on the working set.
+                lam_w = np.linalg.lstsq(G[np.ix_(idx, idx)], resid[idx],
+                                        rcond=None)[0]
+            if np.all(lam_w >= -tol):
+                break
+            work.pop(int(np.argmin(lam_w)))
+
+        if not work:
+            break
+        x = ddq_nom - A[np.array(work)].T @ np.maximum(lam_w, 0.0)
+
+    if not feasible:
+        # Reached on three paths, and they are NOT all "the constraints
+        # conflict":
+        #   * the working set emptied, or the budget ran out, while rows were
+        #     still violated -- the rows genuinely conflict, e.g. two links
+        #     where saving one necessarily drives the other down, or a barrier
+        #     that cannot be honoured within the torque envelope;
+        #   * the zigzag break above -- the problem may well be feasible and
+        #     this is just the cost of having no anti-cycling step rule.
+        # Either way the answer below is an approximation, so it is reported as
+        # "degraded" and never as a safety certificate.
+        #
+        # Degrade predictably rather than returning whichever working set we
+        # stopped on: spread the correction across all violated rows in the
+        # least-squares sense, which shares the residual out instead of
+        # sacrificing one link entirely.
+        viol = (A @ x - b > tol) & ~dead
+        if np.any(viol):
+            Av = A[viol]
+            delta = np.linalg.lstsq(Av, Av @ ddq_nom - b[viol], rcond=None)[0]
+            x = ddq_nom - delta
+            return x, "degraded"
+        # Only dead rows left violated: nothing is expressible.
+        return x, ("blocked" if x is ddq_nom else "exact")
+
+    return x, "exact"
+
+
+def wall_cap_clearance(standoff, k_wall, f_max):
+    """Clearance above z_min at which `table_wall_torque`'s force cap binds.
+
+    Returns 0.0 when the cap is high enough that the spring reaches the surface
+    un-clipped (the intended tuning). A positive value is the height at which
+    the wall stops being a spring and becomes a constant push -- everything
+    below it is soft in the only place that has to be hard.
+    """
+    if standoff <= 0.0 or k_wall <= 0.0:
+        return 0.0
+    f_surface = k_wall * standoff
+    if f_max >= f_surface:
+        return 0.0
+    s_cap = np.sqrt(f_max / f_surface)      # F = k*standoff*s^2 = f_max
+    return float(standoff * (1.0 - s_cap))
+
+
+def table_wall_torque(z, J_z, dq, z_min, standoff, k_wall, d_wall,
+                      f_max=90.0):
+    """Joint torque from a virtual spring-damper wall above the table.
+
+    Unlike the HOCBF -- which only constrains acceleration and therefore feels
+    slack when you lean on it -- this applies a genuine upward force to any
+    monitored point that enters the standoff band, so the arm pushes back.
+
+    Force on point i, with clearance d = z - z_min and penetration s = 1 - d/standoff:
+
+        F = k_wall * standoff * s^2  +  d_wall * s * max(0, -z_dot)
+
+    The quadratic spring makes engagement smooth (zero force *and* zero
+    gradient at the band edge, so there is no torque step as a link crosses in)
+    while still becoming very stiff at the surface -- the effective stiffness
+    dF/dd is 2 * k_wall * s, so it reaches 2 * k_wall right at z_min. Damping
+    is one-sided: it resists approach but never sucks a retreating link back
+    down. Below the barrier (d < 0) the spring saturates at its cap rather than
+    growing without bound, so a bad z_min or a modelling error cannot command a
+    wild torque.
+
+    IMPORTANT: the spring alone peaks at ``k_wall * standoff`` at the surface,
+    so `f_max` must exceed that or the cap binds INSIDE the band and the last
+    stretch before the table is a constant push rather than a stiff wall --
+    the opposite of what the quadratic profile is for. `wall_cap_clearance`
+    reports where the cap starts binding; keep it at zero.
+
+    Args:
+        z (array_like): Monitored point heights (m,)
+        J_z (array_like): Row 2 of each point's Jacobian (m, n)
+        dq (array_like): Joint velocities (n,)
+        z_min (float): Barrier height
+        standoff (float): Band thickness above z_min where the wall acts (m)
+        k_wall (float): Wall stiffness (N/m)
+        d_wall (float): Wall damping (N*s/m)
+        f_max (float): Per-point force cap (N)
+
+    Returns:
+        tau (np.ndarray): (n,) joint torque
+        f (np.ndarray): (m,) per-point applied force, for logging
+    """
+    z = np.atleast_1d(np.asarray(z, dtype=float))
+    J_z = np.atleast_2d(np.asarray(J_z, dtype=float))
+    dq = np.asarray(dq, dtype=float)
+
+    if standoff <= 0.0:
+        return np.zeros(J_z.shape[1]), np.zeros(z.shape[0])
+
+    d = z - z_min
+    s = np.clip((standoff - d) / standoff, 0.0, 1.0)   # 0 outside band, 1 at/below z_min
+    active = s > 0.0
+    if not np.any(active):
+        return np.zeros(J_z.shape[1]), np.zeros(z.shape[0])
+
+    z_dot = J_z @ dq
+    approach = np.maximum(0.0, -z_dot)                 # one-sided damping
+
+    f = k_wall * standoff * s ** 2 + d_wall * s * approach
+    f = np.clip(f, 0.0, f_max)
+    f *= active
+
+    # Map the +z point forces to joint torque: tau = sum_i J_z,i^T * f_i
+    return J_z.T @ f, f

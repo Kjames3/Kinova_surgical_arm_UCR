@@ -1,0 +1,161 @@
+robot_cfg:
+  kinematics:
+    format_version: 2.0
+    urdf_path: /home/kamren/workspace/ros2_kortex_ws/src/Kinova_surgical_arm_UCR/surgical_arm_bringup/config/curobo/gen3_surgical_resolved.urdf
+    base_link: base_link
+    tool_frames: [assembly_tip]
+    collision_link_names: [base_link, shoulder_link, half_arm_1_link, half_arm_2_link,
+      forearm_link, spherical_wrist_1_link, spherical_wrist_2_link, bracelet_link]
+    collision_spheres:
+      base_link:
+      - center: [-0.00267, -0.00127, 0.04225]
+        radius: 0.06106
+      - center: [-0.033, -0.00772, 0.14558]
+        radius: 0.02571
+      - center: [0.02445, 0.02381, 0.00634]
+        radius: 0.00721
+      - center: [-0.00284, -0.00044, 0.08511]
+        radius: 0.04922
+      - center: [0.00556, -0.0139, 0.12433]
+        radius: 0.05278
+      - center: [0.01995, -0.01469, 0.01339]
+        radius: 0.01379
+      - center: [0.0017, 0.0211, 0.1372]
+        radius: 0.04538
+      shoulder_link:
+      - center: [-0.02136, -0.0208, -0.13832]
+        radius: 0.03732
+      - center: [-0.00757, -0.02122, -0.08025]
+        radius: 0.03944
+      - center: [0.0194, -0.02064, -0.13835]
+        radius: 0.03729
+      - center: [0.03473, -0.02868, -0.08293]
+        radius: 0.01453
+      - center: [-0.01552, -0.01314, -0.03032]
+        radius: 0.03845
+      - center: [-0.02614, 0.01707, -0.02259]
+        radius: 0.02545
+      - center: [0.01604, -0.00875, -0.03169]
+        radius: 0.04035
+      - center: [0.00761, 0.02694, -0.01799]
+        radius: 0.02799
+      half_arm_1_link:
+      - center: [0.00108, -0.12574, -0.02405]
+        radius: 0.04336
+      - center: [-0.00261, -0.17096, -0.00603]
+        radius: 0.0544
+      - center: [0.00082, -0.00045, -0.03026]
+        radius: 0.04693
+      - center: [6.0e-05, -0.06567, -0.03385]
+        radius: 0.03649
+      half_arm_2_link:
+      - center: [-0.04163, -0.0168, -0.0421]
+        radius: 0.005
+      - center: [0.04108, 0.01489, -0.00362]
+        radius: 0.005
+      - center: [0.01117, -0.02652, -0.2487]
+        radius: 0.005
+      - center: [-0.04111, 0.01867, -0.19043]
+        radius: 0.005
+      forearm_link:
+      - center: [0.00041, -0.13483, -0.01911]
+        radius: 0.03756
+      - center: [0.00478, -0.17781, -0.0101]
+        radius: 0.04559
+      - center: [-0.01263, 0.0162, -0.02498]
+        radius: 0.03862
+      - center: [0.02041, 0.00415, -0.02636]
+        radius: 0.03258
+      - center: [-0.00108, -0.08019, -0.03506]
+        radius: 0.0313
+      - center: [-4.0e-05, -0.02409, -0.02776]
+        radius: 0.04116
+      spherical_wrist_1_link:
+      - center: [-0.01753, -0.02054, -0.10901]
+        radius: 0.0322
+      - center: [0.00964, -0.01997, -0.11866]
+        radius: 0.03225
+      - center: [0.00265, -0.02086, -0.0757]
+        radius: 0.03727
+      - center: [0.00145, 0.00143, -0.02583]
+        radius: 0.03552
+      - center: [-0.01412, -0.00571, -0.02757]
+        radius: 0.02747
+      spherical_wrist_2_link:
+      - center: [-0.01293, -0.09096, 0.01765]
+        radius: 0.02684
+      - center: [0.0162, -0.09196, 0.0121]
+        radius: 0.0231
+      - center: [-0.01052, -0.00458, -0.02754]
+        radius: 0.03245
+      - center: [0.00748, -0.00531, -0.02452]
+        radius: 0.0331
+      - center: [0.03044, -0.04388, -0.03257]
+        radius: 0.00698
+      - center: [0.00223, 0.00785, -0.02844]
+        radius: 0.03348
+      - center: [-0.00134, -0.08122, -0.0059]
+        radius: 0.04694
+      - center: [-0.01025, -0.05041, -0.02453]
+        radius: 0.02098
+      bracelet_link:
+      - center: [-0.00278, -0.04935, -0.05289]
+        radius: 0.0269
+      - center: [0.01598, 0.01204, -0.03094]
+        radius: 0.03944
+      - center: [-0.0284, 0.00129, -0.03202]
+        radius: 0.03075
+      - center: [-0.00067, -0.01789, -0.01776]
+        radius: 0.0221
+      - center: [0.03067, -0.06029, -0.05306]
+        radius: 0.01551
+      - center: [-0.03049, -0.06198, -0.05308]
+        radius: 0.01532
+      - center: [-0.03245, -0.01713, -0.06235]
+        radius: 0.00349
+      - center: [-0.01451, 0.0337, -0.06004]
+        radius: 0.00432
+      - center: [0.0, 0.0, -0.065]
+        radius: 0.018
+      - center: [-0.00245, 0.0, -0.09673]
+        radius: 0.01709
+      - center: [-0.00491, 0.0, -0.12845]
+        radius: 0.01618
+      - center: [-0.00736, 0.0, -0.16018]
+        radius: 0.01527
+      - center: [-0.00982, 0.0, -0.19191]
+        radius: 0.01436
+      - center: [-0.01227, 0.0, -0.22364]
+        radius: 0.01345
+      - center: [-0.01473, 0.0, -0.25536]
+        radius: 0.01255
+      - center: [-0.01718, 0.0, -0.28709]
+        radius: 0.01164
+      - center: [-0.01964, 0.0, -0.31882]
+        radius: 0.01073
+      - center: [-0.02209, 0.0, -0.35055]
+        radius: 0.00982
+      - center: [-0.02455, 0.0, -0.38227]
+        radius: 0.00891
+      - center: [-0.027, 0.0, -0.414]
+        radius: 0.008
+    collision_sphere_buffer: 0.005
+    self_collision_ignore:
+      base_link: [shoulder_link]
+      shoulder_link: [base_link, half_arm_1_link]
+      half_arm_1_link: [shoulder_link, half_arm_2_link]
+      half_arm_2_link: [half_arm_1_link, forearm_link]
+      forearm_link: [half_arm_2_link, spherical_wrist_1_link]
+      spherical_wrist_1_link: [forearm_link, spherical_wrist_2_link]
+      spherical_wrist_2_link: [spherical_wrist_1_link, bracelet_link]
+      bracelet_link: [spherical_wrist_2_link]
+    self_collision_buffer: {base_link: 0.0, shoulder_link: 0.0, half_arm_1_link: 0.0,
+      half_arm_2_link: 0.0, forearm_link: 0.0, spherical_wrist_1_link: 0.0, spherical_wrist_2_link: 0.0,
+      bracelet_link: 0.0}
+    cspace:
+      joint_names: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, joint_7]
+      max_acceleration: 15.0
+      max_jerk: 500.0
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      default_joint_position: [0.0, -0.3049, -3.1416, -1.6607, 0.0, -1.7928, -0.0006]

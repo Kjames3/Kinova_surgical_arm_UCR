@@ -1,9 +1,23 @@
 manipulator:
-  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  # ACTIVE: KDL with a much larger search budget. TRAC-IK isn't apt-installable
+  # on REAL-1 (no ROS 2 apt repo configured), so test this zero-dependency
+  # option first. KDL was solving the steep tilted angled-insert poses only
+  # ~5/10 of the time at timeout=0.05/attempts=1 (marginal pose + local solver +
+  # random re-seeding within the timeout). 10x the timeout and 5 attempts give
+  # the random re-seeding far more chances to land a solution per call.
+  # kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  # kinematics_solver_search_resolution: 0.005
+  # kinematics_solver_timeout: 0.5
+  # kinematics_solver_attempts: 5
+  # PREFERRED once available: TRAC-IK (KDL Newton + SQP in parallel) is far more
+  # reliable for these marginal poses (~99%+). Comment the KDL block above and
+  # uncomment below after installing the plugin (apt repo or source build).
+  kinematics_solver: trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin
   kinematics_solver_search_resolution: 0.005
-  # Increased from 0.005 s — the extra fixed link (pen_tip) and tight
-  # orientation constraints need more search iterations to converge.
-  kinematics_solver_timeout: 0.05
+  kinematics_solver_timeout: 0.2
+  kinematics_solver_attempts: 3
+  solve_type: Distance
+  position_only_ik: false
 gripper:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.005

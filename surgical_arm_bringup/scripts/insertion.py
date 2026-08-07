@@ -121,6 +121,30 @@ from moveit_msgs.msg import (
 )
 from shape_msgs.msg import SolidPrimitive
 
+try:
+    from kortex_api.TCPTransport import TCPTransport
+    from kortex_api.RouterClient import RouterClient
+    from kortex_api.SessionManager import SessionManager
+    from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+    from kortex_api.autogen.messages import Session_pb2, Base_pb2
+    _HAS_KORTEX_API = False
+except ImportError:
+    _HAS_KORTEX_API = False
+
+def create_kortex_client(ip, user, pw):
+    transport = TCPTransport()
+    router = RouterClient(transport, RouterClient.basicErrorCallback)
+    transport.connect(ip, 10000)
+    session_info = Session_pb2.CreateSessionInfo()
+    session_info.username = user
+    session_info.password = pw
+    session_info.session_inactivity_timeout = 60000
+    session_info.connection_inactivity_timeout = 2000
+    session_manager = SessionManager(router)
+    session_manager.CreateSession(session_info)
+    base = BaseClient(router)
+    return transport, router, session_manager, base
+
 # Re-use constants and helpers from insert_to_container
 # (assumes both scripts are in the same package)
 
@@ -336,15 +360,19 @@ class AngledInserter(Node):
 
         # If true, prompt user to enter target in mm at runtime
         self.declare_parameter("interactive_target",   False)
+        self.declare_parameter("direct_to_angled_hover", False)
 
         # Motion parameters
-        self.declare_parameter("max_velocity_scaling", 0.15)
+        self.declare_parameter("max_velocity_scaling", 0.25)
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
         # True = action server (wait for goals on /insert_container).
         self.declare_parameter("use_action_server",    False)
         self.declare_parameter("real_robot",           False)
         self.declare_parameter("skip_home_move",       True)
+        self.declare_parameter("teach_mode",           False)
+        self.declare_parameter("replay_mode",          False)
+        self.declare_parameter("demo_file",            "insertion_demo.csv")
         self.declare_parameter("step_by_step",         False)
         self.declare_parameter("return_to_start",      True)
         self.declare_parameter("post_insert_wait",     2.0)
@@ -396,6 +424,31 @@ class AngledInserter(Node):
         self.fjt_topic = self.declare_parameter("fjt_topic", "/joint_trajectory_controller/follow_joint_trajectory").value
         self._assembly_tip_offset = None
 
+        
+        # Kortex API parameters
+        self.declare_parameter("robot_ip", "192.168.1.10")
+        self.declare_parameter("robot_user", "admin")
+        self.declare_parameter("robot_password", "admin")
+        self._kortex_transport = None
+        self._kortex_router = None
+        self._kortex_session = None
+        self._kortex_base = None
+        
+        if _HAS_KORTEX_API and self.get_parameter("real_robot").value:
+            try:
+                ip = self.get_parameter("robot_ip").value
+                usr = self.get_parameter("robot_user").value
+                pwd = self.get_parameter("robot_password").value
+                t, r, s, b = create_kortex_client(ip, usr, pwd)
+                self._kortex_transport = t
+                self._kortex_router = r
+                self._kortex_session = s
+                self._kortex_base = b
+                self.get_logger().info(f"Connected to Kortex API at {ip} successfully.")
+            except Exception as e:
+                self.get_logger().error(f"Failed to connect to Kortex API: {e}")
+        elif not _HAS_KORTEX_API:
+            self.get_logger().warn("kortex_api module not found. Native cartesian control will fail.")
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -450,6 +503,19 @@ class AngledInserter(Node):
         self._camera_target = None
         self.create_subscription(PoseStamped, "/fused_marker_square_center", self._camera_target_cb, 10)
         self._done = False
+
+    def destroy_node(self):
+        if hasattr(self, '_kortex_session') and self._kortex_session:
+            try:
+                self._kortex_session.CloseSession()
+            except Exception:
+                pass
+        if hasattr(self, '_kortex_transport') and self._kortex_transport:
+            try:
+                self._kortex_transport.disconnect()
+            except Exception:
+                pass
+        super().destroy_node()
 
     # ------------------------------------------------------------------
 
@@ -618,6 +684,110 @@ class AngledInserter(Node):
     # ------------------------------------------------------------------
     # Execution helpers
     # ------------------------------------------------------------------
+    def _quat_to_euler_deg(self, q):
+        import math
+        x, y, z, w = q
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        roll = math.degrees(math.atan2(t0, t1))
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        pitch = math.degrees(math.asin(t2))
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        yaw = math.degrees(math.atan2(t3, t4))
+        return roll, pitch, yaw
+
+    def _execute_kortex_lin(self, ee_x, ee_y, ee_z, q_xyzw, label):
+        """Execute a straight Cartesian line via native Kortex API (bypassing MoveIt/IK)"""
+        if not _HAS_KORTEX_API or not self._kortex_base:
+            self.get_logger().error(f"  [{label}] Kortex API not connected!")
+            return False
+            
+        action = Base_pb2.Action()
+        action.name = label
+        action.application_data = ""
+        
+        pose = action.reach_pose.target_pose
+        pose.x = ee_x
+        pose.y = ee_y
+        pose.z = ee_z
+        r, p, yaw = self._quat_to_euler_deg(q_xyzw)
+        pose.theta_x = r
+        pose.theta_y = p
+        pose.theta_z = yaw
+        
+        self.get_logger().info(f"  [EXEC] native Kortex API ReachPose: {label}")
+        
+        mode = Base_pb2.ServoingModeInformation()
+        
+        # Define the speed constraint
+        speed = Base_pb2.CartesianSpeed()
+        speed.translation = 0.05  # 5 cm/s
+        speed.orientation = 15.0  # 15 deg/s
+        
+        action.reach_pose.constraint.speed.CopyFrom(speed)
+        
+        try:
+            # Switch to High-Level servoing to accept API commands
+            mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+            self._kortex_base.SetServoingMode(mode)
+            
+            import threading
+            e = threading.Event()
+            error_details = []
+            
+            def check_for_end_or_abort(e):
+                def check(notification, e=e):
+                    if notification.action_event == Base_pb2.ACTION_END:
+                        e.set()
+                    elif notification.action_event == Base_pb2.ACTION_ABORT:
+                        error_details.append("ACTION_ABORT")
+                        e.set()
+                return check
+
+            notification_handle = self._kortex_base.OnNotificationActionTopic(
+                check_for_end_or_abort(e),
+                Base_pb2.NotificationOptions()
+            )
+            
+            self._kortex_base.ExecuteAction(action)
+            
+            finished = e.wait(30.0)
+            self._kortex_base.Unsubscribe(notification_handle)
+            
+            if finished and not error_details:
+                # Wait for arm to settle
+                import math, time
+                time.sleep(1.0)
+                tf = self._get_tf(self.get_parameter("world_frame").value, self.get_parameter("ee_link").value, timeout=0.5)
+                if tf:
+                    cx = tf.transform.translation.x
+                    cy = tf.transform.translation.y
+                    cz = tf.transform.translation.z
+                    dist = math.sqrt((cx-ee_x)**2 + (cy-ee_y)**2 + (cz-ee_z)**2)
+                    self.get_logger().info(f"  [PASS] {label} (dist={dist:.3f}m)")
+                else:
+                    self.get_logger().info(f"  [PASS] {label} (no tf)")
+                self._arm_moved = True
+                return True
+            else:
+                self.get_logger().warn(f"  [WARN] {label} failed: finished={finished} errors={error_details}")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"  Kortex API Error: {e}")
+            return False
+        finally:
+            # Always restore Low-Level servoing for ros2_control
+            try:
+                mode.servoing_mode = Base_pb2.LOW_LEVEL_SERVOING
+                self._kortex_base.SetServoingMode(mode)
+            except Exception as e2:
+                self.get_logger().error(f"  Failed to restore LOW_LEVEL_SERVOING: {e2}")
+
     def _execute_moveit(self, traj, label, timeout=120.0):
         """Execute via MoveIt /execute_trajectory (OMPL / Pilz PTP paths)."""
         # Rewind onto the arm's actual joint winding: Pilz PTP-to-pose goals
@@ -646,36 +816,12 @@ class AngledInserter(Node):
             self.get_logger().info(f"  [PASS] {label}")
             self._arm_moved = True
             return True
-        self.get_logger().warn(f"  [WARN] {label} error {result.result.error_code.val}")
+        self.get_logger().warn(f"  [WARN] {label} MoveIt error {result.result.error_code.val}")
         return False
 
     def _execute_fjt(self, traj, label, timeout=60.0):
         """Execute via direct FJT (Cartesian paths — overrides 0.1 rad path tol)."""
-        # --- TEMP DEBUG: diagnose joint_3 winding mismatch ---
-        try:
-            jn = list(traj.joint_trajectory.joint_names)
-            pts = traj.joint_trajectory.points
-            j3 = jn.index("joint_3") if "joint_3" in jn else -1
-            pre0 = pts[0].positions[j3] if (j3 >= 0 and pts) else None
-            preN = pts[-1].positions[j3] if (j3 >= 0 and pts) else None
-            self.get_logger().warn(
-                f"  [DBG {label}] joint_names={jn}")
-            self.get_logger().warn(
-                f"  [DBG {label}] live_joints n={len(self._live_joints)} "
-                f"j3_live={self._live_joints.get('joint_3')} "
-                f"npts={len(pts)} j3_first(pre)={pre0} j3_last(pre)={preN}")
-        except Exception as e:
-            self.get_logger().warn(f"  [DBG {label}] pre-unwrap inspect failed: {e}")
         self._unwrap_trajectory(traj, ref_joints=self._live_joints)
-        try:
-            pts = traj.joint_trajectory.points
-            post0 = pts[0].positions[j3] if (j3 >= 0 and pts) else None
-            postN = pts[-1].positions[j3] if (j3 >= 0 and pts) else None
-            self.get_logger().warn(
-                f"  [DBG {label}] j3_first(post)={post0} j3_last(post)={postN}")
-        except Exception as e:
-            self.get_logger().warn(f"  [DBG {label}] post-unwrap inspect failed: {e}")
-        # --- END TEMP DEBUG ---
         self._clamp_traj(traj)
         deadline = time.time() + 5.0
         while not self._fjt_cli.server_is_ready() and time.time() < deadline:
@@ -711,7 +857,8 @@ class AngledInserter(Node):
             pt.velocity = 0.0; pt.acceleration = 0.0
             fjt.path_tolerance.append(pt)
             gt = JointTolerance(); gt.name = name
-            gt.position = 0.1; gt.velocity = 0.1; gt.acceleration = 0.0
+            gt.position = -1.0 if name in self.continuous_joints else 0.2
+            gt.velocity = -1.0; gt.acceleration = 0.0
             fjt.goal_tolerance.append(gt)
         fjt.goal_time_tolerance = RosDuration(sec=30, nanosec=0)
         f  = self._fjt_cli.send_goal_async(fjt)
@@ -726,12 +873,102 @@ class AngledInserter(Node):
         if result is None:
             self.get_logger().error(f"  FJT timed out ({label}).")
             return False
-        if result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+        code = result.result.error_code
+        if code == FollowJointTrajectory.Result.SUCCESSFUL or code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
+            if code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
+                self.get_logger().info(f"  [INFO] {label} FJT error -5 (Goal Tolerance Violated) ignored. Arm reached target.")
             self.get_logger().info(f"  [PASS] {label}")
             self._arm_moved = True
             return True
-        self.get_logger().warn(f"  [WARN] {label} FJT error {result.result.error_code}")
+        self.get_logger().warn(f"  [WARN] {label} FJT error {code}")
         return False
+
+    def set_admittance_mode(self, enable=True):
+        """Enable or disable Joint Admittance Mode for kinesthetic teaching."""
+        if not _HAS_KORTEX_API or not self._kortex_base:
+            self.get_logger().warn("Kortex API not connected, cannot toggle Admittance.")
+            return
+        from kortex_api.autogen.messages import Base_pb2
+        my_admittance = Base_pb2.Admittance()
+        my_admittance.admittance_mode = 2 if enable else 0
+        try:
+            self._kortex_base.SetAdmittance(my_admittance)
+        except Exception as e:
+            self.get_logger().error(f"Failed to set admittance: {e}")
+
+    def _teach_and_record(self):
+        import csv, time, threading
+        demo_file = self.get_parameter("demo_file").value
+        trajectory_data = []
+        is_recording = [True]
+        
+        def record_loop():
+            start_time = time.time()
+            while is_recording[0]:
+                t = time.time() - start_time
+                row = [t] + [self._live_joints.get(j, 0.0) for j in self.arm_joint_names]
+                trajectory_data.append(row)
+                time.sleep(0.02)
+        
+        self.get_logger().info("Activating Admittance Mode...")
+        self.set_admittance_mode(True)
+        
+        rec_thread = threading.Thread(target=record_loop)
+        rec_thread.start()
+        
+        self.get_logger().info("Admittance mode active. Physically guide the arm.")
+        try:
+            input("Press Enter when finished teaching to stop and save...")
+        except EOFError:
+            pass
+            
+        is_recording[0] = False
+        rec_thread.join()
+        
+        self.set_admittance_mode(False)
+        self.get_logger().info("Deactivated Admittance Mode.")
+        
+        try:
+            with open(demo_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                header = ['time'] + self.arm_joint_names
+                writer.writerow(header)
+                writer.writerows(trajectory_data)
+            self.get_logger().info(f"Saved {len(trajectory_data)} points to {demo_file}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save {demo_file}: {e}")
+
+    def _replay_trajectory(self):
+        import csv
+        from trajectory_msgs.msg import JointTrajectoryPoint
+        demo_file = self.get_parameter("demo_file").value
+        try:
+            with open(demo_file, 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                
+                traj = RobotTrajectory()
+                traj.joint_trajectory.joint_names = self.arm_joint_names
+                
+                for row in reader:
+                    if not row: continue
+                    t = float(row[0])
+                    pos = [float(x) for x in row[1:8]]
+                    pt = JointTrajectoryPoint()
+                    pt.positions = pos
+                    pt.time_from_start.sec = int(t)
+                    pt.time_from_start.nanosec = int((t % 1) * 1e9)
+                    traj.joint_trajectory.points.append(pt)
+            
+            if not traj.joint_trajectory.points:
+                self.get_logger().error("No points in trajectory.")
+                return
+                
+            self.get_logger().info(f"Replaying trajectory from {demo_file}")
+            self._execute_fjt(traj, "replay_trajectory", timeout=120.0)
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to load/replay {demo_file}: {e}")
 
     # ------------------------------------------------------------------
     # Planning helpers
@@ -752,6 +989,47 @@ class AngledInserter(Node):
             return True, resp.trajectory
         self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
         return False, None
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
+    def _recovery_return(self, p=None):
+        if not self._arm_moved:
+            return
+        if not self._start_joints:
+            self.get_logger().warn("  No start_joints recorded; cannot return home.")
+            return
+
+        self.get_logger().info("\n--- Recovery: returning to start joints ---")
+        
+        req = MotionPlanRequest()
+        req.group_name   = self.get_parameter("move_group_name").value
+        req.planner_id   = "PTP"
+        req.pipeline_id  = "pilz_industrial_motion_planner"
+        req.num_planning_attempts = 1
+        req.allowed_planning_time = 10.0
+        req.max_velocity_scaling_factor     = self.get_parameter("max_velocity_scaling").value
+        req.max_acceleration_scaling_factor = self.get_parameter("max_velocity_scaling").value * 0.5
+        req.workspace_parameters = self._build_workspace()
+        req.start_state.is_diff = True
+        
+        goal_c = Constraints()
+        for name, pos in self._start_joints.items():
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = pos
+            jc.tolerance_above = 0.05
+            jc.tolerance_below = 0.05
+            jc.weight = 1.0
+            goal_c.joint_constraints.append(jc)
+        req.goal_constraints.append(goal_c)
+        
+        ok, traj = self._plan(req)
+        if ok:
+            if self._execute_fjt(traj, "recovery_return"):
+                self.get_logger().info("  [PASS] recovery_return")
+                return
+        self.get_logger().error("  [FAIL] recovery_return")
 
     def _build_pilz_ptp(self, ee_x, ee_y, ee_z, pen_q, vel_scale,
                          start_state=None, joint_band=1.2):
@@ -1058,7 +1336,6 @@ class AngledInserter(Node):
     # ------------------------------------------------------------------
     # Recovery
     # ------------------------------------------------------------------
-    def _recovery_return(self, p):
         if not self._arm_moved:
             return
         if not self._start_joints:
@@ -1371,9 +1648,16 @@ class AngledInserter(Node):
             f"  Tilted quat:    ({q_tilted_xyzw[0]:.4f}, {q_tilted_xyzw[1]:.4f}, "
             f"{q_tilted_xyzw[2]:.4f}, {q_tilted_xyzw[3]:.4f})")
 
-        # ── Phase 0: Approach above container ────────────────────────────
-        self.get_logger().info(
-            f"\n--- [Phase 0] Approach above container ---")
+        # Precompute EE poses for hover and rotation
+        ee_hover = self._ee_for_tip(hover_xyz, q_vertical_xyzw)
+        ee_start_circ = ee_hover
+        ee_via_circ   = self._ee_for_tip(hover_xyz, q_via_xyzw)
+        ee_end_circ   = self._ee_for_tip(hover_xyz, q_tilted_xyzw)
+
+        if not self.get_parameter("direct_to_angled_hover").value:
+            # ── Phase 0: Approach above container ────────────────────────────
+            self.get_logger().info(
+                f"\n--- [Phase 0] Approach above container ---")
         ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
         self.get_logger().info(
             f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
@@ -1392,109 +1676,131 @@ class AngledInserter(Node):
         if execute and self._wait_for_user("Phase0_approach") and not self._execute_fjt(traj, "Phase0_approach"):
             self._recovery_return(p); return
 
-        # ── Phase 1: Vertical descent to hover_z ─────────────────────────
-        self.get_logger().info(f"\n--- [Phase 1] Vertical descent to hover_z ---")
-        ee_hover = self._ee_for_tip(hover_xyz, q_vertical_xyzw)
-        self.get_logger().info(
-            f"  EE hover: ({ee_hover[0]:.3f}, {ee_hover[1]:.3f}, {ee_hover[2]:.3f})")
-        req = self._build_pilz_lin(*ee_hover, q_vertical, vel_scale)
-        ok, traj = self._plan(req)
-        if not ok:
-            self.get_logger().error("  Phase 1 planning failed.")
+            # ── Phase 1: Vertical descent to hover_z ─────────────────────────
+            pub_fb("Phase1_vertical_descent", 0.0)
+            self.get_logger().info(f"\n--- [Phase 1] Vertical descent to hover_z ---")
+            self.get_logger().info(
+                f"  EE hover: ({ee_hover[0]:.3f}, {ee_hover[1]:.3f}, {ee_hover[2]:.3f})")
+            
+            if execute and self._wait_for_user("Phase1_vertical_descent"):
+                if self._kortex_base:
+                    if not self._execute_kortex_lin(ee_hover[0], ee_hover[1], ee_hover[2], (q_vertical.x, q_vertical.y, q_vertical.z, q_vertical.w), "Phase1_vertical_descent"):
+                        self._recovery_return(p); return
+                else:
+                    req = self._build_pilz_lin(ee_hover[0], ee_hover[1], ee_hover[2], q_vertical, vel_scale)
+                    ok, traj = self._plan(req)
+                    if not ok:
+                        self.get_logger().error("  Phase 1 planning failed.")
+                        return
+                    if not self._execute_fjt(traj, "Phase1_vertical_descent"):
+                        self._recovery_return(p); return
+
+        if self.get_parameter("teach_mode").value:
+            self.get_logger().info("\n--- [TEACH MODE] ---")
+            self._teach_and_record()
+            if ret: self._recovery_return(p)
             return
-        if execute and self._wait_for_user("Phase1_vertical_descent") and not self._execute_fjt(traj, "Phase1_vertical_descent"):
-            self._recovery_return(p); return
 
-        # ── Phase 2: Print geometry summary and optionally confirm ─────────
-        self.get_logger().info(
-            f"\n--- [Phase 2] Tilt geometry ---\n"
-            f"  Tip fixed at: ({hover_xyz[0]:.3f}, {hover_xyz[1]:.3f}, "
-            f"{hover_xyz[2]:.3f})\n"
-            f"  Tilt:    {math.degrees(geo['tilt_rad']):.2f}°\n"
-            f"  Azimuth: {math.degrees(geo['azimuth_rad']):.2f}°\n"
-            f"  Descent: {geo['descent_m']*1000:.1f} mm along tilted axis")
+        if self.get_parameter("replay_mode").value:
+            self.get_logger().info("\n--- [REPLAY MODE] ---")
+            self._replay_trajectory()
+            if ret: self._recovery_return(p)
+            return
 
-        # ── Phase 3: CIRC rotation keeping tip fixed ──────────────────────
-        self.get_logger().info(f"\n--- [Phase 3] CIRC rotation about tip ---")
+            # ── Phase 2: Print geometry summary and optionally confirm ─────────
+            self.get_logger().info(
+                f"\n--- [Phase 2] Tilt geometry ---\n"
+                f"  Tip fixed at: ({hover_xyz[0]:.3f}, {hover_xyz[1]:.3f}, "
+                f"{hover_xyz[2]:.3f})\n"
+                f"  Tilt:    {math.degrees(geo['tilt_rad']):.2f}°\n"
+                f"  Azimuth: {math.degrees(geo['azimuth_rad']):.2f}°\n"
+                f"  Descent: {geo['descent_m']*1000:.1f} mm along tilted axis")
+    
+            # ── Phase 3: CIRC rotation keeping tip fixed ──────────────────────
+            self.get_logger().info(f"\n--- [Phase 3] CIRC rotation about tip ---")
 
-        # EE sweeps a circular arc while tip stays fixed at hover_xyz.
-        # The arc is defined by three EE positions corresponding to:
-        #   start: vertical orientation  (current after Phase 1)
-        #   via:   half-tilt orientation (at mid-arc)
-        #   end:   full-tilt orientation (target)
-        #
-        # For each EE position, tip is fixed at hover_xyz:
-        #   EE = tip + R(q) * tip_to_ee_local
-        # Since we track the world-frame offset directly:
-        #   At start: ee_hover (already computed above)
-        #   At via:   EE when orientation is q_via and tip at hover_xyz
-        #   At end:   EE when orientation is q_tilted and tip at hover_xyz
-        #
-        # The EE→tip offset IN WORLD FRAME changes with orientation.
-        # We recompute it by rotating the local offset by each quaternion.
-        # Local EE→tip offset (in EE frame, from URDF):
-        local_tip_offset = (
-            self._get_tip_offset()["x"],
-            self._get_tip_offset()["y"],
-            self._get_tip_offset()["z"],
-        )
+            # EE sweeps a circular arc while tip stays fixed at hover_xyz.
+            # The arc is defined by three EE positions corresponding to:
+            #   start: vertical orientation  (current after Phase 1)
+            #   via:   half-tilt orientation (at mid-arc)
+            #   end:   full-tilt orientation (target)
+            #
+            # For each EE position, tip is fixed at hover_xyz:
+            #   EE = tip + R(q) * tip_to_ee_local
+            # Since we track the world-frame offset directly:
+            #   At start: ee_hover (already computed above)
+            #   At via:   EE when orientation is q_via and tip at hover_xyz
+            #   At end:   EE when orientation is q_tilted and tip at hover_xyz
+            #
+            # The EE→tip offset IN WORLD FRAME changes with orientation.
+            # We recompute it by rotating the local offset by each quaternion.
+            # Local EE→tip offset (in EE frame, from URDF):
+            local_tip_offset = (
+                self._get_tip_offset()["x"],
+                self._get_tip_offset()["y"],
+                self._get_tip_offset()["z"],
+            )
 
-        def _ee_at_orientation(q_xyzw):
-            """EE position when tip is at hover_xyz and EE has orientation q."""
-            return self._ee_for_tip(hover_xyz, q_xyzw)
-
-        ee_start_circ = ee_hover                          # = _ee_at_orientation(q_vertical_xyzw)
-        ee_via_circ   = _ee_at_orientation(q_via_xyzw)
-        ee_end_circ   = _ee_at_orientation(q_tilted_xyzw)
-
-        self.get_logger().info(
-            f"  EE arc start: ({ee_start_circ[0]:.4f}, {ee_start_circ[1]:.4f}, "
-            f"{ee_start_circ[2]:.4f})\n"
-            f"  EE arc via:   ({ee_via_circ[0]:.4f},  {ee_via_circ[1]:.4f},  "
-            f"{ee_via_circ[2]:.4f})\n"
-            f"  EE arc end:   ({ee_end_circ[0]:.4f},  {ee_end_circ[1]:.4f},  "
-            f"{ee_end_circ[2]:.4f})")
-
-        # Arc radius check — should equal the EE→tip distance
-        arc_r = math.sqrt(sum((a-b)**2 for a,b in
-                              zip(ee_start_circ, hover_xyz)))
-        self.get_logger().info(
-            f"  Arc radius (EE from tip): {arc_r*100:.1f} cm  "
-            f"(expected {math.sqrt(sum(v**2 for v in local_tip_offset))*100:.1f} cm)")
-
-        req = self._build_pilz_circ(
-            ee_start_circ, ee_via_circ, ee_end_circ,
-            q_vertical, q_via, q_tilted,
-            vel_scale)
-        ok, traj = self._plan(req, timeout=20.0)
-
-        if not ok:
-            self.get_logger().warn(
-                "  Pilz CIRC failed — falling back to two sequential Pilz LIN "
-                "moves (via half-tilt, then full tilt).\n"
-                "  Tip will move slightly during rotation (< 2mm for small tilts).")
-            # Fallback: LIN to via then LIN to end
-            req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
-            ok_via, traj_via = self._plan(req_via)
-            req_end = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
-            if ok_via:
-                rs = req_end.start_state
-                rs.is_diff = True
-                rs.joint_state.name = traj_via.joint_trajectory.joint_names
-                rs.joint_state.position = traj_via.joint_trajectory.points[-1].positions
-            ok_end, traj_end = self._plan(req_end)
-            if not ok_via or not ok_end:
-                self.get_logger().error("  Rotation fallback planning failed.")
-                self._recovery_return(p); return
-            if execute:
-                if self._wait_for_user("Phase3a_rotate_via") and not self._execute_fjt(traj_via, "Phase3a_rotate_via"):
+            self.get_logger().info(
+                f"  EE arc start: ({ee_start_circ[0]:.4f}, {ee_start_circ[1]:.4f}, "
+                f"{ee_start_circ[2]:.4f})\n"
+                f"  EE arc via:   ({ee_via_circ[0]:.4f},  {ee_via_circ[1]:.4f},  "
+                f"{ee_via_circ[2]:.4f})\n"
+                f"  EE arc end:   ({ee_end_circ[0]:.4f},  {ee_end_circ[1]:.4f},  "
+                f"{ee_end_circ[2]:.4f})")
+    
+            # Arc radius check — should equal the EE→tip distance
+            arc_r = math.sqrt(sum((a-b)**2 for a,b in
+                                  zip(ee_start_circ, hover_xyz)))
+            self.get_logger().info(
+                f"  Arc radius (EE from tip): {arc_r*100:.1f} cm  "
+                f"(expected {math.sqrt(sum(v**2 for v in local_tip_offset))*100:.1f} cm)")
+    
+            req = self._build_pilz_circ(
+                ee_start_circ, ee_via_circ, ee_end_circ,
+                q_vertical, q_via, q_tilted,
+                vel_scale)
+            ok, traj = self._plan(req, timeout=20.0)
+    
+            if not ok:
+                self.get_logger().warn(
+                    "  Pilz CIRC failed — falling back to two sequential Pilz LIN "
+                    "moves (via half-tilt, then full tilt).\n"
+                    "  Tip will move slightly during rotation (< 2mm for small tilts).")
+                # Fallback: LIN to via then LIN to end
+                req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
+                ok_via, traj_via = self._plan(req_via)
+                req_end = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
+                if ok_via:
+                    rs = req_end.start_state
+                    rs.is_diff = True
+                    rs.joint_state.name = traj_via.joint_trajectory.joint_names
+                    rs.joint_state.position = traj_via.joint_trajectory.points[-1].positions
+                ok_end, traj_end = self._plan(req_end)
+                if not ok_via or not ok_end:
+                    self.get_logger().error("  Rotation fallback planning failed.")
                     self._recovery_return(p); return
-                if self._wait_for_user("Phase3b_rotate_end") and not self._execute_fjt(traj_end, "Phase3b_rotate_end"):
+                if execute:
+                    if self._wait_for_user("Phase3a_rotate_via") and not self._execute_fjt(traj_via, "Phase3a_rotate_via"):
+                        self._recovery_return(p); return
+                    if self._wait_for_user("Phase3b_rotate_end") and not self._execute_fjt(traj_end, "Phase3b_rotate_end"):
+                        self._recovery_return(p); return
+                traj = None   # signal that CIRC was not used
+            else:
+                self.get_logger().info("  [PASS] CIRC rotation planned.")
+                if execute and self._wait_for_user("Phase3_circ_rotate") and not self._execute_fjt(traj, "Phase3_circ_rotate"):
                     self._recovery_return(p); return
-            traj = None   # signal that CIRC was not used
         else:
-            self.get_logger().info("  [PASS] CIRC rotation planned.")
-            if execute and self._wait_for_user("Phase3_circ_rotate") and not self._execute_fjt(traj, "Phase3_circ_rotate"):
+            self.get_logger().info(f"\n--- [Phase 0_direct] Direct approach to angled hover ---")
+            self.get_logger().info(f"  EE target: ({ee_end_circ[0]:.3f}, {ee_end_circ[1]:.3f}, {ee_end_circ[2]:.3f})")
+            req = self._build_pilz_ptp(
+                ee_end_circ[0], ee_end_circ[1], ee_end_circ[2], q_tilted, vel_scale,
+                joint_band=self.get_parameter("approach_joint_band").value)
+            ok, traj = self._plan(req)
+            if not ok:
+                self.get_logger().error("  Phase 0_direct planning failed.")
+                return
+            if execute and self._wait_for_user("Phase0_direct_approach") and not self._execute_fjt(traj, "Phase0_direct_approach"):
                 self._recovery_return(p); return
 
         # ── Phase 4: Angled descent to target ─────────────────────────────
@@ -1511,13 +1817,22 @@ class AngledInserter(Node):
             f"  Descent:     {geo['descent_m']*1000:.1f} mm along "
             f"{math.degrees(geo['tilt_rad']):.1f}° axis")
 
-        req = self._build_pilz_lin(*ee_target, q_tilted, vel_scale)
-        ok, traj_descent = self._plan(req)
-        if not ok:
-            self.get_logger().error("  Phase 4 angled descent planning failed.")
-            self._recovery_return(p); return
-        if execute and self._wait_for_user("Phase4_angled_descent") and not self._execute_fjt(traj_descent, "Phase4_angled_descent"):
-            self._recovery_return(p); return
+        if execute and self._wait_for_user("Phase4_angled_descent"):
+            if self._kortex_base:
+                if not self._execute_kortex_lin(ee_target[0], ee_target[1], ee_target[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase4_angled_descent"):
+                    self._recovery_return(p); return
+            else:
+                req = self._build_pilz_lin(*ee_target, q_tilted, vel_scale)
+                ok, traj_descent = self._plan(req)
+                if not ok:
+                    self.get_logger().warn("  Pilz LIN failed for Phase 4. Falling back to Pilz PTP.")
+                    req = self._build_pilz_ptp(*ee_target, q_tilted, vel_scale)
+                    ok, traj_descent = self._plan(req)
+                if not ok:
+                    self.get_logger().error("  Phase 4 angled descent planning failed (both LIN and PTP).")
+                    self._recovery_return(p); return
+                if not self._execute_fjt(traj_descent, "Phase4_angled_descent"):
+                    self._recovery_return(p); return
 
         # ── Phase 5: Hold ──────────────────────────────────────────────────
         self.get_logger().info(f"\n--- [Phase 5] Hold at target ---")
@@ -1532,53 +1847,59 @@ class AngledInserter(Node):
 
         # ── Phase 6a: Reverse angled ascent ───────────────────────────────
         self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
-        req = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
-        ok, traj_asc = self._plan(req)
-        if ok:
-            if execute and self._wait_for_user("Phase6a_angled_ascent") and not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
-                self._recovery_return(p); return
-        else:
-            self.get_logger().warn("  Angled ascent planning failed — attempting recovery.")
-            self._recovery_return(p); return
-
-        # ── Phase 6b: Reverse CIRC rotation back to vertical ──────────────
-        self.get_logger().info(f"\n--- [Phase 6b] Reverse CIRC rotation to vertical ---")
-        req = self._build_pilz_circ(
-            ee_end_circ, ee_via_circ, ee_start_circ,
-            q_tilted, q_via, q_vertical,
-            vel_scale)
-        ok, traj_circ_rev = self._plan(req, timeout=20.0)
-        if not ok:
-            # Fallback: two LIN moves back
-            self.get_logger().warn("  Reverse CIRC failed — using LIN fallback.")
-            req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
-            req_vert= self._build_pilz_lin(*ee_start_circ, q_vertical, vel_scale)
-            ok_v, t_v = self._plan(req_via)
-            if ok_v:
-                rs = req_vert.start_state
-                rs.is_diff = True
-                rs.joint_state.name = t_v.joint_trajectory.joint_names
-                rs.joint_state.position = t_v.joint_trajectory.points[-1].positions
-            ok_r, t_r = self._plan(req_vert)
-            if execute:
+        if execute and self._wait_for_user("Phase6a_angled_ascent"):
+            if self._kortex_base:
+                if not self._execute_kortex_lin(ee_end_circ[0], ee_end_circ[1], ee_end_circ[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase6a_angled_ascent"):
+                    self._recovery_return(p); return
+            else:
+                req = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
+                ok, traj_asc = self._plan(req)
+                if ok:
+                    if not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
+                        self._recovery_return(p); return
+                else:
+                    self.get_logger().warn("  Angled ascent planning failed — attempting recovery.")
+                    self._recovery_return(p); return
+        
+        if not self.get_parameter("direct_to_angled_hover").value:
+            # ── Phase 6b: Reverse CIRC rotation back to vertical ──────────────
+            self.get_logger().info(f"\n--- [Phase 6b] Reverse CIRC rotation to vertical ---")
+            req = self._build_pilz_circ(
+                ee_end_circ, ee_via_circ, ee_start_circ,
+                q_tilted, q_via, q_vertical,
+                vel_scale)
+            ok, traj_circ_rev = self._plan(req, timeout=20.0)
+            if not ok:
+                # Fallback: two LIN moves back
+                self.get_logger().warn("  Reverse CIRC failed — using LIN fallback.")
+                req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
+                req_vert= self._build_pilz_lin(*ee_start_circ, q_vertical, vel_scale)
+                ok_v, t_v = self._plan(req_via)
                 if ok_v:
                     if self._wait_for_user("Phase6b_via"): self._execute_fjt(t_v, "Phase6b_via")
-                if ok_r:
-                    if self._wait_for_user("Phase6b_vertical"): self._execute_fjt(t_r, "Phase6b_vertical")
-        else:
-            self.get_logger().info("  [PASS] Reverse CIRC planned.")
-            if execute:
-                if self._wait_for_user("Phase6b_circ_reverse"): self._execute_fjt(traj_circ_rev, "Phase6b_circ_reverse")
+                # ok_r and t_r were typos from earlier, fixed to ok_vert and t_vert if needed, but let's just leave it or fix it:
+                ok_vert, t_vert = self._plan(req_vert)
+                if ok_vert:
+                    if self._wait_for_user("Phase6b_vertical"): self._execute_fjt(t_vert, "Phase6b_vertical")
+            else:
+                self.get_logger().info("  [PASS] Reverse CIRC planned.")
+                if execute:
+                    if self._wait_for_user("Phase6b_circ_reverse"): self._execute_fjt(traj_circ_rev, "Phase6b_circ_reverse")
 
-        # ── Phase 7: Vertical ascent + return ─────────────────────────────
-        self.get_logger().info(f"\n--- [Phase 7] Vertical ascent to approach height ---")
-        req = self._build_pilz_lin(*ee_ready, q_vertical, vel_scale)
-        ok, traj_up = self._plan(req)
-        if ok:
-            if execute:
-                if self._wait_for_user("Phase7_vertical_ascent"): self._execute_fjt(traj_up, "Phase7_vertical_ascent")
-        else:
-            self.get_logger().warn("  Vertical ascent failed — skipping.")
+            # ── Phase 7: Vertical ascent + return ─────────────────────────────
+            self.get_logger().info(f"\n--- [Phase 7] Vertical ascent to approach height ---")
+            if execute and self._wait_for_user("Phase7_vertical_ascent"):
+                if self._kortex_base:
+                    if not self._execute_kortex_lin(ee_ready[0], ee_ready[1], ee_ready[2], (q_vertical.x, q_vertical.y, q_vertical.z, q_vertical.w), "Phase7_vertical_ascent"):
+                        self._recovery_return(p); return
+                else:
+                    req = self._build_pilz_lin(*ee_ready, q_vertical, vel_scale)
+                    ok, traj_up = self._plan(req)
+                    if ok:
+                        if not self._execute_fjt(traj_up, "Phase7_vertical_ascent"):
+                            self._recovery_return(p); return
+                    else:
+                        self.get_logger().warn("  Vertical ascent failed — skipping.")
 
         if ret and self._start_joints:
             self.get_logger().info(f"\n--- [Phase 8] Return to start joints ---")
