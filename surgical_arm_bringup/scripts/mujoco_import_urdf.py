@@ -237,6 +237,30 @@ if _removed_free:
 else:
     print("Base weld: no freejoint found; URDF root imported already welded to world.")
 
+# Hide collision meshes from the viewer.
+#
+# MuJoCo's URDF importer emits BOTH a <visual> and a <collision> geom per link
+# and renders both. RViz only ever draws visuals, so a URDF can carry a visual
+# and a collision mesh at completely different origins without anyone noticing.
+# thesis_ee does exactly that: its visual Full_Assembly sits at
+# (-0.110, -0.025, -0.202) while its collision copy sits at (0, 0, 0) with a
+# different rotation. Rendered together, the end effector appears TWICE — one
+# attached to the bracelet and one apparently floating in space.
+#
+# The importer tags visual geoms with group="1" (plus contype/conaffinity 0);
+# collision geoms come through with no group at all, i.e. group 0, which the
+# viewer draws. Moving them to group 3 matches the MuJoCo Menagerie convention:
+# the viewer shows groups 0-2 by default and hides 3+, so collision geometry
+# becomes invisible but still fully active for contact. Press '3' in the viewer
+# to show it again when debugging contacts. This changes rendering only —
+# contype/conaffinity/mass are untouched, so physics is bit-identical.
+_hidden_collision = 0
+for geom in root.iter("geom"):
+    if geom.get("mesh") is not None and geom.get("group") is None:
+        geom.set("group", "3")
+        _hidden_collision += 1
+print(f"Collision meshes moved to hidden group 3: {_hidden_collision}")
+
 # Scene geometry. Dimensions mirror setup_planning_scene.py exactly so the
 # MoveIt planning scene and the sim agree. MuJoCo box/cylinder sizes are
 # HALF-extents: table 2.0x2.0x0.05 -> "1.0 1.0 0.025", top face at z=-0.03 so

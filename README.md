@@ -211,6 +211,17 @@ ros2 launch kinova_gen3_7dof_robotiq_2f_140_moveit_config mujoco_sim.launch.py
 > If the model file `~/mujoco_models/gen3_thesis_ee.xml` is missing or stale, or
 > `/isaac_joint_states` never publishes, re-run `mujoco_import_urdf.py` (Step 1).
 
+> **Collision geometry is hidden in the viewer.** `mujoco_import_urdf.py` puts
+> every collision mesh in geom **group 3**, which MuJoCo's viewer does not draw
+> by default (it shows groups 0–2). Press **`3`** in the viewer to reveal it.
+>
+> This matters because MuJoCo renders a URDF's `<visual>` *and* `<collision>`
+> meshes, while RViz only renders visuals. The `thesis_ee` link declares its
+> visual `Full_Assembly.STL` at `(-0.110, -0.025, -0.202)` but its collision
+> copy at `(0, 0, 0)` with a different rotation, so drawing both made a second
+> end effector appear to float beside the arm. Hiding group 3 affects rendering
+> only — `contype`/`conaffinity` are untouched and contact physics is unchanged.
+
 ---
 
 ## TF frames
