@@ -5,8 +5,8 @@ A ROS 2 workspace package set for a **Kinova Gen3 7-DOF** arm fitted with a cust
 arm to perform **precision container-insertion** tasks: a rigid tool tip is guided
 straight down — or tilted at a computed angle — into a small container whose 3D
 center and orientation are located in real time by **multi-camera ArUco marker
-sensor fusion**. The same robot description and motion stack also run in **NVIDIA
-Isaac Sim** for hardware-free development and testing.
+sensor fusion**. The same robot description and motion stack also run in
+**MuJoCo** for hardware-free development and testing.
 
 This repository is developed at UC Riverside as part of a thesis project.
 
@@ -19,8 +19,8 @@ The workspace folder contains three ROS 2 packages:
 | Package | Purpose |
 |---------|---------|
 | **`surgical_arm_description`** | URDF/xacro and meshes for the custom `thesis_ee` end effector (the `assembly_tip` virtual TCP link lives here). |
-| **`kinova_gen3_7dof_robotiq_2f_140_moveit_config`** | MoveIt 2 configuration and the top-level launch files (`robot.launch.py`, `isaac_sim.launch.py`, `gen3_complete_system.launch.py`, camera launches, planner YAMLs). |
-| **`surgical_arm_bringup`** | Application logic — motion scripts (`insert_to_container.py`), the multi-camera fusion node (`combine_cameras.py`), Isaac Sim setup scripts, hand-eye calibration tools, and supporting launch files. Also defines the `InsertContainer` action. |
+| **`kinova_gen3_7dof_robotiq_2f_140_moveit_config`** | MoveIt 2 configuration and the top-level launch files (`robot.launch.py`, `mujoco_sim.launch.py`, `gen3_complete_system.launch.py`, camera launches, planner YAMLs). |
+| **`surgical_arm_bringup`** | Application logic — motion scripts (`insert_to_container.py`), the multi-camera fusion node (`combine_cameras.py`), MuJoCo setup scripts, hand-eye calibration tools, and supporting launch files. Also defines the `InsertContainer` action. |
 
 ### Key scripts (`surgical_arm_bringup/scripts/`)
 
@@ -28,9 +28,9 @@ The workspace folder contains three ROS 2 packages:
 |--------|--------------|
 | `insert_to_container.py` | Main task: approach, tilt, and insert the `assembly_tip` into the container using Pilz PTP/LIN/CIRC motions. |
 | `combine_cameras.py` | Multi-camera ArUco fusion node; publishes the fused container center pose + TF. |
-| `isaac_sim_gen3.py` | Headless/standalone Isaac Sim launcher with the ROS 2 OmniGraph bridge. |
-| `isaac_sim_gen3_gui.py` | Loads the robot + scene into a running Isaac Sim GUI session. |
-| `isaac_sim_import_urdf.py` | Converts the robot URDF → USD for Isaac Sim (run after any URDF/xacro change). |
+| `mujoco_import_urdf.py` | Converts the robot URDF → MJCF for MuJoCo (run after any URDF/xacro change). |
+| `mujoco_sim_gen3.py` | Launches the MuJoCo viewer with the ROS 2 bridge; owns its own physics loop. |
+| `mujoco_sim_gen3_gui.py` | Launches MuJoCo's interactive managed GUI with the same ROS 2 bridge. |
 | `setup_planning_scene.py` | Publishes table/obstacle collision objects to the MoveIt planning scene. |
 | `handeye_calibration*.py`, `calibrate_camera_offsets.py` | Camera ↔ robot extrinsic calibration utilities. |
 | `robot_keepalive.py`, `test_pen_tip_offset.py`, `kortex_utils.py` | Connection keepalive, TCP-offset check, shared helpers. |
@@ -163,48 +163,53 @@ driving the task from an action server (`use_action_server:=true`).
 
 ---
 
-## Running in Isaac Sim
+## Running in MuJoCo
 
-Isaac Sim provides a physics simulation of the arm that talks to the same MoveIt
-stack over the ROS 2 bridge (`/isaac_joint_states` ↔ `/isaac_joint_commands`).
+MuJoCo provides a physics simulation of the arm that talks to the same MoveIt
+stack over a ROS 2 bridge (`/isaac_joint_states` ↔ `/isaac_joint_commands`).
 
-**Step 1 — (re)generate the USD** whenever the URDF/xacro changes:
+> The ROS topic names stay `/isaac_joint_states` and `/isaac_joint_commands`
+> because they are defaults of the **vendor** `kortex_description` xacro args
+> (`isaac_joint_states` / `isaac_joint_commands`), not anything Isaac-specific.
+> Likewise `sim_isaac:=true` just selects the generic `topic_based_ros2_control`
+> hardware interface, which MuJoCo drives.
+
+MuJoCo 3.10 is used from the system `python3` — there is no `~/isaacsim/python.sh`
+wrapper anymore.
+
+**Step 1 — (re)generate the MJCF model** whenever the URDF/xacro changes:
 
 ```bash
 cd ~/workspace/ros2_kortex_ws
 source install/setup.bash
 
-# Render the URDF from xacro with sim_isaac:=true
+# Render the URDF from xacro (sim_isaac:=true → topic_based_ros2_control)
 xacro src/ros2_kortex/kortex_description/robots/gen3.xacro \
     arm:=gen3 dof:=7 gripper:=thesis_ee sim_isaac:=true \
-    robot_ip:=xxx use_fake_hardware:=true > /tmp/gen3_isaac.urdf
+    robot_ip:=xxx use_fake_hardware:=true > /tmp/gen3_mujoco.urdf
 
-# Import URDF → USD (headless)
-~/isaacsim/python.sh \
-  src/ros2_kortex/surgical_arm_bringup/scripts/isaac_sim_import_urdf.py
+# Convert URDF → MJCF (writes ~/mujoco_models/gen3_thesis_ee.xml)
+python3 src/Kinova_surgical_arm_UCR/surgical_arm_bringup/scripts/mujoco_import_urdf.py
 ```
 
-**Step 2 — launch Isaac Sim** (it loads the robot, scene, and ROS 2 OmniGraph):
+**Step 2 — launch MuJoCo** (loads the model and starts the ROS 2 bridge):
 
 ```bash
-# Standalone window
-~/isaacsim/python.sh \
-  src/ros2_kortex/surgical_arm_bringup/scripts/isaac_sim_gen3.py
+# Viewer with its own physics loop
+python3 src/Kinova_surgical_arm_UCR/surgical_arm_bringup/scripts/mujoco_sim_gen3.py
 
-# OR inside the full Isaac Sim GUI launcher (then press Play to start the bridge)
-~/isaacsim/isaac-sim.sh --exec \
-  ~/workspace/ros2_kortex_ws/src/ros2_kortex/surgical_arm_bringup/scripts/isaac_sim_gen3_gui.py
+# OR MuJoCo's interactive managed GUI, same bridge
+python3 src/Kinova_surgical_arm_UCR/surgical_arm_bringup/scripts/mujoco_sim_gen3_gui.py
 ```
 
 **Step 3 — connect MoveIt** to the running simulation:
 
 ```bash
-ros2 launch kinova_gen3_7dof_robotiq_2f_140_moveit_config isaac_sim.launch.py
+ros2 launch kinova_gen3_7dof_robotiq_2f_140_moveit_config mujoco_sim.launch.py
 ```
 
-> If Isaac prints `Pattern '/gen3' did not match any rigid bodies` and
-> `/isaac_joint_states` never publishes, the USD is stale/empty — re-run
-> `isaac_sim_import_urdf.py` (Step 1).
+> If the model file `~/mujoco_models/gen3_thesis_ee.xml` is missing or stale, or
+> `/isaac_joint_states` never publishes, re-run `mujoco_import_urdf.py` (Step 1).
 
 ---
 

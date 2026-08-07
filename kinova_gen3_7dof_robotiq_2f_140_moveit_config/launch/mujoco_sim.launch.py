@@ -1,11 +1,13 @@
 """
-Launch file for controlling the Kinova Gen3 7DOF + Robotiq 2F-140 via Isaac Sim 4.x.
+Launch file for controlling the Kinova Gen3 7DOF + Robotiq 2F-140 via MuJoCo.
 
-Assumes Isaac Sim is already running (started separately via isaac_sim_gen3.py)
-and publishing /isaac_joint_states + subscribing to /isaac_joint_commands.
+Assumes the MuJoCo sim is already running (started separately via
+mujoco_sim_gen3.py) and publishing /isaac_joint_states + subscribing to
+/isaac_joint_commands. (Those topic names are vendor xacro defaults — see the
+comment in generate_launch_description() below.)
 
 Usage:
-  ros2 launch kinova_gen3_7dof_robotiq_2f_140_moveit_config isaac_sim.launch.py
+  ros2 launch kinova_gen3_7dof_robotiq_2f_140_moveit_config mujoco_sim.launch.py
 """
 
 import os
@@ -27,6 +29,22 @@ from moveit_configs_utils import MoveItConfigsBuilder
 
 
 def generate_launch_description():
+    # ---------------------------------------------------------------------
+    # Why "isaac" still appears in this file after the MuJoCo port
+    # ---------------------------------------------------------------------
+    # `sim_isaac`, `isaac_joint_commands` and `isaac_joint_states` are xacro
+    # argument names defined in the *vendor* Kinova description package
+    # (src/ros2_kortex/kortex_description), which we do not patch. `sim_isaac`
+    # is simply the vendor's flag for loading the generic
+    # `topic_based_ros2_control` hardware plugin — nothing about it is
+    # Isaac-specific, and MuJoCo now drives that same topic interface.
+    # Renaming the args (or their default topic values, which the xacro also
+    # supplies) would mean forking upstream Kinova code, so they stay as-is.
+    # The topic *values* are ordinary launch arguments and can be overridden at
+    # launch time, e.g.:
+    #   ros2 launch ... mujoco_sim.launch.py isaac_joint_states:=/mujoco/joint_states
+    # as long as the MuJoCo bridge is told to use the same names.
+    # ---------------------------------------------------------------------
     declared_arguments = [
         DeclareLaunchArgument("launch_rviz", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="true"),
@@ -34,12 +52,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "isaac_joint_commands",
             default_value="/isaac_joint_commands",
-            description="Topic Isaac Sim subscribes to for joint position commands",
+            description="Topic the MuJoCo sim subscribes to for joint position commands",
         ),
         DeclareLaunchArgument(
             "isaac_joint_states",
             default_value="/isaac_joint_states",
-            description="Topic Isaac Sim publishes joint states on",
+            description="Topic the MuJoCo sim publishes joint states on",
         ),
     ]
 
@@ -54,8 +72,12 @@ def generate_launch_description():
         "use_fake_hardware": "false",
         "gripper": "thesis_ee",
         "dof": "7",
+        # Vendor xacro arg name (kortex_description). Despite the name it just
+        # enables the generic `topic_based_ros2_control` hardware interface,
+        # which is what MuJoCo now drives — keep it "true".
         "sim_isaac": "true",
         "vision": vision,
+        # Keys must match the vendor xacro arg names; see the note above.
         "isaac_joint_commands": isaac_joint_commands,
         "isaac_joint_states": isaac_joint_states,
     }
