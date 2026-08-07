@@ -82,6 +82,7 @@ Run the node with custom parameters:
 """
 
 import sys
+import os
 import math
 import time
 import numpy as np
@@ -94,10 +95,62 @@ from rclpy.duration import Duration as RclpyDuration
 from rclpy.callback_groups import ReentrantCallbackGroup
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, PointStamped, PoseArray, Pose, TransformStamped
-from cv_bridge import CvBridge
+
+# NOTE: cv_bridge is deliberately NOT imported.  Its compiled extension
+# (cv_bridge.boost) is built against the NumPy 1.x C ABI, and REAL-1 carries
+# NumPy 2.x in ~/.local (pulled in by opencv-python-headless 4.13, which is
+# itself built against the NumPy 2 ABI -- so downgrading NumPy just moves the
+# breakage).  Calling imgmsg_to_cv2 under that combination segfaults the node.
+# This script only ever needs Image -> BGR ndarray, which _imgmsg_to_bgr below
+# does directly, so the ABI coupling is removed rather than worked around.
 
 # TF2 Imports
 import tf2_ros
+
+
+# ==============================================================================
+# Image decoding (cv_bridge replacement — see the import note above)
+# ==============================================================================
+_CHANNELS = {"mono8": 1, "bgr8": 3, "rgb8": 3, "bgra8": 4, "rgba8": 4}
+
+
+def _imgmsg_to_bgr(msg: Image) -> np.ndarray:
+    """Decode a sensor_msgs/Image into a writable BGR ndarray.
+
+    The three cameras in this system do not agree on encoding — the OAK-D
+    publishes bgr8 while the RealSense and Kinova wrist cameras publish rgb8 —
+    so the channel order must be handled, not assumed.  Getting it wrong is
+    quiet: ArUco still detects (it greyscales first) and only the dashboard
+    looks off, which is exactly the kind of bug that survives for months.
+    """
+    enc = msg.encoding.lower()
+    channels = _CHANNELS.get(enc)
+    if channels is None:
+        raise ValueError(
+            f"unsupported image encoding '{msg.encoding}' "
+            f"(supported: {', '.join(sorted(_CHANNELS))})")
+
+    buf = np.frombuffer(msg.data, dtype=np.uint8)
+    if buf.size < msg.height * msg.step:
+        raise ValueError(
+            f"truncated image: got {buf.size} bytes, "
+            f"expected {msg.height * msg.step} ({msg.height}x{msg.width} {enc})")
+
+    # Honour `step`: rows may be padded, so slice to width*channels per row.
+    img = buf[: msg.height * msg.step].reshape(msg.height, msg.step)
+    img = img[:, : msg.width * channels].reshape(msg.height, msg.width, channels)
+
+    # np.frombuffer gives a read-only view; every return path must be writable
+    # because callers annotate these frames in place.
+    if enc == "mono8":
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if enc == "rgb8":
+        return img[:, :, ::-1].copy()
+    if enc == "rgba8":
+        return img[:, :, [2, 1, 0]].copy()
+    if enc == "bgra8":
+        return img[:, :, :3].copy()
+    return img.copy()
 
 
 # ==============================================================================
@@ -176,28 +229,30 @@ class CombineCamerasNode(Node):
         super().__init__("combine_cameras_node")
         self.get_logger().info("Initializing Combine Cameras Multi-Sensor Fusion Node...")
         
-        # Verify RMW matches the rest of the system (all nodes must share the same RMW).
-        # The workspace default is FastRTPS (rmw_fastrtps_cpp).  CycloneDDS would
-        # isolate this node from the camera and robot nodes launched by
-        # gen3_complete_system.launch.py, making all topics invisible.
+        # Report the active RMW.  Every node in the system must share one RMW and
+        # one ROS_DOMAIN_ID; a mismatch is silent — topics simply never arrive and
+        # every camera reads OFFLINE.
+        #
+        # This deliberately does NOT assert a particular RMW.  It used to warn that
+        # CycloneDDS was wrong because "the system default is FastRTPS", but
+        # gen3_complete_system.launch.py is in fact launched under
+        # RMW_IMPLEMENTATION=rmw_cyclonedds_cpp, so that advice inverted the truth
+        # and told you to unset the one variable you need.  Match whatever the
+        # launch used:
+        #     tr '\0' '\n' < /proc/<launch-pid>/environ | grep -E 'RMW_|ROS_DOMAIN'
         try:
             import rclpy.utilities
             rmw_id = rclpy.utilities.get_rmw_implementation_identifier()
-            self.get_logger().info(f"Active ROS 2 Middleware (RMW): {rmw_id}")
-            if "cyclone" in rmw_id.lower():
-                self.get_logger().warn(
-                    "\n========================================================================\n"
-                    f"WARNING: This node is using CycloneDDS ('{rmw_id}').\n"
-                    "The camera nodes launched by gen3_complete_system.launch.py use\n"
-                    "FastRTPS (the system default). Cross-RMW communication fails —\n"
-                    "all camera topics will appear OFFLINE in the dashboard.\n\n"
-                    "Fix: do NOT set RMW_IMPLEMENTATION before launching this node.\n"
-                    "========================================================================\n"
-                )
+            domain = os.environ.get("ROS_DOMAIN_ID", "0 (unset)")
+            self.get_logger().info(
+                f"Active ROS 2 Middleware (RMW): {rmw_id} | ROS_DOMAIN_ID: {domain}")
+            self.get_logger().info(
+                "If cameras stay OFFLINE, this RMW/domain pair does not match the "
+                "one gen3_complete_system.launch.py was started with.")
         except Exception as e:
             self.get_logger().warn(f"Could not determine active ROS 2 Middleware: {e}")
 
-        self.bridge = CvBridge()
+        # (no CvBridge — images are decoded by _imgmsg_to_bgr, see module top)
         self._cb_group = ReentrantCallbackGroup()
         
         # ----------------------------------------------------------------------
@@ -446,7 +501,7 @@ class CombineCamerasNode(Node):
         """Process incoming raw image feed and perform marker detection."""
         try:
             # Convert ROS Image to OpenCV Image
-            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            cv_img = _imgmsg_to_bgr(msg)
         except Exception as e:
             self.get_logger().error(f"Image conversion error for camera '{camera_name}': {e}")
             return
