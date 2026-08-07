@@ -20,6 +20,7 @@ Usage:
   python3 src/Kinova_surgical_arm_UCR/surgical_arm_bringup/scripts/mujoco_sim_gen3.py
 """
 
+import math
 import os
 import re
 import struct
@@ -270,11 +271,61 @@ if worldbody.find("geom[@name='table']") is None:
         "name": "table", "type": "box", "size": "1.0 1.0 0.025",
         "pos": "0 0 -0.055", "rgba": "0.55 0.45 0.35 1",
     })
-if worldbody.find("geom[@name='glass_container']") is None:
+# Glass container, built HOLLOW so the assembly can actually be inserted.
+#
+# A MuJoCo `cylinder` primitive is solid, and a tube-shaped *mesh* would not
+# help either: MuJoCo collides mesh geoms as their CONVEX HULL, which fills the
+# bore straight back in. The only way to get a real cavity is to build the wall
+# out of convex pieces -- here a ring of thin boxes, plus a thin floor disc.
+#
+# Geometry is anchored to the physical container: 42 mm inner radius (the value
+# insert_to_container.py / insertion.py assume when clearing the wall at 45 deg),
+# 3 mm wall, 100 mm tall, standing on the table surface at z = -0.03.
+CONTAINER_CX, CONTAINER_CY = 0.50, -0.20
+CONTAINER_INNER_R = 0.042
+CONTAINER_WALL_T = 0.003
+CONTAINER_HEIGHT = 0.100
+CONTAINER_FLOOR_T = 0.003
+CONTAINER_SEGMENTS = 24
+_table_top_z = -0.030
+_glass_rgba = "0.6 0.8 0.9 0.35"
+
+if worldbody.find("geom[@name='glass_container_wall_00']") is None:
+    # Drop the old solid stand-in if a previous run of this script left one.
+    _old = worldbody.find("geom[@name='glass_container']")
+    if _old is not None:
+        worldbody.remove(_old)
+
+    _r_mid = CONTAINER_INNER_R + CONTAINER_WALL_T / 2.0
+    _half_h = CONTAINER_HEIGHT / 2.0
+    # Size the segments on the MID radius so neighbours overlap slightly at the
+    # bore instead of leaving gaps the tip could snag on.
+    _half_tan = _r_mid * math.tan(math.pi / CONTAINER_SEGMENTS)
+    for _i in range(CONTAINER_SEGMENTS):
+        _th = 2.0 * math.pi * _i / CONTAINER_SEGMENTS
+        # Explicit quat (w x y z) rather than euler: the saved MJCF does not
+        # pin compiler/angle, so degrees-vs-radians would be ambiguous.
+        ET.SubElement(worldbody, "geom", {
+            "name": f"glass_container_wall_{_i:02d}",
+            "type": "box",
+            "size": f"{CONTAINER_WALL_T / 2.0:.6f} {_half_tan:.6f} {_half_h:.6f}",
+            "pos": f"{CONTAINER_CX + _r_mid * math.cos(_th):.6f} "
+                   f"{CONTAINER_CY + _r_mid * math.sin(_th):.6f} "
+                   f"{_table_top_z + _half_h:.6f}",
+            "quat": f"{math.cos(_th / 2.0):.6f} 0 0 {math.sin(_th / 2.0):.6f}",
+            "rgba": _glass_rgba,
+        })
+
     ET.SubElement(worldbody, "geom", {
-        "name": "glass_container", "type": "cylinder", "size": "0.04 0.05",
-        "pos": "0.5 -0.2 0.02", "rgba": "0.6 0.8 0.9 0.35",
+        "name": "glass_container_floor",
+        "type": "cylinder",
+        "size": f"{CONTAINER_INNER_R + CONTAINER_WALL_T:.6f} {CONTAINER_FLOOR_T / 2.0:.6f}",
+        "pos": f"{CONTAINER_CX} {CONTAINER_CY} {_table_top_z + CONTAINER_FLOOR_T / 2.0:.6f}",
+        "rgba": _glass_rgba,
     })
+    print(f"Glass container: hollow, {CONTAINER_SEGMENTS} wall segments, "
+          f"bore r={CONTAINER_INNER_R * 1000:.0f} mm, "
+          f"rim z={_table_top_z + CONTAINER_HEIGHT:.3f} m")
 
 # Lighting + ground. A URDF carries no light source, so without this the
 # viewport renders solid black and the model looks like a failed import — the
