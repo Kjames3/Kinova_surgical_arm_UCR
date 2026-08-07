@@ -265,8 +265,13 @@ class CombineCamerasNode(Node):
         
         # Camera 2 Configurations: OAK-D
         self.declare_parameter("camera_oakd_enabled", True)
+        # The info topic MUST be the colour one, matching the image topic below.
+        # oak_camera_node.py publishes colour and depth intrinsics separately, at
+        # their own resolutions (1280x720 vs 640x360), because depth is aligned
+        # into the colour view.  Feeding the depth K to solvePnP on a colour
+        # image is a silent ~2x scale error in every pose this camera reports.
         self.declare_parameter("oakd_image_topic", "/global_camera/color/image_raw")
-        self.declare_parameter("oakd_info_topic", "/global_camera/depth/camera_info")
+        self.declare_parameter("oakd_info_topic", "/global_camera/color/camera_info")
         
         # Camera 3 Configurations: Kinova Wrist-Attached Camera
         self.declare_parameter("camera_kinova_enabled", True)
