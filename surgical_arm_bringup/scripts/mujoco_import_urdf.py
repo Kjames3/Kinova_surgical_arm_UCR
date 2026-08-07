@@ -262,6 +262,84 @@ for geom in root.iter("geom"):
         _hidden_collision += 1
 print(f"Collision meshes moved to hidden group 3: {_hidden_collision}")
 
+# Replace the thesis_ee collision mesh with a capsule along the probe axis.
+#
+# MuJoCo collides mesh geoms as their CONVEX HULL. Full_Assembly is a slim
+# needle on a broad mounting fixture, so its hull is a 127 mm-radius blob: it
+# cannot enter the container's 42 mm bore, and it self-penetrates shoulder_link
+# by 12 mm even at the home pose. Measuring the mesh per 40 mm slice, only the
+# deepest ~32 mm is actually thin (max radius 1.2 mm); everything above is
+# 90-135 mm of fixture that never goes near the container.
+#
+# So model the part that matters -- the probe -- as one capsule, and drop the
+# fixture from collision entirely.
+#
+# The capsule is placed on the CALIBRATED assembly_tip axis, not on the CAD
+# mesh. Those two disagree: the mesh's deepest vertex sits at
+# (117.4, -5.9, -392.1) mm in bracelet_link while the URDF's assembly_tip is at
+# (-27, 0, -414) mm -- 144 mm apart in X. assembly_tip is the frame
+# insertion.py plans against and was calibrated against hardware (touch tip to
+# table, read bracelet_link Z), so aligning the collision volume to it keeps
+# the sim and the planner consistent. Worth confirming on the real arm with
+#   ros2 run tf2_ros tf2_echo bracelet_link assembly_tip
+# because if the CAD placement is the correct one instead, this capsule and the
+# visual mesh will be offset from each other on screen.
+PROBE_TIP = (-0.027, 0.000, -0.414)   # assembly_tip, from bracelet_link
+PROBE_LENGTH = 0.150                  # how far back up the shaft to model
+PROBE_RADIUS = 0.008                  # keep well inside the 42 mm bore at 45 deg
+
+_ee_removed = 0
+for body in root.iter("body"):
+    for geom in list(body.findall("geom")):
+        if geom.get("mesh") == "Full_Assembly" and geom.get("group") == "3":
+            body.remove(geom)
+            _ee_removed += 1
+    if body.get("name") == "bracelet_link" and _ee_removed:
+        # A capsule's end cap is a hemisphere centred on the fromto endpoint, so
+        # its surface reaches PROBE_RADIUS beyond it. Start the segment one
+        # radius back up the shaft so the capsule's lowest surface point lands
+        # exactly on assembly_tip -- otherwise every commanded insertion depth
+        # would be 8 mm deeper in the sim than the planner intended.
+        _z0 = PROBE_TIP[2] + PROBE_RADIUS
+        ET.SubElement(body, "geom", {
+            "name": "assembly_probe",
+            "type": "capsule",
+            "fromto": f"{PROBE_TIP[0]} {PROBE_TIP[1]} {_z0} "
+                      f"{PROBE_TIP[0]} {PROBE_TIP[1]} {_z0 + PROBE_LENGTH}",
+            "size": f"{PROBE_RADIUS}",
+            "rgba": "0.9 0.3 0.3 0.4",
+            "group": "3",
+        })
+if _ee_removed:
+    print(f"End effector collision: replaced {_ee_removed} Full_Assembly hull(s) "
+          f"with capsule r={PROBE_RADIUS * 1000:.0f} mm on the assembly_tip axis")
+
+# Exclude contacts between adjacent links.
+#
+# A URDF implies that a link and its parent may overlap at the joint -- that is
+# normal modelling, and MoveIt's SRDF disables those pairs explicitly. MuJoCo's
+# URDF importer carries no such exclusions, so neighbouring collision meshes
+# collide with each other: base_link and shoulder_link interpenetrate by 12 mm
+# at the home pose alone, feeding constant spurious contact forces into the
+# solver. Emit an <exclude> for every parent/child body pair.
+_contact = _child(root, "contact")
+_excluded = 0
+
+
+def _exclude_adjacent(parent_body, parent_name):
+    global _excluded
+    for child_body in parent_body.findall("body"):
+        child_name = child_body.get("name")
+        if parent_name and child_name:
+            ET.SubElement(_contact, "exclude",
+                          {"body1": parent_name, "body2": child_name})
+            _excluded += 1
+        _exclude_adjacent(child_body, child_name)
+
+
+_exclude_adjacent(worldbody, "world")
+print(f"Adjacent-link contact exclusions: {_excluded}")
+
 # Scene geometry. Dimensions mirror setup_planning_scene.py exactly so the
 # MoveIt planning scene and the sim agree. MuJoCo box/cylinder sizes are
 # HALF-extents: table 2.0x2.0x0.05 -> "1.0 1.0 0.025", top face at z=-0.03 so
@@ -355,8 +433,23 @@ if worldbody.find("geom[@name='ground']") is None:
 
 # Actuators. mujoco_sim_gen3.py maps incoming JointState command names straight
 # onto actuator names, so each actuator MUST be named after its joint.
-# kp=1000 with dampratio=1 is stiff enough to hold the arm against gravity
-# without the position loop ringing at the 2 ms timestep.
+#
+# ARMATURE IS THE IMPORTANT ONE. A URDF carries no rotor inertia, so the import
+# leaves armature=0, and a geared joint with no reflected inertia is numerically
+# stiff: the position loop rings instead of settling. Measured while holding the
+# home pose and tracking a joint ramp:
+#
+#   armature   kp      settles?         tip error
+#   0 (URDF)   1000    no, |qvel| ~5    16.1 mm
+#   0.1        1000    yes              1.8 mm
+#   0.1        4000    yes              1.4 mm
+#   0.1       10000    yes              0.6 mm
+#
+# 0.1 / 4000 is the chosen point: comfortably inside the 3 mm insertion gate,
+# and softer than kp=10000 when the probe grazes the container wall. Raise
+# ACTUATOR_KP if you need tighter tracking and are not doing contact work.
+JOINT_ARMATURE = "0.1"
+ACTUATOR_KP = "4000"
 _joint_elems = {}
 for body in root.iter("body"):
     for jnt in body.findall("joint"):
@@ -378,10 +471,12 @@ for name in _actuated:
     # Joint-level damping keeps the link from coasting between control ticks.
     if _joint_elems[name].get("damping") is None:
         _joint_elems[name].set("damping", "1.0")
+    if _joint_elems[name].get("armature") is None:
+        _joint_elems[name].set("armature", JOINT_ARMATURE)
     if name in _existing_act:
         continue
     ET.SubElement(actuator, "position", {
-        "name": name, "joint": name, "kp": "1000", "dampratio": "1",
+        "name": name, "joint": name, "kp": ACTUATOR_KP, "dampratio": "1",
     })
 
 # Keyframe. qpos is a flat vector over the whole model, so build it from the
