@@ -74,17 +74,12 @@ def compute_table_hocbf_rows(z, J_z, dJdq_z, dq, z_min,
     return A, b
 
 
-def compute_table_hocbf_constraints(q, dq, z_ee, J_ee, dJ_ee, z_min,
-                                    alpha1=10.0, alpha2=10.0):
-    """Single-point HOCBF rows from a full 6xN Jacobian and its derivative.
-
-    Thin wrapper kept for callers that already hold the full matrices; the
-    per-point path (`compute_table_hocbf_rows`) avoids materialising them.
-    """
-    J_ee = np.asarray(J_ee, dtype=float)
-    dJ_ee = np.asarray(dJ_ee, dtype=float)
-    return compute_table_hocbf_rows(z_ee, J_ee[2, :], dJ_ee[2, :] @ dq, dq,
-                                    z_min, alpha1, alpha2)
+# NOTE: a single-point wrapper (`compute_table_hocbf_constraints`, taking a
+# full 6xN Jacobian for the EE alone) was removed on 2026-08-11. It had no
+# callers, and it was a trap: it guarded ONE point, so anything that reached
+# for it expecting table avoidance would have silently dropped the elbow and
+# forearm. Guard every link through `compute_table_hocbf_rows` instead -- pass
+# `J_full[2, :]` and `(dJ_full[2, :] @ dq)` if you already hold full matrices.
 
 
 def torque_limit_rows(M, tau_bias, tau_max):
@@ -341,9 +336,11 @@ def table_wall_torque(z, J_z, dq, z_min, standoff, k_wall, d_wall,
     z_dot = J_z @ dq
     approach = np.maximum(0.0, -z_dot)                 # one-sided damping
 
+    # `s` is already 0 for every point outside the band, so both the spring and
+    # the damping term vanish there and the clip leaves them at 0 -- no
+    # separate masking by `active` is needed (it was a no-op).
     f = k_wall * standoff * s ** 2 + d_wall * s * approach
     f = np.clip(f, 0.0, f_max)
-    f *= active
 
     # Map the +z point forces to joint torque: tau = sum_i J_z,i^T * f_i
     return J_z.T @ f, f
