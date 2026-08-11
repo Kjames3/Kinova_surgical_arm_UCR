@@ -192,7 +192,22 @@ KP_NULL = np.array([10.0, 10.0, 8.0, 8.0, 5.0, 5.0, 4.0])
 # with K_REPULSE=0 to confirm cartesian mode is unchanged, then raise it.
 K_REPULSE = 40.0             # Nm per unit -d(collision_cost)/dq
 K_LIMIT = 25.0               # Nm/rad, joint-limit barrier stiffness
-COLLIDE_DECIMATE = 10        # recompute self-collision gradient every N cycles
+
+# Self-collision gradient scheduling. The gradient is a finite difference over
+# all n joints, so taking it in one go costs n+1 collision_cost() calls --
+# measured at 1547 us on REAL-1 (2026-08-11 perf audit), LONGER THAN A WHOLE
+# CYCLE. Decimating by 10 only hid that in the average: one cycle in ten still
+# ran ~2.6 ms, more than double the watchdog window, and because the stride
+# matched --log-decimate 10 every logged sample landed on exactly that cycle.
+#
+# The sweep is now spread ACROSS cycles: one finite-difference column per cycle,
+# published when the sweep completes. Peak cost drops ~4x (386 us on the cycle
+# that also re-takes the baseline, 193 us otherwise) and the full gradient still
+# refreshes every n cycles -- marginally faster than the old 10-cycle stride.
+# Every column is differenced against a FROZEN configuration (collide_q), so the
+# result is a true gradient at one pose instead of a mix of poses smeared over
+# the sweep.
+COLLIDE_EPS = 1e-4           # finite-difference step (rad); was collision_gradient's default
 
 # Cartesian safety limits.
 MAX_CART_FORCE = 80.0        # N   -- clamp task force magnitude per axis
@@ -326,9 +341,40 @@ TAU_MAX = np.array([39.0, 39.0, 39.0, 39.0, 9.0, 9.0, 9.0])
 SENSED_LOAD_SIGN = -1.0
 
 # Loop rate. Kinova low-level servoing expects ~1 kHz; too slow and the actuator
-# watchdog faults. Joint mode sustains ~1 kHz easily; cartesian mode is heavier
-# (FK/Jacobian/inversions per cycle) -- drop --rate if you see slow-loop warns.
+# watchdog faults.
+#
+# MEASURED REALITY (2026-08-11 perf audit, 12 archived runs / 944 s of hardware
+# time): the loop achieves 833 Hz (1.200 ms), NOT the 1000 Hz asked for, and has
+# done so on every run since 2026-07-30. Compute is not the reason -- it is
+# 93-310 us depending on mode, against ~890 us for the blocking
+# base_cyclic.Refresh() round-trip. Since compute + comms already exceeds the
+# 1 ms budget, the sleep pacer at the bottom of the loop never runs at all and
+# the loop free-runs at whatever the transport allows. Lowering --rate will not
+# make it faster and raising it will not either; the only levers are
+# transport-side. The watchdog evidently tolerates 833 Hz.
+#
+# What this DID break, until fixed on 2026-08-11: every integrator advanced by a
+# nominal 1/rate per cycle while only 833 cycles happened per second, so the
+# gravity trim, the joint integral trim and the re-anchor blend all integrated
+# at 0.833x their configured gain. They now use the MEASURED cycle time.
 DEFAULT_RATE_HZ = 1000.0
+
+# Bounds on the measured cycle time fed to the integrators. The loop genuinely
+# does hit ~2.6x nominal on a bad cycle, so the ceiling has to allow real spikes
+# through (clamping them would under-integrate exactly when time is passing
+# fastest); it exists only to stop a scheduling stall or a clock anomaly from
+# injecting one enormous integration step into a torque command. The floor
+# guards the first cycle and any zero/negative interval.
+DT_MEAS_MIN_FACTOR = 0.1     # x nominal dt
+DT_MEAS_MAX_FACTOR = 5.0     # x nominal dt
+
+# Slow-cycle warning threshold, as a multiple of the nominal period. This was
+# 3.0, which at --rate 1000 meant nothing was reported below 3 ms -- so a loop
+# permanently running at 1.2 ms (20% over budget) never printed a single warning
+# and the shortfall went unnoticed for weeks. 1.5 still clears an ordinary
+# cycle but catches a genuine stall. The warning stays rate-limited to one line
+# every 2 s, and the exit summary reports the achieved rate unconditionally.
+SLOW_CYCLE_WARN_FACTOR = 1.5
 
 # Safety envelope: abort if any joint spins faster than this (rad/s).
 MAX_JOINT_SPEED = 1.5
@@ -465,8 +511,6 @@ class KinDynModel:
         self._scratch_twist = kdl.Twist()
         self._scratch_qv = kdl.JntArrayVel(self.n)
         self._scratch_cor = kdl.JntArray(self.n)
-        # Two slots, because `coriolis` needs q and dq live at the same time.
-        self._scratch_jnt = (kdl.JntArray(self.n), kdl.JntArray(self.n))
 
     # -- vendored from kdl_parser_py (treeFromUrdfModel), rotation of the
     #    inertial origin dropped (URDF inertials here are axis-aligned) --------
@@ -509,19 +553,8 @@ class KinDynModel:
         add_children(robot.get_root(), tree)
         return tree
 
-    def _to_jnt(self, q, slot=0):
-        """Copy `q` into a preallocated JntArray and return it.
-
-        Reuses a scratch array instead of allocating one: this runs ~7 times
-        per 1 kHz cycle and the allocation was ~30% of its cost.
-
-        The returned object is SHARED and is overwritten by the next call with
-        the same `slot`. A call site that needs two JntArrays alive at once --
-        `coriolis`, which hands q and dq to a single solver call -- must ask
-        for different slots, or both arguments alias the same data and the
-        solver silently sees dq twice.
-        """
-        ja = self._scratch_jnt[slot]
+    def _to_jnt(self, q):
+        ja = self.kdl.JntArray(self.n)
         for i in range(self.n):
             ja[i] = float(q[i])
         return ja
@@ -623,9 +656,7 @@ class KinDynModel:
         inversion needs and avoids forming an n x n matrix at 1 kHz.
         """
         c = self._scratch_cor
-        # Distinct slots: a shared scratch array would make both arguments the
-        # same object, so the solver would receive dq as the position too.
-        self._dyn.JntToCoriolis(self._to_jnt(q, 0), self._to_jnt(dq, 1), c)
+        self._dyn.JntToCoriolis(self._to_jnt(q), self._to_jnt(dq), c)
         return np.array([c[i] for i in range(self.n)])
 
     def gravity(self, q):
@@ -711,8 +742,13 @@ class KinDynModel:
     def collision_gradient(self, q, eps=1e-4):
         """-d(collision_cost)/dq direction points toward greater clearance.
 
-        Finite differences: costs n+1 centerline evaluations, so callers should
-        decimate this (self-collision geometry changes slowly vs. 1 kHz).
+        Finite differences: costs n+1 centerline evaluations -- 1547 us on
+        REAL-1, longer than a whole control cycle.
+
+        NOT USED BY THE CONTROL LOOP. The loop sweeps the same finite difference
+        one column per cycle instead (see COLLIDE_EPS), because decimating a
+        call this heavy bounds its average cost but not its worst cycle. Kept
+        for offline validation and tests, where taking it in one go is fine.
         """
         g = np.zeros(self.n)
         h0 = self.collision_cost(q)
@@ -1589,14 +1625,39 @@ def run_impedance(args):
 
         set_control_mode(actuator_config, n, ActuatorConfig_pb2.TORQUE)
 
-        dt = 1.0 / args.rate
-        t_start = time.time()
-        t_prev = t_start            # (B) previous cycle time for the accel dt
-        last_warn = 0.0
-        tau_collide = np.zeros(n)   # self-collision repulsion, decimated update
+        dt = 1.0 / args.rate         # NOMINAL period: paces the sleep, sets warn
+        dt_min = DT_MEAS_MIN_FACTOR * dt
+        dt_max = DT_MEAS_MAX_FACTOR * dt
+        # Monotonic clock throughout: every elapsed-time comparison below (ramp,
+        # track phase, re-anchor timers, duration) and now the integration
+        # timestep itself are differences of this clock. time.time() is the wall
+        # clock and an NTP correction mid-run would rewind the ramp and jump the
+        # track setpoint while the arm is in torque mode.
+        t_start = time.monotonic()
+        # Seed one nominal period back so the FIRST cycle measures dt, not ~0.
+        t_prev = t_start - dt
+        last_warn = float("-inf")
         q_hold = q0.copy()          # 'free'-mode captured hold pose
         xdot_prev = np.zeros(6)     # (B) previous task velocity (accel estimate)
         acc_filt = np.zeros(6)      # (B) EMA-filtered task acceleration
+
+        # Rolling self-collision gradient (see COLLIDE_EPS). One finite-difference
+        # column per cycle against a frozen configuration; tau_collide holds the
+        # last COMPLETED sweep so the applied torque is always a coherent
+        # gradient rather than a half-updated one.
+        tau_collide = np.zeros(n)   # published repulsion (last complete sweep)
+        collide_grad = np.zeros(n)  # sweep under construction
+        collide_q = q0.copy()       # configuration this sweep is differenced at
+        collide_h0 = 0.0            # baseline cost at collide_q
+        collide_col = 0             # next finite-difference column to evaluate
+
+        # Achieved-rate accounting, reported on exit. The audit had to recover
+        # this from CSV sample spacing; the loop now just measures it.
+        cyc_n = 0
+        cyc_sum = 0.0
+        cyc_max = 0.0
+        cyc_min = float("inf")
+        cyc_over = 0                # cycles that ran longer than the warn threshold
 
         # (F) Loop invariants for the table barrier, hoisted out of the hot loop.
         table_alpha1, table_alpha2 = args.table_alpha
@@ -1621,9 +1682,28 @@ def run_impedance(args):
                       + [f"trim{i+1}" for i in range(n)])
         try:
             while True:
-                step_start = time.time()
+                step_start = time.monotonic()
                 if args.duration and (step_start - t_start) >= args.duration:
                     break
+
+                # MEASURED cycle period. This is the integration timestep for
+                # the gravity trim, the joint integral trim and the re-anchor
+                # blend. Using the nominal 1/rate here (as this loop did until
+                # 2026-08-11) silently ran all three at 0.833x their configured
+                # gain, because the loop delivers ~833 cycles/s while each one
+                # claimed to advance time by a full millisecond.
+                dt_raw = step_start - t_prev
+                t_prev = step_start
+                dt_meas = min(max(dt_raw, dt_min), dt_max)
+                if frame_id > 0:            # first interval is seeded, not real
+                    cyc_n += 1
+                    cyc_sum += dt_raw
+                    if dt_raw > cyc_max:
+                        cyc_max = dt_raw
+                    if dt_raw < cyc_min:
+                        cyc_min = dt_raw
+                    if dt_raw > SLOW_CYCLE_WARN_FACTOR * dt:
+                        cyc_over += 1
 
                 q, dq = read_state(feedback, n)
 
@@ -1661,14 +1741,48 @@ def run_impedance(args):
                     if args.ki_scale > 0.0:
                         integ = np.where(np.abs(dq) > args.ki_freeze_thresh,
                                          0.0, _wrap_rad(q - q_des))
-                        i_tau = np.clip(i_tau + ki * integ * dt, -i_cap, i_cap)
+                        i_tau = np.clip(i_tau + ki * integ * dt_meas,
+                                        -i_cap, i_cap)
                         tau = tau - i_tau
                 else:
-                    # Self-collision gradient is heavy (n+1 FK sweeps); refresh
-                    # it every COLLIDE_DECIMATE cycles and hold between updates.
+                    # Self-collision gradient, swept one finite-difference
+                    # column per cycle (see COLLIDE_EPS). Taking all n+1 columns
+                    # in one cycle cost 1547 us -- longer than the whole cycle --
+                    # and decimating that only hid the spike in the average.
                     # Active in every interaction mode (guards the free elbow).
-                    if frame_id % COLLIDE_DECIMATE == 0:
-                        tau_collide = -K_REPULSE * model.collision_gradient(q)
+                    if collide_col == 0:
+                        # Freeze the configuration the whole sweep differences
+                        # against, so the published gradient belongs to ONE pose.
+                        collide_q = q.copy()
+                        collide_h0 = model.collision_cost(collide_q)
+                    if collide_h0 == 0.0:
+                        # Every capsule pair is outside COLLISION_MARGIN, so the
+                        # quadratic hinge is flat and the gradient is exactly
+                        # zero -- skip the n perturbations entirely.
+                        #
+                        # NB (2026-08-11 audit): this early-out does NOT fire on
+                        # the current model. CAPSULE_RADIUS 0.055 m makes the
+                        # capsule diameter (0.110 m) exceed the minimum wrist
+                        # capsule-axis distance (0.106 m), so those (i, i+2)
+                        # pairs report a permanent -4.1 mm violation at every
+                        # posture and the cost is never zero. Fixing that
+                        # geometry is a separate change; this path is here so it
+                        # pays off the moment it is.
+                        collide_grad[:] = 0.0
+                        tau_collide = np.zeros(n)
+                        collide_col = 0
+                    else:
+                        q_pert = collide_q.copy()
+                        q_pert[collide_col] += COLLIDE_EPS
+                        collide_grad[collide_col] = (
+                            (model.collision_cost(q_pert) - collide_h0)
+                            / COLLIDE_EPS)
+                        collide_col += 1
+                        if collide_col >= n:
+                            # Sweep complete -- publish it as one coherent
+                            # gradient and start the next one next cycle.
+                            tau_collide = -K_REPULSE * collide_grad.copy()
+                            collide_col = 0
 
                     if args.interaction_mode == "free":
                         # Weightless hand-guiding: no task spring, no singularity
@@ -1703,7 +1817,7 @@ def run_impedance(args):
                             # settling would otherwise latch the yield at t~0 and
                             # never let go (2026-07-28 collapse).
                             p_des, quat_des, captured, timed_out = reanchor.update(
-                                step_start, dt, p_cur, quat_cur, xdot,
+                                step_start, dt_meas, p_cur, quat_cur, xdot,
                                 p_des, quat_des,
                                 enabled=(step_start - t_start) >= args.ramp_time)
                             if reanchor.yielding and not was_yielding:
@@ -1764,12 +1878,13 @@ def run_impedance(args):
                             # task acceleration is a low-passed finite diff of
                             # xdot using the ACTUAL loop dt (the loop rate is not
                             # exactly --rate).
-                            dt_act = step_start - t_prev
-                            t_prev = step_start
-                            if dt_act > 1e-4:
-                                acc_raw = (xdot - xdot_prev) / dt_act
-                                acc_filt = (ACC_FILTER_ALPHA * acc_filt
-                                            + (1.0 - ACC_FILTER_ALPHA) * acc_raw)
+                            # dt_meas is the shared measured period computed at
+                            # the top of the loop (and clamped strictly > 0), so
+                            # render no longer keeps its own t_prev -- this was
+                            # the one place that already did the right thing.
+                            acc_raw = (xdot - xdot_prev) / dt_meas
+                            acc_filt = (ACC_FILTER_ALPHA * acc_filt
+                                        + (1.0 - ACC_FILTER_ALPHA) * acc_raw)
                             xdot_prev = xdot
                             acc = np.clip(acc_filt, -MAX_TASK_ACC, MAX_TASK_ACC)
                             task_kp, task_kd = env_kp * engage, env_kd * engage_d
@@ -1809,7 +1924,7 @@ def run_impedance(args):
                     if (engage >= 1.0
                             and np.max(np.abs(dq)) < args.trim_freeze_thresh):
                         tau_trim = np.clip(
-                            tau_trim + k_trim * _wrap_rad(q_ref - q) * dt,
+                            tau_trim + k_trim * _wrap_rad(q_ref - q) * dt_meas,
                             -i_cap, i_cap)
                     tau = tau + tau_trim
 
@@ -1878,19 +1993,12 @@ def run_impedance(args):
                     # without it ddq_nom is wrong by Minv @ C dq and the
                     # torque rebuilt below does not produce ddq_safe.
                     if M_cyc is None:               # joint / free mode
-                        # Nothing else this cycle wants M's inverse, and the
-                        # barrier needs exactly one solve against it, so solve
-                        # rather than invert: measurably faster and better
-                        # conditioned. Cartesian mode still reuses the explicit
-                        # Minv it already built for the operational-space term.
                         M_cyc = model.mass(q)
-                    M = M_cyc
+                        Minv_cyc = np.linalg.inv(M_cyc)
+                    M, Minv = M_cyc, Minv_cyc
                     tau_bias = tau_g + model.coriolis(q, dq)
 
-                    if Minv_cyc is not None:
-                        ddq_nom = Minv_cyc @ (tau - tau_bias)
-                    else:
-                        ddq_nom = np.linalg.solve(M, tau - tau_bias)
+                    ddq_nom = Minv @ (tau - tau_bias)
                     A_cbf, b_cbf = compute_table_hocbf_rows(
                         z_surf, J_z, dJdq_z, dq,
                         z_min=args.table_z_min,
@@ -1976,10 +2084,12 @@ def run_impedance(args):
 
                 feedback = base_cyclic.Refresh(command)
 
-                now = time.time()
-                if now - last_warn > 2.0 and (now - step_start) > 3.0 * dt:
+                now = time.monotonic()
+                if (now - last_warn > 2.0
+                        and (now - step_start) > SLOW_CYCLE_WARN_FACTOR * dt):
                     print(f"\nWARNING: loop slow ({(now-step_start)*1e3:.1f} ms "
-                          f"> {dt*1e3:.1f} ms target) -- watchdog risk.")
+                          f"work > {SLOW_CYCLE_WARN_FACTOR:g}x the "
+                          f"{dt*1e3:.1f} ms target) -- watchdog risk.")
                     last_warn = now
 
                 remaining = dt - (now - step_start)
@@ -2000,6 +2110,22 @@ def run_impedance(args):
             except Exception as e:  # noqa: BLE001
                 print(f"  (servoing-mode restore failed: {e})")
             print("Done. Arm returned to high-level position control.")
+
+            # Achieved-rate report. The loop does not reach --rate (see
+            # DEFAULT_RATE_HZ) and for weeks nothing said so -- the 833 Hz
+            # figure had to be reconstructed from CSV sample spacing after the
+            # fact. Print it every run so a regression is visible immediately.
+            if cyc_n > 0:
+                mean_s = cyc_sum / cyc_n
+                print("--- loop timing ---")
+                print(f"  cycles     : {cyc_n}")
+                print(f"  achieved   : {1.0 / mean_s:.1f} Hz "
+                      f"(target {args.rate:.0f} Hz, "
+                      f"{100.0 * (1.0 / mean_s) / args.rate:.1f}%)")
+                print(f"  cycle time : mean {mean_s * 1e3:.3f} ms  "
+                      f"min {cyc_min * 1e3:.3f}  max {cyc_max * 1e3:.3f}")
+                print(f"  over {SLOW_CYCLE_WARN_FACTOR:g}x dt: {cyc_over} "
+                      f"cycles ({100.0 * cyc_over / cyc_n:.2f}%)")
 
             # Return to initial position prior to start of script after 3s countdown
             if q0 is not None:
