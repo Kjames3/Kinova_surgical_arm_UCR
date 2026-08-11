@@ -511,6 +511,8 @@ class KinDynModel:
         self._scratch_twist = kdl.Twist()
         self._scratch_qv = kdl.JntArrayVel(self.n)
         self._scratch_cor = kdl.JntArray(self.n)
+        # Two slots, because `coriolis` needs q and dq live at the same time.
+        self._scratch_jnt = (kdl.JntArray(self.n), kdl.JntArray(self.n))
 
     # -- vendored from kdl_parser_py (treeFromUrdfModel), rotation of the
     #    inertial origin dropped (URDF inertials here are axis-aligned) --------
@@ -553,8 +555,19 @@ class KinDynModel:
         add_children(robot.get_root(), tree)
         return tree
 
-    def _to_jnt(self, q):
-        ja = self.kdl.JntArray(self.n)
+    def _to_jnt(self, q, slot=0):
+        """Copy `q` into a preallocated JntArray and return it.
+
+        Reuses a scratch array instead of allocating one: this runs ~7 times
+        per 1 kHz cycle and the allocation was ~30% of its cost.
+
+        The returned object is SHARED and is overwritten by the next call with
+        the same `slot`. A call site that needs two JntArrays alive at once --
+        `coriolis`, which hands q and dq to a single solver call -- must ask
+        for different slots, or both arguments alias the same data and the
+        solver silently sees dq twice.
+        """
+        ja = self._scratch_jnt[slot]
         for i in range(self.n):
             ja[i] = float(q[i])
         return ja
@@ -656,7 +669,9 @@ class KinDynModel:
         inversion needs and avoids forming an n x n matrix at 1 kHz.
         """
         c = self._scratch_cor
-        self._dyn.JntToCoriolis(self._to_jnt(q), self._to_jnt(dq), c)
+        # Distinct slots: a shared scratch array would make both arguments the
+        # same object, so the solver would receive dq as the position too.
+        self._dyn.JntToCoriolis(self._to_jnt(q, 0), self._to_jnt(dq, 1), c)
         return np.array([c[i] for i in range(self.n)])
 
     def gravity(self, q):
@@ -1993,12 +2008,19 @@ def run_impedance(args):
                     # without it ddq_nom is wrong by Minv @ C dq and the
                     # torque rebuilt below does not produce ddq_safe.
                     if M_cyc is None:               # joint / free mode
+                        # Nothing else this cycle wants M's inverse, and the
+                        # barrier needs exactly one solve against it, so solve
+                        # rather than invert: measurably faster and better
+                        # conditioned. Cartesian mode still reuses the explicit
+                        # Minv it already built for the operational-space term.
                         M_cyc = model.mass(q)
-                        Minv_cyc = np.linalg.inv(M_cyc)
-                    M, Minv = M_cyc, Minv_cyc
+                    M = M_cyc
                     tau_bias = tau_g + model.coriolis(q, dq)
 
-                    ddq_nom = Minv @ (tau - tau_bias)
+                    if Minv_cyc is not None:
+                        ddq_nom = Minv_cyc @ (tau - tau_bias)
+                    else:
+                        ddq_nom = np.linalg.solve(M, tau - tau_bias)
                     A_cbf, b_cbf = compute_table_hocbf_rows(
                         z_surf, J_z, dJdq_z, dq,
                         z_min=args.table_z_min,
