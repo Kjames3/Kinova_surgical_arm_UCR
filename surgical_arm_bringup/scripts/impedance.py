@@ -45,8 +45,13 @@ Consequences:
     gain, a NaN, or a stalled loop can let the arm sag or move fast. Start with
     the (low) default gains and keep the e-stop within reach.
   * Cartesian mode adds singularity risk: near a kinematic singularity the
-    Jacobian loses rank and the mapped torques blow up. A manipulability guard
-    aborts before that; still, start soft.
+    Jacobian loses rank and the mapped torque blows up. The Lambda inversion is
+    variable-damped on sigma_min(J) so the degenerate direction is given up
+    smoothly instead of fought (see the SING_* block); ``--sing-avoid`` adds a
+    null-space escape that uses the redundant 7th DOF to back away. Near a
+    singularity the arm DELIBERATELY stops tracking the unreachable direction,
+    so expect tip error there -- that is the trade, not a fault. Still start
+    soft. Validate changes offline first with sim_impedance_mujoco.py.
 
 GRAVITY COMPENSATION
 --------------------
@@ -126,15 +131,40 @@ for _name in ("MutableMapping", "Mapping", "Sequence", "MutableSequence",
     if not hasattr(collections, _name):
         setattr(collections, _name, getattr(collections.abc, _name))
 
-from kortex_api.RouterClient import RouterClient, RouterClientSendOptions
-from kortex_api.SessionManager import SessionManager
-from kortex_api.TCPTransport import TCPTransport
-from kortex_api.UDPTransport import UDPTransport
-from kortex_api.autogen.client_stubs.ActuatorConfigClientRpc import ActuatorConfigClient
-from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
-from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
-from kortex_api.autogen.messages import (ActuatorConfig_pb2, Base_pb2,
-                                         BaseCyclic_pb2, Session_pb2)
+# kortex_api is only installed in ~/.venvs/kortex_impedance on REAL-1 (it pins
+# protobuf 3.5.1, which would shadow the system protobuf and break colcon and
+# torch -- so it is deliberately absent from the laptop). Import it SOFTLY: the
+# control law below (KinDynModel, cartesian_impedance_torque, the singularity
+# helpers) is pure numpy/KDL and is exercised offline by the MuJoCo harness
+# `sim_impedance_mujoco.py`, which must be able to import this module on a
+# machine with no robot SDK. Anything that actually touches the arm goes
+# through require_kortex_api() and fails there with an actionable message.
+KORTEX_API_IMPORT_ERROR = None
+try:
+    from kortex_api.RouterClient import RouterClient, RouterClientSendOptions
+    from kortex_api.SessionManager import SessionManager
+    from kortex_api.TCPTransport import TCPTransport
+    from kortex_api.UDPTransport import UDPTransport
+    from kortex_api.autogen.client_stubs.ActuatorConfigClientRpc import ActuatorConfigClient
+    from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+    from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
+    from kortex_api.autogen.messages import (ActuatorConfig_pb2, Base_pb2,
+                                             BaseCyclic_pb2, Session_pb2)
+except ImportError as _exc:      # no SDK here -- offline/analysis use only
+    KORTEX_API_IMPORT_ERROR = _exc
+
+
+def require_kortex_api():
+    """Fail loudly before any robot connection if the Kortex SDK is missing."""
+    if KORTEX_API_IMPORT_ERROR is not None:
+        raise SystemExit(
+            "kortex_api is not importable ({}).\n"
+            "This script only talks to the arm from the REAL-1 venv:\n"
+            "  source /home/kinova/ros2_kortex_ws/install/setup.bash\n"
+            "  ~/.venvs/kortex_impedance/bin/python impedance.py ...\n"
+            "Offline (no arm) use -- CSV analysis, and the MuJoCo singularity\n"
+            "harness sim_impedance_mujoco.py -- does not need it."
+            .format(KORTEX_API_IMPORT_ERROR))
 
 
 # --- Connection --------------------------------------------------------------
@@ -212,7 +242,65 @@ COLLIDE_EPS = 1e-4           # finite-difference step (rad); was collision_gradi
 # Cartesian safety limits.
 MAX_CART_FORCE = 80.0        # N   -- clamp task force magnitude per axis
 MAX_CART_TORQUE = 15.0       # Nm  -- clamp task moment per axis
-MIN_MANIPULABILITY = 1e-3    # sqrt(det(J Jᵀ)); abort below (near singularity)
+MIN_MANIPULABILITY = 1e-3    # sqrt(det(J Jᵀ)); logged only -- see below
+
+# --- Singularity handling (cartesian mode) -----------------------------------
+# Distance to a kinematic singularity is sigma_min(J), the SMALLEST singular
+# value of the 6xn Jacobian -- not sqrt(det(J Jᵀ)) and not det(J M⁻¹ Jᵀ), which
+# is what this file gated on until 2026-08-18. Both determinants are PRODUCTS of
+# all six singular values, so the five healthy directions (O(1) each) mask the
+# one that is collapsing. Measured on the bundled gen3_2f85 chain, sweeping the
+# elbow to straight (joint_4 -> 0, the arm's dominant singularity):
+#
+#   joint_4   sigma_min   manip=sqrt(det(JJᵀ))   det(J M⁻¹ Jᵀ)   ||Lambda||
+#   -0.50      0.0711        2.1e-2               2.9e+06          8.9
+#   -0.20      0.0289        6.9e-03              5.0e+05         41.5
+#   -0.05      0.0073        1.5e-03              2.7e+04        611
+#   -0.01      0.0015        2.9e-04              1.1e+03        1.5e+04
+#    0.00      1.0e-05       1.3e-06              2.1e-02        7.8e+08
+#
+# Two failures follow directly from that table:
+#
+#   * The Lambda conditioning test `abs(det(Lambda_inv)) >= 1e-2` was still TRUE
+#     at the exact singularity (2.06e-2 > 1e-2), so the code took the plain
+#     np.linalg.inv branch in the one configuration where it must not, and
+#     produced ||Lambda|| = 7.8e8. The pinv fallback was effectively dead code.
+#   * The abort gate `manip < 1e-3` still read 1.49e-3 (i.e. PASSING) at
+#     joint_4 = -0.05, where ||Lambda|| had already reached 611 -- ~150x nominal.
+#     The guard fired only after the torque spike it was meant to prevent.
+#
+# The replacement is continuous, because a discontinuous switch on a 1 kHz
+# torque command is itself a hazard:
+#
+#   1. Variable-damped inversion (Chiaverini). Lambda_inv is symmetric PSD, so
+#      eigh gives Lambda = sum_i (1/e_i) u_i u_iᵀ exactly. Each mode is inverted
+#      as e/(e² + lam²) instead of 1/e, which caps the gain of a degenerate
+#      direction at 1/(2*lam) rather than letting it run to infinity. lam ramps
+#      in smoothly only once sigma_min < SING_SIGMA_ON, so in the validated
+#      hold-ee regime (sigma_min ~ 0.07-0.22) lam is exactly 0 and the torque is
+#      bit-for-bit what it was before this change.
+#   2. No global gain rolloff. The damping already suppresses ONLY the collapsing
+#      direction; the five healthy task directions keep full authority, which is
+#      the whole point of doing this in the eigenbasis instead of scaling F.
+#   3. Null-space escape (opt-in, --sing-avoid). The Gen3 is redundant, so the
+#      arm can retreat from the singular set without moving the tool tip: ascend
+#      the sigma_min gradient inside the existing null-space projector.
+#   4. Abort only on true rank collapse, gated on sigma_min, with a rate-limited
+#      warning above it. Aborting drops to the finally-block that restores
+#      POSITION mode -- it is a controlled stop, but it ends the run, so it must
+#      be the last resort and not the first response.
+#
+# CAVEAT: J mixes units (m/rad in rows 0-2, dimensionless in rows 3-5), so
+# sigma_min is not a physically clean length. The thresholds are therefore
+# EMPIRICAL for this chain, taken from the sweep above; re-measure them with
+# tools/probe_singularity.py if the tip link or URDF changes.
+SING_SIGMA_ON = 0.05         # sigma_min below which DLS damping ramps in
+SING_SIGMA_ABORT = 0.002     # sigma_min floor: rank collapse, stop the loop
+SING_LAMBDA_MAX = 0.01       # max damping -> caps ||Lambda|| at 1/(2*lam) = 50
+SING_WARN_PERIOD = 1.0       # s, rate limit on the proximity warning
+K_SING = 30.0                # Nm per unit d(sigma_min)/dq, null-space escape
+SING_GRAD_EPS = 1e-3         # finite-difference step (rad) for that gradient
+MAX_SING_TORQUE = 8.0        # Nm, per-joint clamp on the null-space escape
 
 # --- (B) Virtual-environment rendering (from virtu-phys-sim controller.c) -----
 # In interaction-mode 'render' the EE renders a task-space virtual environment.
@@ -766,6 +854,7 @@ class DeviceConnection:
     """Context manager for a Kortex session (TCP for services, UDP for cyclic)."""
 
     def __init__(self, ip, port, credentials):
+        require_kortex_api()
         self.ip = ip
         self.port = port
         self.credentials = credentials
@@ -921,16 +1010,101 @@ def joint_impedance_torque(q, dq, q_des, kp, kd, tau_g):
     return tau
 
 
+def singular_values(J):
+    """Singular values of the Jacobian, descending. sigma[-1] is sigma_min."""
+    return np.linalg.svd(np.asarray(J, dtype=float), compute_uv=False)
+
+
+def damping_factor(sigma_min):
+    """Chiaverini variable damping lam(sigma_min), continuous and C0 at both ends.
+
+    Zero above SING_SIGMA_ON so well-conditioned poses are untouched, rising
+    quadratically to SING_LAMBDA_MAX at sigma_min = 0. Quadratic rather than
+    linear so the derivative is also zero at the handover point -- a linear ramp
+    puts a kink in the torque exactly where the arm is already struggling.
+    """
+    if sigma_min >= SING_SIGMA_ON:
+        return 0.0
+    r = 1.0 - sigma_min / SING_SIGMA_ON      # 0 at the threshold, 1 at sigma=0
+    return SING_LAMBDA_MAX * r * r
+
+
+def damped_lambda(Lambda_inv, sigma_min):
+    """Operational-space inertia (J M⁻¹ Jᵀ)⁻¹ with singularity-robust inversion.
+
+    Returns ``(Lambda, lam)``. With ``lam == 0`` this is the exact inverse (up to
+    the symmetrisation below), so nominal behaviour is unchanged.
+
+    Lambda_inv is symmetric positive-definite in theory; floating-point J M⁻¹ Jᵀ
+    is only symmetric to round-off, so it is symmetrised before ``eigh``, whose
+    guaranteed-real eigenvalues are what make the per-mode damping well defined.
+    """
+    A = np.asarray(Lambda_inv, dtype=float)
+    A = 0.5 * (A + A.T)
+    evals, evecs = np.linalg.eigh(A)
+    # eigh can return a tiny NEGATIVE eigenvalue for a theoretically PSD matrix
+    # purely from round-off; 1/e would then flip the sign of that mode's torque,
+    # driving the arm INTO the singularity. Floor at a value far below anything
+    # physical so this only ever catches round-off, never shapes real behaviour.
+    evals = np.maximum(evals, 1e-12)
+    lam = damping_factor(sigma_min)
+    if lam > 0.0:
+        inv_e = evals / (evals * evals + lam * lam)
+    else:
+        inv_e = 1.0 / evals
+    Lambda = (evecs * inv_e) @ evecs.T
+    return 0.5 * (Lambda + Lambda.T), lam
+
+
+def sigma_min_gradient(model, q, eps=SING_GRAD_EPS, column=None, base=None):
+    """d(sigma_min(J))/dq by central difference -- the null-space escape direction.
+
+    Ascending this gradient moves the arm AWAY from the singular set. There is no
+    cheap closed form (it needs dJ/dq_i for every i), so it is a finite
+    difference costing 2 Jacobian evaluations per column.
+
+    ``column`` computes a single column i and returns ``(i, value)``, so the
+    caller can spread the 7-column sweep across cycles the way the self-collision
+    gradient already does -- taking all 7 in one cycle costs 14 KDL Jacobian
+    calls and will not fit in a 1 kHz budget. ``base`` is unused for the central
+    difference and accepted only to keep the call signature stable.
+    """
+    n = len(q)
+    idx = range(n) if column is None else (column,)
+    out = np.zeros(n)
+    for i in idx:
+        qp = np.array(q, dtype=float)
+        qm = np.array(q, dtype=float)
+        qp[i] += eps
+        qm[i] -= eps
+        sp = singular_values(model.jacobian(qp))[-1]
+        sm = singular_values(model.jacobian(qm))[-1]
+        out[i] = (sp - sm) / (2.0 * eps)
+    if column is not None:
+        return column, out[column]
+    return out
+
+
 def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
                                kp_cart, kd_cart, kp_null, kd_null, tau_g,
                                tau_collide, k_limit, f_task_extra=None,
-                               state=None, dyn=None):
+                               state=None, dyn=None, tau_sing=0.0):
     """Operational-space impedance torque (ported from Kuka opspace).
 
     Task spring-damper on the EE pose, mapped through Lambda and Jᵀ, with a
     null-space secondary task: posture PD toward q0, a joint-limit barrier, and
     a precomputed self-collision repulsion ``tau_collide`` (all projected into
-    the null space so they never disturb the EE task). Returns (tau[N], manip).
+    the null space so they never disturb the EE task).
+
+    Returns ``(tau[N], manip, sigma_min, lam_damp)`` where ``sigma_min`` is the
+    smallest singular value of J (the singularity metric the caller gates on)
+    and ``lam_damp`` is the damping actually applied to the Lambda inversion
+    this cycle -- 0.0 whenever the pose is well conditioned.
+
+    ``tau_sing`` (optional n-vec) is the precomputed null-space escape torque
+    K_SING * d(sigma_min)/dq. It is passed in rather than computed here because
+    the gradient is a finite difference whose 7-column sweep is spread across
+    cycles by the caller, exactly as ``tau_collide`` already is.
 
     ``f_task_extra`` (optional 6-vec) is an extra task-space wrench added as a
     RAW force (not Lambda-weighted) before the Jᵀ map -- used by 'render' mode to
@@ -968,11 +1142,14 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     else:
         M, Minv = dyn
     Lambda_inv = J @ Minv @ J.T
+    # sigma_min(J) is the singularity metric everything downstream gates on; the
+    # determinant-based `manip` is kept only because the CSV logs and
+    # analyze_tracking.py already carry that column. See the SING_* block for
+    # why the old det(Lambda_inv) >= 1e-2 test could not detect a singularity.
+    sigma = singular_values(J)
+    sigma_min = float(sigma[-1])
     manip = float(np.sqrt(max(np.linalg.det(J @ J.T), 0.0)))
-    if abs(np.linalg.det(Lambda_inv)) >= 1e-2:
-        Lambda = np.linalg.inv(Lambda_inv)
-    else:
-        Lambda = np.linalg.pinv(Lambda_inv, rcond=1e-2)
+    Lambda, lam_damp = damped_lambda(Lambda_inv, sigma_min)
 
     # Optional extra raw task wrench (render-mode virtual mass Km*acc), clamped
     # like F, added inside the Jᵀ map but NOT Lambda-weighted (it is a force).
@@ -990,11 +1167,12 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     tau_null = (kp_null * _wrap_rad(q0 - q)
                 + joint_limit_torque(q, k_limit)
                 + tau_collide
+                + tau_sing
                 - kd_null * dq)
     tau += (np.eye(n) - J.T @ Jbar.T) @ tau_null
 
     tau += tau_g
-    return tau, manip
+    return tau, manip, sigma_min, lam_damp
 
 
 def free_drive_torque(q, tau_g, tau_collide, k_limit):
@@ -1651,6 +1829,17 @@ def run_impedance(args):
         collide_h0 = 0.0            # baseline cost at collide_q
         collide_col = 0             # next finite-difference column to evaluate
 
+        # Singularity state, mirroring the collision sweep above: one column of
+        # d(sigma_min)/dq per cycle, published only when the sweep completes.
+        # sigma_min/lam_damp are seeded well-conditioned so the CSV has a valid
+        # value for any cycle before the first cartesian evaluation.
+        tau_sing = np.zeros(n)      # published escape torque (last full sweep)
+        sing_grad_acc = np.zeros(n)  # sweep under construction
+        sing_col = 0                # next finite-difference column to evaluate
+        sing_warn_t = -1e9          # last proximity warning (rate limiting)
+        sigma_min = float("nan")
+        lam_damp = 0.0
+
         # Achieved-rate accounting, reported on exit. The audit had to recover
         # this from CSV sample spacing; the loop now just measures it.
         cyc_n = 0
@@ -1679,7 +1868,14 @@ def run_impedance(args):
                       + [f"tau{i+1}" for i in range(n)]
                       + [f"taug{i+1}" for i in range(n)]
                       + ["ramp", "engage", "xerr"]
-                      + [f"trim{i+1}" for i in range(n)])
+                      + [f"trim{i+1}" for i in range(n)]
+                      # Singularity trace: sigma_min is the metric the guards
+                      # act on and lam_damp says whether the damped inversion
+                      # was engaged, so a post-hoc log review can tell "the arm
+                      # went soft" from "the arm was near a singularity and the
+                      # controller gave up that direction on purpose". NaN in
+                      # joint mode, which never evaluates a Jacobian.
+                      + ["sigma_min", "lam_damp"])
         try:
             while True:
                 step_start = time.monotonic()
@@ -1899,16 +2095,57 @@ def run_impedance(args):
 
                         M_cyc = model.mass(q)
                         Minv_cyc = np.linalg.inv(M_cyc)
-                        tau, manip = cartesian_impedance_torque(
+                        tau, manip, sigma_min, lam_damp = cartesian_impedance_torque(
                             model, q, dq, p_des, quat_des, q_ref,
                             task_kp, task_kd, kp_null * engage, kd_null, tau_g,
                             tau_collide, K_LIMIT, f_task_extra=f_extra,
                             state=(p_cur, quat_cur, J),
-                            dyn=(M_cyc, Minv_cyc))
-                        if manip < MIN_MANIPULABILITY:
-                            print(f"\nABORT: near singularity (manipulability "
-                                  f"{manip:.2e} < {MIN_MANIPULABILITY:.1e}).")
+                            dyn=(M_cyc, Minv_cyc), tau_sing=tau_sing)
+
+                        # Null-space singularity escape: advance ONE column of
+                        # the d(sigma_min)/dq finite difference per cycle and
+                        # publish the torque when the sweep wraps, so the cost
+                        # is 2 Jacobian evaluations per cycle instead of 14.
+                        # Only armed once the pose is actually degrading --
+                        # above SING_SIGMA_ON the gradient is not even sampled,
+                        # so nominal cycles pay nothing.
+                        if args.sing_avoid and sigma_min < SING_SIGMA_ON:
+                            col, val = sigma_min_gradient(
+                                model, q, column=sing_col)
+                            sing_grad_acc[col] = val
+                            sing_col += 1
+                            if sing_col >= n:
+                                sing_col = 0
+                                # Ascend the gradient: +grad moves AWAY from the
+                                # singular set. Clamped so a bad finite
+                                # difference near rank collapse (where sigma_min
+                                # is least smooth) cannot dominate the command.
+                                tau_sing = np.clip(
+                                    args.sing_gain * sing_grad_acc,
+                                    -MAX_SING_TORQUE, MAX_SING_TORQUE)
+                        elif args.sing_avoid:
+                            # Well conditioned again: release the escape torque
+                            # and restart the sweep, so a stale gradient from a
+                            # pose the arm has already left cannot keep pushing.
+                            tau_sing = np.zeros(n)
+                            sing_col = 0
+
+                        # Proximity warning, then abort only on true rank
+                        # collapse. Between the two the damped Lambda has
+                        # already suppressed the degenerate direction, so the
+                        # right response is to keep holding the arm up and tell
+                        # the operator -- not to end the run.
+                        if sigma_min < SING_SIGMA_ABORT:
+                            print(f"\nABORT: rank collapse (sigma_min "
+                                  f"{sigma_min:.2e} < {SING_SIGMA_ABORT:.1e}).")
                             break
+                        if (lam_damp > 0.0
+                                and step_start - sing_warn_t >= SING_WARN_PERIOD):
+                            sing_warn_t = step_start
+                            print(f"\n[singularity] sigma_min={sigma_min:.4f} "
+                                  f"(< {SING_SIGMA_ON:.3f}) -- damping "
+                                  f"lam={lam_damp:.4f}, task authority reduced "
+                                  f"along the degenerate direction.")
 
                 # Bounded gravity trim (cartesian): learns the residual holding
                 # torque the gravity feedforward is missing and applies it at
@@ -2070,7 +2307,8 @@ def run_impedance(args):
                                     + [round(v, 4) for v in tau_g]
                                     + [round(ramp, 3), round(engage, 3),
                                        round(pose_err, 4)]
-                                    + [round(v, 4) for v in tau_trim])
+                                    + [round(v, 4) for v in tau_trim]
+                                    + [round(sigma_min, 6), round(lam_damp, 6)])
 
                 # Build the cyclic command frame.
                 frame_id = (frame_id + 1) % 65536
@@ -2371,7 +2609,25 @@ def main():
     p.add_argument("--table-verbose", action="store_true",
                    help="Print the closest guarded link and wall force while "
                         "the wall is engaged (rate-limited to 2 Hz).")
+    p.add_argument("--sing-avoid", action="store_true",
+                   help="Cartesian mode: use the redundant 7th DOF to retreat "
+                        "from kinematic singularities, by ascending the "
+                        "d(sigma_min)/dq gradient inside the null-space "
+                        "projector (so the tool tip does not move). Only "
+                        "active below sigma_min = %.3f; costs 2 extra Jacobian "
+                        "evaluations on those cycles. The damped Lambda "
+                        "inversion is ALWAYS on and does not need this flag -- "
+                        "this is the proactive layer on top of it."
+                        % SING_SIGMA_ON)
+    p.add_argument("--sing-gain", type=float, default=K_SING, metavar="K",
+                   help="Nm per unit d(sigma_min)/dq for --sing-avoid "
+                        "(default %(default)s, per-joint clamp "
+                        + "%.0f Nm)." % MAX_SING_TORQUE)
     args = p.parse_args()
+
+    if args.sing_gain < 0.0:
+        p.error("--sing-gain must be >= 0 (a negative gain would DESCEND the "
+                "gradient, driving the arm into the singularity).")
 
     if args.table_avoidance:
         if args.table_alpha[0] <= 0.0 or args.table_alpha[1] <= 0.0:
