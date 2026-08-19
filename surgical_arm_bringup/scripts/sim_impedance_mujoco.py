@@ -67,6 +67,60 @@ import impedance as imp   # noqa: E402  (path must be set first)
 # so it lives in a temp path and is never committed.
 PLANT_URDF = "/tmp/gen3_impedance_plant.urdf"
 
+# Startup posture for the hold/reach scenarios: the sim Home pose.
+HOME_Q0 = np.array([0.0, 0.26, 3.14, -2.0, 0.0, -0.93, 1.57])
+
+# --- Where the singularities actually are, measured not assumed ---------------
+# Minimising sigma_min(J) from 60 random starts put EVERY local minimum at
+# joint_4 ~ 0 (the elbow-extended set) with a healthy rotational block, which is
+# what the `reach` scenario drives into.
+#
+# The classic spherical-wrist singularity is NOT one of them, and this is worth
+# stating plainly because it is the opposite of the 6-DOF intuition: at
+# joint_6 = 0 the joint_5 and joint_7 angular axes are exactly collinear
+# (|cos| = 1.000000 to six digits, so the wrist really has lost a DOF), yet
+# sigma_min(J) stays around 0.12 and the arm is NOT rank deficient. The
+# redundant 7th DOF simply covers the lost wrist freedom. Driving joint_6 to
+# zero on its own is therefore not a singularity test on this arm.
+#
+# A genuine wrist singularity does exist, but it needs joint_5 near 1.62 rad AS
+# WELL as joint_6 = 0. Holding the elbow bent at joint_4 = -1.2 (off the elbow
+# set entirely) and minimising sigma_min lands exactly there. Sweeping joint_6
+# down to 0 at that posture:
+#
+#   joint_6   0.60     0.25     0.08     0.04     0.02     0.00
+#   sigma_min 0.107    0.0499   0.0163   0.0081   0.0041   0.000048
+#   ||Lambda|| 3.86    3.86     4.45     10.2     34.9     1.75e+07
+#
+# Note how late and how abruptly it goes: Lambda is still nominal at
+# joint_6 = 0.08 and then climbs seven orders of magnitude in the last 0.08 rad.
+# The tool tip moves only 58 mm across that whole sweep, so a small commanded
+# reorientation is enough to walk the arm into it -- which is precisely why a
+# guard that reacts late is dangerous here.
+WRIST_Q_SING = np.array([0.392, 1.355, -0.89, -1.2, 1.621, 0.0, 0.666])
+WRIST_J6_START = 0.35        # rad of joint_6 to start from (sigma_min ~0.068)
+# The commanded pose overshoots to the far side of the singular set. Aiming AT
+# it is not enough: the null-space posture term pulls back toward the startup
+# posture and the arm settles at sigma_min ~0.019, never actually reaching the
+# singularity. Commanding through it makes the arm try to TRACK ACROSS the
+# singular set, which is the case that actually bites in service.
+WRIST_J6_TARGET = -0.25
+
+
+def _slerp(qa, qb, s):
+    """Shortest-arc quaternion interpolation, [x,y,z,w] as KinDynModel.fk returns."""
+    qa = np.asarray(qa, dtype=float)
+    qb = np.asarray(qb, dtype=float)
+    dot = float(qa @ qb)
+    if dot < 0.0:                 # take the short way round
+        qb, dot = -qb, -dot
+    if dot > 0.9995:              # nearly parallel: lerp is numerically safer
+        out = qa + s * (qb - qa)
+        return out / np.linalg.norm(out)
+    theta = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_t = np.sin(theta)
+    return (np.sin((1.0 - s) * theta) * qa + np.sin(s * theta) * qb) / sin_t
+
 
 # =============================================================================
 # Plant construction
@@ -231,6 +285,23 @@ class RunResult:
         self.trace = []              # (t, sigma_min, tau_peak, lam) per sample
 
 
+def resolve_q0(args):
+    """Startup posture: an explicit --q0 always wins, else the scenario's own.
+
+    The wrist scenario needs a completely different posture from hold/reach --
+    its singularity lives at joint_5 ~ 1.62 with the elbow bent, nowhere near
+    the Home pose -- so it carries its own default rather than making the caller
+    remember seven numbers.
+    """
+    if args.q0 is not None:
+        return np.array(args.q0, dtype=float)
+    if args.scenario == "wrist":
+        q0 = WRIST_Q_SING.copy()
+        q0[5] = WRIST_J6_START
+        return q0
+    return HOME_Q0.copy()
+
+
 def simulate(args, guard, sing_avoid=False, verbose=False):
     """Run one scenario under one guard and return a RunResult.
 
@@ -266,7 +337,7 @@ def simulate(args, guard, sing_avoid=False, verbose=False):
         imp.SING_SIGMA_ON = 0.0
 
     try:
-        q0 = np.array(args.q0, dtype=float)
+        q0 = resolve_q0(args)
         d.qpos[qposadr] = q0
         d.qvel[:] = 0.0
         mujoco.mj_forward(m, d)
@@ -292,6 +363,17 @@ def simulate(args, guard, sing_avoid=False, verbose=False):
             norm = np.linalg.norm(radial)
             direction = radial / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
             p_target = p0 + args.reach * direction
+            p_des = p0.copy()
+        elif args.scenario == "wrist":
+            # Command the pose of the wrist-singular configuration itself. The
+            # task is only 58 mm and a modest reorientation away, so this is an
+            # ordinary-looking motion -- not an unreachable target like `reach`
+            # -- which is what makes the wrist case the more insidious of the
+            # two. Both position and ORIENTATION are ramped; orientation is the
+            # part that actually drives joint_6 to zero.
+            q_target = WRIST_Q_SING.copy()
+            q_target[5] = WRIST_J6_TARGET
+            p_target, quat_target = kin.fk(q_target)
             p_des = p0.copy()
         else:
             raise SystemExit("unknown scenario %r" % args.scenario)
@@ -319,12 +401,14 @@ def simulate(args, guard, sing_avoid=False, verbose=False):
                 res.diverged = True
                 break
 
-            if args.scenario == "reach":
+            if args.scenario in ("reach", "wrist"):
                 # Linear ramp over --ramp seconds, then held at the target so
                 # the arm sits in the singular configuration rather than passing
                 # through it.
                 s = min(1.0, (k * dt) / max(args.ramp, 1e-9))
                 p_des = p0 + s * (p_target - p0)
+                if args.scenario == "wrist":
+                    quat_des = _slerp(quat0, quat_target, s)
 
             # Exact gravity feedforward. On hardware this term is the dominant
             # error source, but here plant == model, so making it exact is what
@@ -490,10 +574,13 @@ def main():
     p = argparse.ArgumentParser(
         description="MuJoCo bench for impedance.py cartesian singularity handling",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--scenario", choices=["hold", "reach"], default="reach",
+    p.add_argument("--scenario", choices=["hold", "reach", "wrist"],
+                   default="reach",
                    help="hold: well-conditioned regression. reach: command a "
-                        "tip pose beyond reach, which pulls the elbow straight "
-                        "into the arm's dominant singularity.")
+                        "tip pose beyond reach, pulling the elbow straight into "
+                        "the arm's dominant singularity. wrist: reorient the "
+                        "tool into the joint_5~1.62/joint_6=0 wrist singularity "
+                        "-- a much smaller, more ordinary-looking motion.")
     p.add_argument("--guard", choices=["legacy", "damped"], default="damped",
                    help="legacy reproduces the undamped inversion + the old "
                         "sqrt(det(J Jt)) abort gate.")
@@ -508,9 +595,10 @@ def main():
     p.add_argument("--reach", type=float, default=0.50, metavar="M",
                    help="How far beyond the startup tip pose to command, "
                         "radially outward, in the reach scenario.")
-    p.add_argument("--q0", type=float, nargs=7,
-                   default=[0.0, 0.26, 3.14, -2.0, 0.0, -0.93, 1.57],
-                   help="Startup joint configuration (the sim Home pose).")
+    p.add_argument("--q0", type=float, nargs=7, default=None,
+                   help="Startup joint configuration. Default is the sim Home "
+                        "pose for hold/reach, and the wrist scenario's own "
+                        "posture for wrist.")
     p.add_argument("--duration", type=float, default=8.0, metavar="S")
     p.add_argument("--rate", type=float, default=1000.0, metavar="HZ",
                    help="Control rate, matching the arm's 1 kHz loop.")
@@ -560,7 +648,7 @@ def main():
         m, d, dofadr, qposadr, names = load_plant(
             args.urdf, args.base_link, args.tip_link, 1.0 / args.rate)
         rng = np.random.default_rng(0)
-        poses = [np.zeros(7), np.array(args.q0)] + [rng.uniform(-1.5, 1.5, 7)
+        poses = [np.zeros(7), resolve_q0(args)] + [rng.uniform(-1.5, 1.5, 7)
                                                     for _ in range(8)]
         dg, dM = check_model_match(m, d, kin, qposadr, dofadr, poses)
         print("plant joints: %s" % ", ".join(names))
@@ -588,7 +676,7 @@ def main():
     m, d, dofadr, qposadr, _ = load_plant(args.urdf, args.base_link,
                                           args.tip_link, 1.0 / args.rate)
     rng = np.random.default_rng(0)
-    poses = [np.zeros(7), np.array(args.q0)] + [rng.uniform(-1.5, 1.5, 7)
+    poses = [np.zeros(7), resolve_q0(args)] + [rng.uniform(-1.5, 1.5, 7)
                                                 for _ in range(8)]
     dg, dM = check_model_match(m, d, kin, qposadr, dofadr, poses)
     # Checked on the BARE chain (armature 0), which is what verifies the URDF
@@ -600,18 +688,18 @@ def main():
           % args.armature)
 
     results = {}
-    for scenario in ("hold", "reach"):
+    for scenario in ("hold", "reach", "wrist"):
         args.scenario = scenario
         for guard in ("legacy", "damped"):
             print("[%s / %s]" % (scenario, guard))
             r = simulate(args, guard, sing_avoid=False, verbose=args.verbose)
             describe("%s/%s" % (scenario, guard), r)
             results[(scenario, guard)] = r
-        if scenario == "reach":
-            print("[reach / damped + --sing-avoid]")
+        if scenario in ("reach", "wrist"):
+            print("[%s / damped + --sing-avoid]" % scenario)
             r = simulate(args, "damped", sing_avoid=True, verbose=args.verbose)
-            describe("reach/damped+avoid", r)
-            results[("reach", "avoid")] = r
+            describe("%s/damped+avoid" % scenario, r)
+            results[(scenario, "avoid")] = r
         print()
 
     # --- verdict -------------------------------------------------------------
@@ -672,6 +760,25 @@ def main():
         "null-space escape improves the closest approach",
         r_avo.sigma_min > r_dam.sigma_min,
         "damped sigma_min=%.5f -> +avoid %.5f" % (r_dam.sigma_min, r_avo.sigma_min)))
+
+    w_leg, w_dam = results[("wrist", "legacy")], results[("wrist", "damped")]
+    checks.append((
+        "the wrist scenario reaches its own distinct singularity",
+        w_leg.sigma_min < imp.SING_SIGMA_ON,
+        "sigma_min=%.5f at joint_5~1.62/joint_6=0 (not the elbow set)"
+        % w_leg.sigma_min))
+    checks.append((
+        "damped inversion bounds ||Lambda|| at the wrist singularity too",
+        w_dam.lambda_peak < w_leg.lambda_peak,
+        "legacy %.3g -> damped %.3g" % (w_leg.lambda_peak, w_dam.lambda_peak)))
+    checks.append((
+        "wrist approach does not explode the commanded torque when damped",
+        w_dam.tau_peak <= w_leg.tau_peak + 1e-9,
+        "legacy %.1f Nm -> damped %.1f Nm" % (w_leg.tau_peak, w_dam.tau_peak)))
+    checks.append((
+        "damped run stays numerically sane at the wrist singularity",
+        not w_dam.diverged,
+        "diverged=%s" % w_dam.diverged))
 
     failed = 0
     for name, ok, detail in checks:
