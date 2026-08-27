@@ -374,6 +374,22 @@ SENSED_LOAD_SIGN = -1.0
 #     stop blocking on it: RouterClientSendOptions(andForget=True) and the
 #     send-only RefreshCommand() both exist on this API and are unused.
 #
+# CONFIRMED ON HARDWARE (2026-08-26, two 30 s cartesian hold-ee runs). Note the
+# 833 Hz figure above is STALE -- by 2026-08-12 the loop was already at 934 Hz:
+#
+#   Aug 06   1.223 ms   817 Hz    p99 1.580   max 1.680
+#   Aug 12   1.070 ms   934 Hz    p99 1.600   max 2.040
+#   Aug 26   1.055 ms   947 Hz    p99 1.246   max 1.460   <- collision_cost vectorised
+#
+# Cutting 132 us of compute bought only 15 us of mean cycle time. That is the
+# point: the loop is NOT compute-bound. It blocks in Refresh until the arm
+# services the command on its own ~1 kHz tick, so once total work fits under one
+# tick, further compute savings are absorbed into a longer blocking wait rather
+# than a faster loop. What the saving DOES buy is tail margin -- p99 -22%, max
+# -28% -- i.e. fewer cycles overshoot the tick and slip to the next one, which
+# is what the watchdog and the dt_meas-driven integrators actually care about.
+# Do not expect further compute optimisation to raise the rate.
+#
 # What this DID break, until fixed on 2026-08-11: every integrator advanced by a
 # nominal 1/rate per cycle while only 833 cycles happened per second, so the
 # gravity trim, the joint integral trim and the re-anchor blend all integrated
