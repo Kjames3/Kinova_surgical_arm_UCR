@@ -916,6 +916,31 @@ def _wrap_rad(rad):
     return (rad + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def critical_damping(kp, zeta=1.0):
+    """Damping for a unit-apparent-inertia spring of stiffness ``kp``.
+
+        D = 2 * zeta * sqrt(K)
+
+    ALWAYS DERIVE DAMPING FROM THE FINAL, ALREADY-SCALED STIFFNESS. Calling this
+    on the base constant and multiplying the result by the same scale afterwards
+    is the bug this helper exists to prevent: damping would then scale as
+    ``s`` where it must scale as ``sqrt(s)``, so the effective ratio drifts to
+    ``zeta * sqrt(s)``.
+
+    That was live until 2026-08-26 on the cartesian task gains, the render-mode
+    environment gains and the free-mode hold spring. At ``--cart-scale 0.25`` it
+    left the task at HALF the intended damping ratio (underdamped -- the EE
+    rings); at ``--cart-scale 4`` it ran at twice (sluggish). Defaults were
+    unaffected, since every one of those scales defaults to 1.0 and sqrt(1) = 1,
+    which is why it survived so long.
+
+    The loop already gets this right where it blends the re-anchor yield:
+    ``engage_d = sqrt(engage)`` scales damping by the root of the stiffness
+    fraction. This is the same rule, applied to the CLI scales.
+    """
+    return 2.0 * zeta * np.sqrt(np.asarray(kp, dtype=float))
+
+
 def _quat_conj(q):
     return np.array([-q[0], -q[1], -q[2], q[3]])
 
@@ -1560,14 +1585,13 @@ def run_impedance(args):
         kp_anchor = args.wrist_anchor * CONTINUOUS_JOINTS[:n]
         # 'free'-mode position-hold spring (critically damped for unit inertia).
         kp_hold = KP_HOLD[:n] * args.free_hold_scale
-        kd_hold = 2.0 * np.sqrt(KP_HOLD[:n]) * args.free_hold_scale
+        kd_hold = critical_damping(kp_hold)
 
         # Cartesian TASK gains scale with --cart-scale (softens EE feel only);
         # posture/null-space gains scale with --kp-scale so self-collision and
         # posture authority stay independent of how compliant the task is set.
         kp_cart = np.concatenate([KP_CART_POS, KP_CART_ORI]) * args.cart_scale
-        kd_cart = (CART_DAMPING_RATIO * 2.0 * np.sqrt(
-            np.concatenate([KP_CART_POS, KP_CART_ORI]))) * args.cart_scale
+        kd_cart = critical_damping(kp_cart, CART_DAMPING_RATIO)
         # Null-space posture stiffness toward q0. Scaled by --null-stiffness
         # (SEPARATE from --kp-scale) so the redundant DOF can be anchored without
         # stiffening the EE task. This is the restoring term that stops the slow
@@ -1575,7 +1599,16 @@ def run_impedance(args):
         # sets a terminal drift velocity under residual gravity torque, it never
         # nulls the drift. 0.0 => fully free elbow (legacy behaviour).
         kp_null = KP_NULL[:n] * args.null_stiffness
-        kd_null = (2.0 * np.sqrt(KP_NULL[:n])) * args.kd_scale
+        # DELIBERATELY NOT critical_damping(kp_null): unlike the springs above,
+        # kd_null damps the WHOLE null-space secondary task, and two of its three
+        # terms -- the joint-limit barrier and the self-collision repulsion --
+        # are live regardless of --null-stiffness. Deriving this from kp_null
+        # would drive it to zero at --null-stiffness 0 ("fully free elbow"),
+        # leaving those two guards undamped and springy exactly when the operator
+        # has asked for the most compliant configuration. It is nominal
+        # null-space dissipation trimmed by --kd-scale, not the posture spring's
+        # damping partner, so it stays tied to the nominal KP_NULL.
+        kd_null = critical_damping(KP_NULL[:n]) * args.kd_scale
 
         # (B) Virtual-environment gains for interaction-mode 'render'. Stiffness
         # scales with --cart-scale (task softness), damping is derived like the
@@ -1583,7 +1616,7 @@ def run_impedance(args):
         # risky mass term is dialed independently from the spring/damper.
         env = ENV_PRESETS[args.env]
         env_kp = env["kp"] * args.cart_scale
-        env_kd = (CART_DAMPING_RATIO * 2.0 * np.sqrt(env["kp"])) * args.cart_scale
+        env_kd = critical_damping(env_kp, CART_DAMPING_RATIO)
         env_km = env["km"] * args.km_scale
 
         # --- Capture start state + gravity feedforward (still position-held) ---
@@ -1694,14 +1727,18 @@ def run_impedance(args):
             elif args.interaction_mode == "render":
                 print(f"  env       : {args.env}  (virtual-environment render)")
                 print(f"  Kp_cart   : {np.round(env_kp, 1)}  (Lambda-weighted)")
-                print(f"  Kd_cart   : {np.round(env_kd, 1)}")
+                print(f"  Kd_cart   : {np.round(env_kd, 1)}  "
+                      f"(zeta={CART_DAMPING_RATIO:g} at --cart-scale "
+                      f"{args.cart_scale:g})")
                 print(f"  Km (mass) : {np.round(env_km, 2)}")
                 if np.any(env_km > 0.0):
                     print("  !! Km>0 (mass-reduction) is POSITIVE accel feedback "
                           "-- raise --km-scale slowly, e-stop ready.")
             else:
                 print(f"  Kp_cart   : {np.round(kp_cart, 1)}")
-                print(f"  Kd_cart   : {np.round(kd_cart, 1)}")
+                print(f"  Kd_cart   : {np.round(kd_cart, 1)}  "
+                      f"(zeta={CART_DAMPING_RATIO:g} at --cart-scale "
+                      f"{args.cart_scale:g})")
             if args.interaction_mode == "track":
                 print(f"  track A->B: {np.round(p_a, 3)} -> {np.round(p_b, 3)}"
                       f"  period {args.track_period}s")
@@ -2370,8 +2407,10 @@ def main():
     p.add_argument("--track-period", type=float, default=6.0,
                    help="[track] Seconds for one full A->B->A cycle.")
     p.add_argument("--free-hold-scale", type=float, default=1.0,
-                   help="[free] Scale the position-hold stiffness. 0 = pure "
-                        "gravity comp (no hold; arm sinks if model imperfect).")
+                   help="[free] Scale the position-hold stiffness (damping "
+                        "follows as sqrt, keeping it critically damped). 0 = "
+                        "pure gravity comp (no hold; arm sinks if model "
+                        "imperfect).")
     p.add_argument("--free-move-thresh", type=float, default=FREE_MOVE_THRESH,
                    help="[free] Joint speed (rad/s) above which the arm is "
                         "treated as hand-moved (hold pose re-centers); below it, "
@@ -2397,9 +2436,12 @@ def main():
                         "accumulation, so it doesn't wind up while you hand-move "
                         "the arm (prevents overshoot/ringing on release).")
     p.add_argument("--cart-scale", type=float, default=1.0,
-                   help="[cartesian] Scale ONLY the task stiffness/damping "
-                        "(kp_cart/kd_cart) -- softens the EE feel WITHOUT "
-                        "weakening posture/self-collision authority.")
+                   help="[cartesian] Scale ONLY the task stiffness -- softens "
+                        "the EE feel WITHOUT weakening posture/self-collision "
+                        "authority. Damping tracks as sqrt(scale), so the "
+                        "damping RATIO stays put (before 2026-08-26 damping "
+                        "scaled linearly, leaving 0.25 underdamped and 4 "
+                        "sluggish).")
     p.add_argument("--null-stiffness", type=float, default=0.4,
                    help="[cartesian hold-ee/track/render] Null-space posture "
                         "stiffness toward q0, as a fraction of KP_NULL. Anchors "
