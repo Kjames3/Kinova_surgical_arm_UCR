@@ -1508,16 +1508,28 @@ def return_to_home(base, n, q0, countdown=3):
 
     Waits for countdown seconds, then sends a ReachJointAngles action to the Kortex
     BaseClient to move back to q0 (initial joint configuration in radians).
+
+    The countdown is the operator's last chance to veto the move, so a Ctrl-C
+    during it cancels the return and is swallowed -- this runs inside
+    run_impedance's `finally`, where an escaping KeyboardInterrupt would skip
+    the CSV log write that comes after it.
     """
     if q0 is None or base is None:
         return
 
     print("=" * 70)
-    print(f"Returning to initial position in {countdown} seconds ...")
-    for s in range(countdown, 0, -1):
-        print(f"   returning in {s} ...", end="\r", flush=True)
-        time.sleep(1.0)
-    print(" " * 40, end="\r")
+    print(f"Returning to initial position in {countdown} seconds "
+          "(Ctrl-C to stay put) ...")
+    try:
+        for s in range(countdown, 0, -1):
+            print(f"   returning in {s} ...  (Ctrl-C cancels)",
+                  end="\r", flush=True)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print(" " * 60, end="\r")
+        print("Return cancelled -- the arm stays where it is.")
+        return
+    print(" " * 60, end="\r")
     print("Moving arm to initial position...")
 
     action = Base_pb2.Action()
@@ -1977,6 +1989,13 @@ def run_impedance(args):
         if args.log is not None:
             print(f"  log       : {args.log}  (every {args.log_decimate} cycles)")
         print(f"  rate      : {args.rate:.0f} Hz   duration: {args.duration}s")
+        print("  on exit   : " + {
+            "auto":   "return to start pose after a clean stop; STAY PUT after "
+                      "an abort",
+            "always": "return to start pose even after an ABORT (unplanned "
+                      "move -- inspect first)",
+            "never":  "stay where the run ends",
+        }[args.return_home] + f"  (--return-home {args.return_home})")
         print("=" * 70)
         print("!! TORQUE MODE disables the position safety envelope.")
         print("!! Keep the e-stop in hand. Ctrl-C restores position mode.")
@@ -2046,6 +2065,11 @@ def run_impedance(args):
         cyc_over = 0                # cycles that ran longer than the warn threshold
         cyc_timeout_run = 0         # CONSECUTIVE timed-out cyclic frames
         cyc_timeout_total = 0       # timed-out frames over the whole run
+        # Why the loop stopped. None => it ran to completion (--duration
+        # elapsed) or the operator stopped it with Ctrl-C. A string => one of
+        # the safety guards fired, and --return-home 'auto' will then refuse to
+        # drive the arm anywhere. See the finally block.
+        abort_reason = None
 
         # Bounded cyclic send options (see CYCLIC_TIMEOUT_MS). Built once: the
         # generated stub's default argument is a single shared instance created
@@ -2112,6 +2136,7 @@ def run_impedance(args):
                 if np.any(np.abs(dq) > MAX_JOINT_SPEED):
                     print(f"\nABORT: joint speed {np.round(dq, 2)} exceeds "
                           f"{MAX_JOINT_SPEED} rad/s.")
+                    abort_reason = "runaway joint speed"
                     break
 
                 tau_g = args.gravity_scale * compute_gravity(
@@ -2240,6 +2265,8 @@ def run_impedance(args):
                                           f"{args.reanchor_time}s to teach a pose "
                                           "instead of moving continuously, or "
                                           "raise --yield-timeout.")
+                                    abort_reason = ("yield timeout with the EE "
+                                                    "far from its setpoint")
                                     break
                             if captured:
                                 q_ref = q.copy()
@@ -2268,6 +2295,7 @@ def run_impedance(args):
                                   "(--gravity-scale / --gravity-trim), or raise "
                                   "--max-pose-err"
                                   f"{'-guided' if guided else ''}.")
+                            abort_reason = f"EE {pose_err:.2f} m from setpoint"
                             break
 
                         # Stiffness scales with `engage`; damping with its sqrt so
@@ -2343,6 +2371,7 @@ def run_impedance(args):
                         if sigma_min < SING_SIGMA_ABORT:
                             print(f"\nABORT: rank collapse (sigma_min "
                                   f"{sigma_min:.2e} < {SING_SIGMA_ABORT:.1e}).")
+                            abort_reason = "kinematic rank collapse"
                             break
                         if (lam_damp > 0.0
                                 and step_start - sing_warn_t >= SING_WARN_PERIOD):
@@ -2508,6 +2537,7 @@ def run_impedance(args):
 
                 if np.any(np.isnan(tau)):
                     print("\nABORT: NaN in torque command.")
+                    abort_reason = "NaN in the torque command"
                     break
 
                 # (D) Capture a decimated log row (post-clip command torque).
@@ -2546,6 +2576,7 @@ def run_impedance(args):
                               f"frames timed out at "
                               f"{args.cyclic_timeout_ms:g} ms -- the arm is not "
                               "answering. Restoring position mode.")
+                        abort_reason = "arm stopped answering cyclic frames"
                         break
                     # Retry immediately against the last good feedback rather
                     # than ending the run on one dropped datagram. `feedback` is
@@ -2597,9 +2628,33 @@ def run_impedance(args):
                 print(f"  cyclic t/o : {cyc_timeout_total} frame(s) exceeded "
                       f"{args.cyclic_timeout_ms:g} ms")
 
-            # Return to initial position prior to start of script after 3s countdown
+            # Return to the startup joint configuration -- but NOT after a
+            # safety abort. This block used to run unconditionally, so every
+            # guard in the loop (runaway speed, EE collapse, rank collapse, NaN
+            # torque, unanswered cyclic frames) was followed 3 seconds later by
+            # an UNPLANNED joint-space ReachJointAngles back to q0. The guards
+            # fire precisely when the arm is somewhere unexpected -- collapsed
+            # onto the table, folded near a singularity -- and that move sweeps
+            # through whatever is in the way with no collision checking. The one
+            # case where returning home is least safe was the one case it was
+            # guaranteed to happen.
             if q0 is not None:
-                return_to_home(base, n, q0, countdown=3)
+                if args.return_home == "never":
+                    print("Leaving the arm where it stopped (--return-home "
+                          "never).")
+                elif abort_reason is not None and args.return_home != "always":
+                    print("=" * 70)
+                    print(f"NOT returning to the start pose: the run ABORTED "
+                          f"({abort_reason}).")
+                    print("  The arm is left exactly where it stopped. Returning"
+                          " to q0 from here would be an")
+                    print("  unplanned joint-space move through whatever the "
+                          "arm has ended up next to.")
+                    print("  Inspect it, clear the cause, then jog it back by "
+                          "hand or with --return-home always.")
+                    print("=" * 70)
+                else:
+                    return_to_home(base, n, q0, countdown=3)
 
             # (D) Dump the buffered log AFTER the arm is safe -- a slow/failed
             # write must never delay the control-mode restore above.
@@ -2806,6 +2861,17 @@ def main():
                         "the run; a persistent stall still aborts promptly.")
     p.add_argument("--countdown", type=int, default=5,
                    help="Seconds to wait before engaging torque mode.")
+    p.add_argument("--return-home", choices=["auto", "always", "never"],
+                   default="auto",
+                   help="Move back to the startup joint configuration when the "
+                        "run ends. 'auto' (default) does so only after a CLEAN "
+                        "exit (--duration elapsed, or Ctrl-C) and NEVER after a "
+                        "safety abort, because the guards fire exactly when the "
+                        "arm is somewhere unexpected and the return is an "
+                        "unplanned joint-space move with no collision checking. "
+                        "'always' returns even after an abort (inspect the arm "
+                        "first). 'never' leaves it where it stopped. The "
+                        "countdown can be cancelled with Ctrl-C either way.")
     p.add_argument("--ramp-time", type=float, default=1.0,
                    help="Soft-engage: seconds to fade control torque 0->1 at "
                         "start (gravity FF stays full). 0 = engage instantly.")
