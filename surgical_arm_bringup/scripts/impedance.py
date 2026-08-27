@@ -109,6 +109,7 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import numpy as np
 from control_barrier import (compute_table_hocbf_rows, filter_control_qp,
@@ -201,12 +202,17 @@ K_LIMIT = 25.0               # Nm/rad, joint-limit barrier stiffness
 # matched --log-decimate 10 every logged sample landed on exactly that cycle.
 #
 # The sweep is now spread ACROSS cycles: one finite-difference column per cycle,
-# published when the sweep completes. Peak cost drops ~4x (386 us on the cycle
-# that also re-takes the baseline, 193 us otherwise) and the full gradient still
-# refreshes every n cycles -- marginally faster than the old 10-cycle stride.
-# Every column is differenced against a FROZEN configuration (collide_q), so the
-# result is a true gradient at one pose instead of a mix of poses smeared over
-# the sweep.
+# published when the sweep completes, and the full gradient still refreshes
+# every n cycles -- marginally faster than the old 10-cycle stride. Every column
+# is differenced against a FROZEN configuration (collide_q), so the result is a
+# true gradient at one pose instead of a mix of poses smeared over the sweep.
+#
+# Cost per cycle, measured on REAL-1 at the surgical home pose:
+#   2026-08-11  193 us ordinary cycle / 386 us on the baseline cycle
+#   2026-08-26   64 us ordinary cycle / 128 us on the baseline cycle
+# after collision_cost() was vectorised over capsule pairs (see
+# _segment_distance_batch). Identical costs to 1.4e-17; identical gradients to
+# 1.4e-13. This was still ~66% of all control compute before the change.
 COLLIDE_EPS = 1e-4           # finite-difference step (rad); was collision_gradient's default
 
 # Cartesian safety limits.
@@ -353,6 +359,21 @@ SENSED_LOAD_SIGN = -1.0
 # make it faster and raising it will not either; the only levers are
 # transport-side. The watchdog evidently tolerates 833 Hz.
 #
+# 2026-08-26 follow-up, measured against the live arm:
+#   * Cartesian+barrier compute was ~298 us, of which collision_cost alone was
+#     196 us. Vectorising it (see COLLIDE_EPS) took compute to ~166 us.
+#   * The comms floor is genuinely arm-side, not host-side. Read-only
+#     RefreshFeedback round-trips at 435 us mean / 834 us max over 3000 frames.
+#     Two candidate host-side causes were tested and RULED OUT: pure-Python
+#     protobuf (serialize 12 us + parse 72 us, and forcing the cpp backend just
+#     crashes on 3.5.1 descriptors), and CPU C-states/governor (REAL-1 idles at
+#     'powersave' with a 1048 us C3 exit latency, but pinning all cores awake at
+#     5.5 GHz moved the round trip 408 -> 413 us, i.e. not at all).
+#   * The remaining ~480 us gap between Refresh and RefreshFeedback is the arm
+#     consuming the command at its own cycle boundary. The only lever left is to
+#     stop blocking on it: RouterClientSendOptions(andForget=True) and the
+#     send-only RefreshCommand() both exist on this API and are unused.
+#
 # What this DID break, until fixed on 2026-08-11: every integrator advanced by a
 # nominal 1/rate per cycle while only 833 cycles happened per second, so the
 # gravity trim, the joint integral trim and the re-anchor blend all integrated
@@ -375,6 +396,25 @@ DT_MEAS_MAX_FACTOR = 5.0     # x nominal dt
 # cycle but catches a genuine stall. The warning stays rate-limited to one line
 # every 2 s, and the exit summary reports the achieved rate unconditionally.
 SLOW_CYCLE_WARN_FACTOR = 1.5
+
+# Cyclic-frame send timeout (ms). The Kortex default is timeout_ms=10000, and
+# impedance.py never passed a RouterClientSendOptions, so it inherited it: ONE
+# lost UDP frame blocked the torque loop for TEN SECONDS with the arm in
+# LOW_LEVEL_SERVOING and its position safety envelope disabled. The `finally`
+# that restores POSITION mode cannot run until that call returns, so the failure
+# mode was "arm holds whatever torque it last got, and the recovery path is
+# unreachable". Kinova's own low-level examples use 3 ms.
+#
+# BaseCyclicClient.Refresh waits on a concurrent.futures.Future with this as the
+# deadline, so an expiry raises FutureTimeoutError -- caught in the loop below.
+# The achieved period is ~1.2 ms (see DEFAULT_RATE_HZ), so 3 ms absorbs a merely
+# LATE frame while still failing fast on a lost one.
+CYCLIC_TIMEOUT_MS = 3.0
+# Consecutive timed-out frames tolerated before aborting. A single drop on a
+# 50k-frame run should not end the run; a persistent stall must. Each retry
+# recomputes from the last good feedback, so this is bounded staleness
+# (3 x ~1.2 ms) rather than an open-ended hang.
+MAX_CYCLIC_TIMEOUTS = 3
 
 # Safety envelope: abort if any joint spins faster than this (rad/s).
 MAX_JOINT_SPEED = 1.5
@@ -513,6 +553,8 @@ class KinDynModel:
         self._scratch_cor = kdl.JntArray(self.n)
         # Two slots, because `coriolis` needs q and dq live at the same time.
         self._scratch_jnt = (kdl.JntArray(self.n), kdl.JntArray(self.n))
+        # Non-adjacent capsule pair indices, keyed by capsule count.
+        self._pair_cache = {}
 
     # -- vendored from kdl_parser_py (treeFromUrdfModel), rotation of the
     #    inertial origin dropped (URDF inertials here are axis-aligned) --------
@@ -725,6 +767,11 @@ class KinDynModel:
 
         The polyline connecting these points is the capsule model's spine;
         consecutive points define one link capsule each.
+
+        Returns an (m, 3) array. The de-duplication threshold compares
+        consecutive segment ORIGINS, whose separation is fixed by the URDF joint
+        offsets and does not depend on q, so `m` is constant for a given chain
+        -- but `_capsule_pairs` keys its cache on it rather than assuming so.
         """
         ja = self._to_jnt(q)
         frame = self.kdl.Frame()
@@ -734,7 +781,25 @@ class KinDynModel:
             p = np.array([frame.p[i] for i in range(3)])
             if not pts or np.linalg.norm(p - pts[-1]) > 0.02:
                 pts.append(p)
-        return pts
+        return np.asarray(pts)
+
+    def _capsule_pairs(self, ncap):
+        """Cached (i, j) index arrays for the non-adjacent capsule pairs.
+
+        Adjacent capsules share a joint and always touch, so only j >= i + 2 is
+        checked. The pair set depends solely on the capsule COUNT, so it is
+        built once and reused every cycle instead of being re-enumerated.
+        """
+        idx = self._pair_cache.get(ncap)
+        if idx is None:
+            pairs = [(i, j) for i in range(ncap) for j in range(i + 2, ncap)]
+            if pairs:
+                ii, jj = (np.array(x, dtype=np.intp) for x in zip(*pairs))
+            else:
+                ii = jj = np.empty(0, dtype=np.intp)
+            idx = (ii, jj)
+            self._pair_cache[ncap] = idx
+        return idx
 
     def collision_cost(self, q):
         """Quadratic-hinge self-collision potential over non-adjacent capsules.
@@ -742,17 +807,22 @@ class KinDynModel:
         Rises smoothly from zero as any non-adjacent link pair's surface
         clearance drops below COLLISION_MARGIN. Adjacent capsules share a joint
         (always touch), so they are skipped.
+
+        Vectorised over all pairs at once (see `_segment_distance_batch`); the
+        equivalent Python double loop was 66% of the control cycle's compute.
         """
         pts = self.centerline(q)
-        caps = list(zip(pts[:-1], pts[1:]))
-        two_r = 2.0 * self.CAPSULE_RADIUS
-        H = 0.0
-        for i in range(len(caps)):
-            for j in range(i + 2, len(caps)):
-                surf = _segment_distance(*caps[i], *caps[j]) - two_r
-                if surf < self.COLLISION_MARGIN:
-                    H += 0.5 * (self.COLLISION_MARGIN - surf) ** 2
-        return H
+        if len(pts) < 3:
+            return 0.0
+        P, Q = pts[:-1], pts[1:]
+        ii, jj = self._capsule_pairs(len(P))
+        if ii.size == 0:
+            return 0.0
+        surf = (_segment_distance_batch(P[ii], Q[ii], P[jj], Q[jj])
+                - 2.0 * self.CAPSULE_RADIUS)
+        # Quadratic hinge: only clearances inside the margin contribute.
+        v = np.maximum(0.0, self.COLLISION_MARGIN - surf)
+        return 0.5 * float(v @ v)
 
     def collision_gradient(self, q, eps=1e-4):
         """-d(collision_cost)/dq direction points toward greater clearance.
@@ -886,6 +956,65 @@ def _segment_distance(p1, q1, p2, q2):
             elif t > 1.0:
                 t, s = 1.0, np.clip((b - c) / a, 0.0, 1.0)
     return float(np.linalg.norm((p1 + s * d1) - (p2 + t * d2)))
+
+
+def _segment_distance_batch(P1, Q1, P2, Q2):
+    """Vectorised `_segment_distance` over K segment pairs at once.
+
+    Same algorithm (Ericson, ClosestPtSegmentSegment), with every scalar branch
+    rewritten as a `np.where` select so all K pairs are solved in one pass.
+
+    This exists because the scalar version, called from a Python double loop,
+    was the single most expensive thing in the 1 kHz control cycle: 195.6 us
+    per `collision_cost`, i.e. ~66% of all control compute and ~16% of the
+    whole 1.2 ms cycle (measured on REAL-1, 2026-08-26). Batched, the same
+    query costs 59.3 us and returns bit-identical costs.
+
+    Args:
+        P1, Q1 (np.ndarray): (K, 3) endpoints of the first segment of each pair
+        P2, Q2 (np.ndarray): (K, 3) endpoints of the second segment
+
+    Returns:
+        np.ndarray: (K,) minimum distance for each pair
+    """
+    d1, d2, r = Q1 - P1, Q2 - P2, P1 - P2
+    a = np.einsum("ij,ij->i", d1, d1)
+    e = np.einsum("ij,ij->i", d2, d2)
+    f = np.einsum("ij,ij->i", d2, r)
+    b = np.einsum("ij,ij->i", d1, d2)
+    c = np.einsum("ij,ij->i", d1, r)
+    eps = 1e-9
+
+    # Guarded denominators: the np.where SELECTS the right branch, but both
+    # branches are evaluated, so every divisor has to be finite everywhere or
+    # numpy warns (and propagates NaN into the selected branch's neighbours).
+    a_ok = np.where(a > eps, a, 1.0)
+    e_ok = np.where(e > eps, e, 1.0)
+    denom = a * e - b * b
+    denom_ok = np.where(denom > eps, denom, 1.0)
+
+    # General case: both segments non-degenerate.
+    s = np.where(denom > eps, np.clip((b * f - c * e) / denom_ok, 0.0, 1.0), 0.0)
+    t = (b * s + f) / e_ok
+    # Re-clamp s wherever the unclamped t left [0, 1] (the scalar version's
+    # `if t < 0` / `elif t > 1` arms).
+    s = np.where(t < 0.0, np.clip(-c / a_ok, 0.0, 1.0), s)
+    s = np.where(t > 1.0, np.clip((b - c) / a_ok, 0.0, 1.0), s)
+    t = np.clip(t, 0.0, 1.0)
+
+    # Degenerate arms, applied last so they win over the general case.
+    first_pt = a <= eps                       # segment 1 is a point
+    s = np.where(first_pt, 0.0, s)
+    t = np.where(first_pt, np.clip(f / e_ok, 0.0, 1.0), t)
+    second_pt = (e <= eps) & ~first_pt        # segment 2 is a point
+    t = np.where(second_pt, 0.0, t)
+    s = np.where(second_pt, np.clip(-c / a_ok, 0.0, 1.0), s)
+    both_pt = (a <= eps) & (e <= eps)         # both degenerate
+    s = np.where(both_pt, 0.0, s)
+    t = np.where(both_pt, 0.0, t)
+
+    diff = (P1 + s[:, None] * d1) - (P2 + t[:, None] * d2)
+    return np.sqrt(np.einsum("ij,ij->i", diff, diff))
 
 
 # Joint-limit barrier (null-space): Gen3 joints 1,3,5,7 are CONTINUOUS -- no
@@ -1673,6 +1802,14 @@ def run_impedance(args):
         cyc_max = 0.0
         cyc_min = float("inf")
         cyc_over = 0                # cycles that ran longer than the warn threshold
+        cyc_timeout_run = 0         # CONSECUTIVE timed-out cyclic frames
+        cyc_timeout_total = 0       # timed-out frames over the whole run
+
+        # Bounded cyclic send options (see CYCLIC_TIMEOUT_MS). Built once: the
+        # generated stub's default argument is a single shared instance created
+        # at import time, so passing our own also avoids mutating that.
+        send_opts = RouterClientSendOptions()
+        send_opts.timeout_ms = args.cyclic_timeout_ms
 
         # (F) Loop invariants for the table barrier, hoisted out of the hot loop.
         table_alpha1, table_alpha2 = args.table_alpha
@@ -2104,7 +2241,25 @@ def run_impedance(args):
                     command.actuators[i].position = feedback.actuators[i].position
                     command.actuators[i].torque_joint = float(tau[i])
 
-                feedback = base_cyclic.Refresh(command)
+                # Bounded-latency cyclic exchange. Without an explicit options
+                # object this inherits timeout_ms=10000 and a single lost frame
+                # wedges the torque loop for ten seconds (see CYCLIC_TIMEOUT_MS).
+                try:
+                    feedback = base_cyclic.Refresh(command, 0, send_opts)
+                    cyc_timeout_run = 0
+                except FutureTimeoutError:
+                    cyc_timeout_run += 1
+                    cyc_timeout_total += 1
+                    if cyc_timeout_run >= args.max_cyclic_timeouts:
+                        print(f"\nABORT: {cyc_timeout_run} consecutive cyclic "
+                              f"frames timed out at "
+                              f"{args.cyclic_timeout_ms:g} ms -- the arm is not "
+                              "answering. Restoring position mode.")
+                        break
+                    # Retry immediately against the last good feedback rather
+                    # than ending the run on one dropped datagram. `feedback` is
+                    # deliberately left stale; the next pass recomputes from it.
+                    continue
 
                 now = time.monotonic()
                 if (now - last_warn > 2.0
@@ -2148,6 +2303,8 @@ def run_impedance(args):
                       f"min {cyc_min * 1e3:.3f}  max {cyc_max * 1e3:.3f}")
                 print(f"  over {SLOW_CYCLE_WARN_FACTOR:g}x dt: {cyc_over} "
                       f"cycles ({100.0 * cyc_over / cyc_n:.2f}%)")
+                print(f"  cyclic t/o : {cyc_timeout_total} frame(s) exceeded "
+                      f"{args.cyclic_timeout_ms:g} ms")
 
             # Return to initial position prior to start of script after 3s countdown
             if q0 is not None:
@@ -2340,6 +2497,17 @@ def main():
                    help="Control loop rate (Hz).")
     p.add_argument("--duration", type=float, default=0.0,
                    help="Auto-stop after N seconds (0 = until Ctrl-C).")
+    p.add_argument("--cyclic-timeout-ms", type=float, default=CYCLIC_TIMEOUT_MS,
+                   help="Per-frame timeout (ms) on the low-level cyclic "
+                        "exchange. The Kortex default is 10000, which blocks "
+                        "the torque loop for ten seconds on one lost frame and "
+                        "makes the position-mode restore unreachable. Must "
+                        "exceed the loop period (~1.2 ms achieved).")
+    p.add_argument("--max-cyclic-timeouts", type=int,
+                   default=MAX_CYCLIC_TIMEOUTS,
+                   help="Consecutive timed-out cyclic frames before aborting. "
+                        "Absorbs an isolated dropped datagram without ending "
+                        "the run; a persistent stall still aborts promptly.")
     p.add_argument("--countdown", type=int, default=5,
                    help="Seconds to wait before engaging torque mode.")
     p.add_argument("--ramp-time", type=float, default=1.0,
@@ -2486,6 +2654,17 @@ def main():
                 "integration every cycle and silently disable the trim)")
     if args.log_decimate < 1:
         p.error("--log-decimate must be >= 1")
+    if args.cyclic_timeout_ms <= 0.0:
+        p.error("--cyclic-timeout-ms must be > 0")
+    if args.max_cyclic_timeouts < 1:
+        p.error("--max-cyclic-timeouts must be >= 1")
+    if args.cyclic_timeout_ms < 2.0:
+        # The blocking Refresh round trip measures ~0.9 ms against the real arm
+        # (2026-08-26), so anything under ~2 ms starts timing out healthy
+        # frames and the retry path becomes the normal path.
+        print(f"WARNING: --cyclic-timeout-ms {args.cyclic_timeout_ms:g} is close "
+              "to the measured ~0.9 ms cyclic round trip; healthy frames may "
+              "time out.")
     if args.ki_scale > 0.0 and args.mode != "joint":
         print("NOTE: --ki-scale only affects joint mode; ignored in cartesian.")
     if args.interaction_mode == "render" and args.mode != "cartesian":
