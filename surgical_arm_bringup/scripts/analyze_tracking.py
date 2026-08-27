@@ -264,12 +264,37 @@ def analyse(path, args):
 
     mask, t0 = settled_mask(log, args)
     if mask.sum() < 3:
+        # Diagnose WHY the window is empty, in order. The time cut is checked
+        # first because if it selected nothing, every later test is being asked
+        # about an empty array -- and `np.all([])` is vacuously True, which used
+        # to report a run as "entirely YIELDING" when the real problem was that
+        # --settle-from had been given a value past the end of the run.
+        in_time = t >= t0
+        n_time = int(np.count_nonzero(in_time))
+        span = t[-1] - t[0]
+        if n_time < 3:
+            raise SystemExit(
+                f"{path}: settled window has {mask.sum()} samples -- the settle "
+                f"cut t >= {t0:.1f} s leaves {n_time} of {len(t)} samples, and "
+                f"this run is only {span:.1f} s long.\n"
+                "--settle-from is an ABSOLUTE time in SECONDS (not a percentage "
+                f"and not a fraction). Try --settle-from {max(1.0, 0.3 * span):.0f}, "
+                "or a negative value to count back from the end "
+                f"(--settle-from {-max(1.0, 0.5 * span):.0f}), or --settle-frac "
+                "to give a fraction of the run.")
+
         why = "loosen --settle-from/--settle-frac"
-        if (not args.include_yield and log["engage"] is not None
-                and np.all(log["engage"][t >= t0] < args.engage_min)):
-            why = ("the whole window was YIELDING (hand-guided, task spring "
-                   "softened) -- this run holds nothing to score; "
-                   "--include-yield forces it")
+        if not args.include_yield and log["engage"] is not None:
+            eng = log["engage"][in_time]
+            n_yield = int(np.count_nonzero(eng < args.engage_min))
+            if n_yield == len(eng):
+                why = ("the whole window was YIELDING (hand-guided, task spring "
+                       "softened) -- this run holds nothing to score; "
+                       "--include-yield forces it")
+            elif n_yield:
+                why = (f"{n_yield} of {n_time} samples in the window were "
+                       "YIELDING (hand-guided) and were excluded, leaving too "
+                       "few to score; --include-yield forces them in")
         raise SystemExit(f"{path}: settled window has {mask.sum()} samples -- "
                          f"{why}.")
 
