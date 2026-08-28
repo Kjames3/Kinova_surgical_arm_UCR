@@ -207,11 +207,23 @@ I_CLAMP_FRAC = 0.4          # integral torque capped at this fraction of TAU_MAX
 I_FREEZE_THRESH = 0.12      # rad/s
 
 # --- Cartesian-space gains (operational space) -------------------------------
-# Task stiffness: [x, y, z] in N/m, [rx, ry, rz] in Nm/rad. Damping is derived
-# from a unit apparent inertia (the Lambda weighting makes the task ~unit-mass),
-# D = 2 * zeta * sqrt(K). Conservative defaults; scale with --kp-scale/--kd-scale.
-KP_CART_POS = np.array([200.0, 200.0, 200.0])   # N/m
-KP_CART_ORI = np.array([20.0, 20.0, 20.0])      # Nm/rad
+# Task stiffness PER UNIT APPARENT MASS, because the Lambda weighting makes the
+# task behave as unit-inertia: these are 1/s^2 (linear) and 1/s^2 (angular), NOT
+# N/m and Nm/rad as they were labelled until 2026-08-26. Read them as squared
+# natural frequencies -- KP_CART_POS = 200 is sqrt(200) = 14.1 rad/s, i.e. about
+# 2.25 Hz of impedance bandwidth, which is the quantity actually being tuned.
+#
+# The stiffness a hand FEELS is Lambda * K, so it is configuration-dependent:
+# with Lambda's translational eigenvalues measured at 1.68-15 kg over the
+# workspace (REAL-1, 2026-08-26), KP_CART_POS = 200 renders anywhere from
+# ~340 N/m to ~3000 N/m. That is the standard operational-space tradeoff --
+# config-independent DYNAMICS in exchange for config-dependent stiffness -- and
+# it is worth knowing when a hold feels different in a different posture.
+#
+# Damping is derived with D = 2 * zeta * sqrt(K) from the FINAL scaled stiffness
+# (see critical_damping). Scale with --cart-scale.
+KP_CART_POS = np.array([200.0, 200.0, 200.0])   # 1/s^2  (linear)
+KP_CART_ORI = np.array([20.0, 20.0, 20.0])      # 1/s^2  (angular)
 CART_DAMPING_RATIO = 1.0
 
 # Null-space posture gains (redundant DOF): pull toward the startup posture q0
@@ -245,9 +257,49 @@ K_LIMIT = 25.0               # Nm/rad, joint-limit barrier stiffness
 # 1.4e-13. This was still ~66% of all control compute before the change.
 COLLIDE_EPS = 1e-4           # finite-difference step (rad); was collision_gradient's default
 
-# Cartesian safety limits.
-MAX_CART_FORCE = 80.0        # N   -- clamp task force magnitude per axis
-MAX_CART_TORQUE = 15.0       # Nm  -- clamp task moment per axis
+# --- Cartesian safety limits -------------------------------------------------
+# THE UNITS HERE WERE WRONG UNTIL 2026-08-26, and the startup banner repeated
+# the error to the operator ("cart clamp: F<80 N").
+#
+# In the Lambda-weighted operational-space law the impedance term is
+#
+#     F   = kp_cart * x_err - kd_cart * xdot        <- NOT a force
+#     tau = Jᵀ * (Lambda @ F + f_extra)
+#
+# Lambda is an inertia (kg), so for `Lambda @ F` to come out in newtons, F must
+# be an ACCELERATION in m/s^2, and kp_cart is a stiffness-per-unit-apparent-mass
+# in 1/s^2 (KP_CART_POS = 200 => sqrt(200) = 14.1 rad/s ~ 2.25 Hz of impedance
+# bandwidth, which is the number that is actually being tuned).
+#
+# Measured on REAL-1 (2026-08-26): Lambda's translational eigenvalues run
+# 1.68 kg (median 1.76) up to 15 kg at p95 and 1910 kg near a singularity, so at
+# the surgical home pose the "80 N" clamp really permitted 139-306 N of EE force
+# depending on axis -- 3-4x what it claimed, and configuration-dependent.
+MAX_IMP_ACC_LIN = 80.0       # m/s^2   -- clamp on the impedance term F, linear
+# 25.0, not the 15.0 this constant held until 2026-08-26. The CLI default had
+# already been raised to 25.0 on hardware ("the old hard-coded 15 let
+# orientation run away past ~21 deg"), but main() pushed that into a module
+# GLOBAL, so only the robot saw it -- sim_impedance_mujoco.py imports
+# cartesian_impedance_torque directly and kept getting 15.0. The bench that
+# validates the control law was validating a different law. The CLI default now
+# references this constant so the two cannot drift apart again.
+MAX_IMP_ACC_ANG = 25.0       # rad/s^2 -- clamp on the impedance term F, angular
+
+# The render-mode virtual-mass term (Km * acc) is a genuine wrench and used to
+# share the constants above, so one clamp was bounding two different physical
+# quantities. Same numbers as before, kept separate and correctly labelled.
+MAX_RENDER_FORCE = 80.0      # N   -- clamp on the raw injected wrench
+MAX_RENDER_TORQUE = 15.0     # Nm  -- ditto, moment
+
+# The actual end-effector wrench ceiling. Nothing bounded this before: TAU_MAX
+# bounds JOINT torque, which is not the same thing once Lambda and Jᵀ are in the
+# path. Replaying the 2026-08-26 hold run, the peak real EE force was 20.9 N and
+# the peak |F| was 5.83 m/s^2 against a clamp of 80 -- i.e. the old clamp never
+# came near binding. These are sized as a backstop that stays out of the way in
+# normal operation while giving the operator a number that means what it says.
+MAX_EE_FORCE = 150.0         # N
+MAX_EE_TORQUE = 30.0         # Nm
+
 MIN_MANIPULABILITY = 1e-3    # sqrt(det(J Jᵀ)); logged only -- see below
 
 # --- Singularity handling (cartesian mode) -----------------------------------
@@ -1273,7 +1325,8 @@ def sigma_min_gradient(model, q, eps=SING_GRAD_EPS, column=None, base=None):
 def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
                                kp_cart, kd_cart, kp_null, kd_null, tau_g,
                                tau_collide, k_limit, f_task_extra=None,
-                               state=None, dyn=None, tau_sing=0.0):
+                               state=None, dyn=None, tau_sing=0.0,
+                               acc_max=None, wrench_max=None):
     """Operational-space impedance torque (ported from Kuka opspace).
 
     Task spring-damper on the EE pose, mapped through Lambda and Jᵀ, with a
@@ -1299,6 +1352,14 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     caller already evaluated this cycle (the re-anchor watchdog needs both), so
     the model is not queried twice per 1 kHz cycle.
 
+    ``acc_max`` ``(lin, ang)`` overrides the clamp on the impedance ACCELERATION
+    command F, and ``wrench_max`` ``(lin, ang)`` the ceiling on the resulting EE
+    wrench. Both default to the module constants. They are parameters rather
+    than module globals because ``sim_impedance_mujoco.py`` imports this function
+    directly: the old ``global MAX_CART_TORQUE`` assignment in ``main()`` meant
+    the simulator silently validated the control law at 15.0 while the robot ran
+    it at the ``--max-cart-torque`` default of 25.0.
+
     ``dyn`` (optional ``(M, Minv)``) does the same for the joint-space inertia,
     which the table barrier also needs to invert its torque. Building M costs a
     KDL call plus an n^2 Python read-back loop and inverting it is another
@@ -1315,10 +1376,14 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     x_err = np.concatenate([p_des - p_cur, orientation_error(quat_des, quat_cur)])
     xdot = J @ dq                               # 6
 
-    # Desired task wrench (impedance), clamped for safety.
+    # Desired task ACCELERATION (impedance), clamped for safety. This is not a
+    # force -- it becomes one only after the Lambda weighting below. See the
+    # MAX_IMP_ACC_* block.
+    acc_lin, acc_ang = (MAX_IMP_ACC_LIN, MAX_IMP_ACC_ANG) if acc_max is None \
+        else acc_max
     F = kp_cart * x_err - kd_cart * xdot
-    F[:3] = np.clip(F[:3], -MAX_CART_FORCE, MAX_CART_FORCE)
-    F[3:] = np.clip(F[3:], -MAX_CART_TORQUE, MAX_CART_TORQUE)
+    F[:3] = np.clip(F[:3], -acc_lin, acc_lin)
+    F[3:] = np.clip(F[3:], -acc_ang, acc_ang)
 
     # Operational-space inertia Lambda = (J M^-1 Jᵀ)^-1, with pinv fallback.
     if dyn is None:
@@ -1336,15 +1401,29 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     manip = float(np.sqrt(max(np.linalg.det(J @ J.T), 0.0)))
     Lambda, lam_damp = damped_lambda(Lambda_inv, sigma_min)
 
-    # Optional extra raw task wrench (render-mode virtual mass Km*acc), clamped
-    # like F, added inside the Jᵀ map but NOT Lambda-weighted (it is a force).
+    # Lambda weighting turns the commanded acceleration into a wrench. From here
+    # on the quantity really is in newtons / newton-metres.
+    wrench = Lambda @ F
+
+    # Optional extra RAW task wrench (render-mode virtual mass Km*acc), added
+    # inside the Jᵀ map but NOT Lambda-weighted -- it is already a force, which
+    # is why it gets its own limits rather than sharing the acceleration clamp.
     if f_task_extra is not None:
         fe = np.asarray(f_task_extra, dtype=float).copy()
-        fe[:3] = np.clip(fe[:3], -MAX_CART_FORCE, MAX_CART_FORCE)
-        fe[3:] = np.clip(fe[3:], -MAX_CART_TORQUE, MAX_CART_TORQUE)
-        tau = J.T @ (Lambda @ F + fe)
-    else:
-        tau = J.T @ (Lambda @ F)
+        fe[:3] = np.clip(fe[:3], -MAX_RENDER_FORCE, MAX_RENDER_FORCE)
+        fe[3:] = np.clip(fe[3:], -MAX_RENDER_TORQUE, MAX_RENDER_TORQUE)
+        wrench = wrench + fe
+
+    # TRUE end-effector wrench ceiling. Applied last, to the total, so it bounds
+    # what the tool can actually exert regardless of how Lambda scaled the
+    # impedance term -- the thing the old "cart clamp" was mistakenly believed
+    # to be doing.
+    w_lin, w_ang = (MAX_EE_FORCE, MAX_EE_TORQUE) if wrench_max is None \
+        else wrench_max
+    wrench[:3] = np.clip(wrench[:3], -w_lin, w_lin)
+    wrench[3:] = np.clip(wrench[3:], -w_ang, w_ang)
+
+    tau = J.T @ wrench
 
     # Null-space secondary task: posture PD toward q0 + joint-limit barrier +
     # self-collision repulsion, all damped and projected into the null space.
@@ -1952,8 +2031,11 @@ def run_impedance(args):
             if args.interaction_mode != "free" and args.wrist_anchor > 0.0:
                 print(f"  wrist anch: {args.wrist_anchor} Nm/rad direct on "
                       f"cont. joints 1,3,5,7 (un-projected anti-creep)")
-            print(f"  cart clamp: F<{MAX_CART_FORCE:.0f} N  M<{MAX_CART_TORQUE:.0f} "
-                  f"Nm (task force/moment saturation)")
+            print(f"  imp clamp : |a|<{acc_max[0]:.0f} m/s2  "
+                  f"|alpha|<{acc_max[1]:.0f} rad/s2 (commanded task "
+                  f"ACCELERATION, pre-Lambda)")
+            print(f"  EE wrench : |F|<{wrench_max[0]:.0f} N  "
+                  f"|M|<{wrench_max[1]:.0f} Nm (the actual tool force ceiling)")
         print(f"  gravity FF: {args.gravity} x{args.gravity_scale} "
               f"{np.round(tau_g0, 2)}")
         if args.mode == "cartesian" and args.gravity_trim > 0.0:
@@ -2076,6 +2158,11 @@ def run_impedance(args):
         # at import time, so passing our own also avoids mutating that.
         send_opts = RouterClientSendOptions()
         send_opts.timeout_ms = args.cyclic_timeout_ms
+
+        # Task limits, resolved once. The impedance clamp is on the commanded
+        # ACCELERATION; the wrench clamp is the real EE force/moment ceiling.
+        acc_max = (MAX_IMP_ACC_LIN, args.max_cart_torque)
+        wrench_max = (args.max_ee_force, args.max_ee_torque)
 
         # (F) Loop invariants for the table barrier, hoisted out of the hot loop.
         table_alpha1, table_alpha2 = args.table_alpha
@@ -2333,7 +2420,8 @@ def run_impedance(args):
                             task_kp, task_kd, kp_null * engage, kd_null, tau_g,
                             tau_collide, K_LIMIT, f_task_extra=f_extra,
                             state=(p_cur, quat_cur, J),
-                            dyn=(M_cyc, Minv_cyc), tau_sing=tau_sing)
+                            dyn=(M_cyc, Minv_cyc), tau_sing=tau_sing,
+                            acc_max=acc_max, wrench_max=wrench_max)
 
                         # Null-space singularity escape: advance ONE column of
                         # the d(sigma_min)/dq finite difference per cycle and
@@ -2820,11 +2908,29 @@ def main():
     p.add_argument("--yield-blend", type=float, default=YIELD_BLEND_TIME,
                    help="[re-anchor] Seconds to fade stiffness between the "
                         "yielded and full level (0 = instant step -- jerky).")
-    p.add_argument("--max-cart-torque", type=float, default=25.0,
-                   help="[cartesian] Per-axis clamp on the task MOMENT (Nm). The "
-                        "orientation spring saturates here, so too low a value "
-                        "caps wrist authority regardless of --cart-scale (the old "
-                        "hard-coded 15 let orientation run away past ~21 deg).")
+    p.add_argument("--max-cart-torque", type=float, default=MAX_IMP_ACC_ANG,
+                   metavar="ALPHA",
+                   help="[cartesian] Per-axis clamp on the ANGULAR part of the "
+                        "commanded task acceleration, in rad/s^2 -- NOT a moment "
+                        "in Nm, despite the flag name (kept for compatibility). "
+                        "It is clamped before the Lambda weighting, so the "
+                        "moment it produces is Lambda*this. The orientation "
+                        "spring saturates here, so too low a value caps wrist "
+                        "authority regardless of --cart-scale (the old "
+                        "hard-coded 15 let orientation run away past ~21 deg). "
+                        "For a real moment ceiling use --max-ee-torque.")
+    p.add_argument("--max-ee-force", type=float, default=MAX_EE_FORCE,
+                   metavar="N",
+                   help="[cartesian] Ceiling on the actual end-effector FORCE "
+                        "(N), applied to the total task wrench after the Lambda "
+                        "weighting. Nothing bounded this before -- TAU_MAX "
+                        "bounds joint torque, which is not the same thing. The "
+                        "default is a backstop: the measured peak in a normal "
+                        "hold run is ~21 N.")
+    p.add_argument("--max-ee-torque", type=float, default=MAX_EE_TORQUE,
+                   metavar="NM",
+                   help="[cartesian] The same ceiling for the end-effector "
+                        "MOMENT (Nm).")
     p.add_argument("--gravity", choices=["startup", "none", "model", "hybrid"],
                    default=None,
                    help="Gravity feedforward source. Default: 'hybrid' in "
@@ -2976,12 +3082,6 @@ def main():
     if args.gravity is None:
         args.gravity = "hybrid" if args.mode == "cartesian" else "startup"
 
-    # Apply the configurable task-moment clamp (read as a module global inside
-    # cartesian_impedance_torque). The per-joint TAU_MAX clamp still bounds the
-    # final command, so raising this cannot exceed the actuators' torque limits.
-    global MAX_CART_TORQUE
-    MAX_CART_TORQUE = args.max_cart_torque
-
     if args.q_des is not None and len(args.q_des) < len(KP_JOINT):
         p.error(f"--q-des needs {len(KP_JOINT)} values, got {len(args.q_des)}")
 
@@ -2993,6 +3093,10 @@ def main():
         p.error("--wrist-anchor must be >= 0")
     if args.max_cart_torque <= 0.0:
         p.error("--max-cart-torque must be > 0")
+    if args.max_ee_force <= 0.0:
+        p.error("--max-ee-force must be > 0")
+    if args.max_ee_torque <= 0.0:
+        p.error("--max-ee-torque must be > 0")
     if args.reanchor_time < 0.0:
         p.error("--reanchor-time must be >= 0 (0 disables re-anchoring)")
     if not 0.0 <= args.yield_scale <= 1.0:
