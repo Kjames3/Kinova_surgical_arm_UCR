@@ -26,6 +26,53 @@ returns joint-space quantities.
 import numpy as np
 
 
+def compute_hocbf_rows(h1, h1_dot, Jh, drift, alpha1=10.0, alpha2=10.0):
+    """Second-order CBF rows ``A @ ddq <= b`` for any barrier ``h1(q) >= 0``.
+
+    This is the algebra every barrier in this module shares. A barrier on
+    configuration alone has relative degree 2 with respect to joint
+    acceleration, so one differentiation is not enough to expose ``ddq``:
+
+        h2      = h1_dot + alpha1 * h1
+        enforce   h2_dot + alpha2 * h2 >= 0
+
+    with ``h1_ddot = Jh @ ddq + drift``. Substituting and rearranging:
+
+        A = -Jh
+        b =  drift + alpha1 * h1_dot + alpha2 * h2
+
+    Callers differ only in how they build ``Jh`` and ``drift``. For the table
+    those are row 2 of the Jacobian and the z-component of ``dJ @ dq``; for a
+    distance barrier the normal rotates as the arm moves, so ``Jh`` is
+    ``n^T J_v`` and ``drift`` picks up a curvature term as well. Getting
+    ``drift`` wrong does not break the constraint's *form*, which is what makes
+    it a dangerous place for an error -- the QP still solves, the arm still
+    moves, and the guarantee is quietly only approximate.
+
+    Args:
+        h1 (array_like): (m,) barrier value; positive is safe.
+        h1_dot (array_like): (m,) its time derivative, ``Jh @ dq``.
+        Jh (array_like): (m, n) gradient of h1 with respect to q.
+        drift (array_like): (m,) the part of ``h1_ddot`` independent of ``ddq``.
+        alpha1, alpha2 (float): HOCBF gains, both > 0. Larger = tolerates a
+            faster approach and intervenes later and harder.
+
+    Returns:
+        A (np.ndarray): (m, n) constraint matrix
+        b (np.ndarray): (m,) constraint vector
+    """
+    h1 = np.atleast_1d(np.asarray(h1, dtype=float))
+    h1_dot = np.atleast_1d(np.asarray(h1_dot, dtype=float))
+    Jh = np.atleast_2d(np.asarray(Jh, dtype=float))
+    drift = np.atleast_1d(np.asarray(drift, dtype=float))
+
+    h2 = h1_dot + alpha1 * h1
+
+    A = -Jh
+    b = drift + alpha1 * h1_dot + alpha2 * h2
+    return A, b
+
+
 def compute_table_hocbf_rows(z, J_z, dJdq_z, dq, z_min,
                              alpha1=10.0, alpha2=10.0):
     """Build the HOCBF rows ``A @ ddq <= b`` keeping points above ``z_min``.
@@ -67,11 +114,12 @@ def compute_table_hocbf_rows(z, J_z, dJdq_z, dq, z_min,
 
     h1 = z - z_min                 # (m,) clearance
     h1_dot = J_z @ dq              # (m,) vertical speed of each point
-    h2 = h1_dot + alpha1 * h1
 
-    A = -J_z
-    b = dJdq_z + alpha1 * h1_dot + alpha2 * h2
-    return A, b
+    # A plane is the one obstacle whose normal never rotates, so its gradient
+    # is just the Jacobian's z row and its drift is just dJ@dq -- no curvature
+    # term. That degeneracy is what keeps this function so short; do not read
+    # it as the general case.
+    return compute_hocbf_rows(h1, h1_dot, J_z, dJdq_z, alpha1, alpha2)
 
 
 # NOTE: a single-point wrapper (`compute_table_hocbf_constraints`, taking a
@@ -80,6 +128,124 @@ def compute_table_hocbf_rows(z, J_z, dJdq_z, dq, z_min,
 # for it expecting table avoidance would have silently dropped the elbow and
 # forearm. Guard every link through `compute_table_hocbf_rows` instead -- pass
 # `J_full[2, :]` and `(dJ_full[2, :] @ dq)` if you already hold full matrices.
+
+
+def compute_obstacle_hocbf_rows(p, J_v, dJdq_v, dq, centers, radii, heights,
+                                link_radii=0.0, alpha1=10.0, alpha2=10.0,
+                                d_min=1e-3):
+    """HOCBF rows keeping monitored points clear of vertical capsule obstacles.
+
+    One row per (monitored point, obstacle) pair, in point-major order: pair
+    ``(i, j)`` is row ``i * n_obstacles + j``. Stack the result under the table
+    rows and the torque rows before calling `filter_control_qp`.
+
+    Each obstacle is a vertical capsule: a segment from ``centers[j]`` rising
+    ``heights[j]`` along +z, inflated by ``radii[j]``. That one primitive
+    covers the three cases we care about, and the code below needs no branches
+    for them beyond the closest-point clamp:
+
+        heights[j] == 0    sphere
+        heights[j] == inf  cylinder, infinite upward
+        otherwise          finite capsule -- the arm can reach over the top
+
+    Reaching over matters. An obstacle modelled as an infinite cylinder walls
+    off the whole column above a 10 cm object, which on a tabletop forbids most
+    of the useful workspace; the surgical descent comes from directly above.
+
+    Why the barrier is not just ``distance - radius`` differentiated twice:
+    unlike the table, the contact normal ROTATES as the arm moves. That adds a
+    curvature term to the drift,
+
+        (v_t^T v_t) / d      with v_t the component of the point's velocity
+                             tangential to the normal
+
+    which is the centrifugal relief you get from swinging around an obstacle
+    rather than driving at it. It is strictly non-negative, so omitting it
+    makes the filter *more* conservative rather than unsafe -- but it is the
+    same class of silent modelling error as the old ``zeros()`` stand-in for
+    ``dJ @ dq``, which mis-stated the barrier by up to 0.77 m/s^2, and it grows
+    with the square of speed. `validate_obstacle_barrier.py` measures it.
+
+    Args:
+        p (array_like): (m, 3) monitored point positions, base frame.
+        J_v (array_like): (m, 3, n) linear-velocity Jacobian of each point.
+        dJdq_v (array_like): (m, 3) the ``dJ @ dq`` product for each point.
+            Passing zeros makes the guarantee approximate, exactly as it does
+            for the table barrier.
+        dq (array_like): (n,) joint velocities.
+        centers (array_like): (k, 3) capsule base points, base frame.
+        radii (array_like): (k,) capsule radii.
+        heights (array_like): (k,) capsule heights along +z; 0 or inf allowed.
+        link_radii (array_like): (m,) or scalar radius of each monitored point,
+            added to the obstacle radius so the LINK SURFACE is guarded, not
+            its centreline. Matches `--table-link-radius`.
+        alpha1, alpha2 (float): HOCBF gains, both > 0.
+        d_min (float): floor on the centre distance used to form the normal.
+            Below it the contact normal is undefined; see ``degenerate`` in the
+            returned info.
+
+    Returns:
+        A (np.ndarray): (m*k, n) constraint matrix
+        b (np.ndarray): (m*k,) constraint vector
+        info (dict): ``h`` (m, k) signed clearance, negative means already
+            penetrating; ``d`` (m, k) centre distance; ``degenerate`` (int)
+            number of pairs closer than ``d_min``, where the row is
+            meaningless and the caller must not treat it as protection.
+    """
+    p = np.atleast_2d(np.asarray(p, dtype=float))
+    J_v = np.asarray(J_v, dtype=float)
+    if J_v.ndim == 2:
+        J_v = J_v[None, :, :]
+    dJdq_v = np.atleast_2d(np.asarray(dJdq_v, dtype=float))
+    dq = np.asarray(dq, dtype=float)
+    centers = np.atleast_2d(np.asarray(centers, dtype=float))
+    radii = np.atleast_1d(np.asarray(radii, dtype=float))
+    heights = np.atleast_1d(np.asarray(heights, dtype=float))
+    link_radii = np.broadcast_to(
+        np.asarray(link_radii, dtype=float), (p.shape[0],))
+
+    # Closest point on each capsule axis. Clamping the height parameter is what
+    # turns the cylinder into a capsule, and it also decides the normal's
+    # geometry: on the shaft the normal is horizontal, past an end cap it is
+    # fully 3-D. Track that as a mask rather than branching.
+    t = p[:, None, 2] - centers[None, :, 2]                    # (m, k)
+    s = np.clip(t, 0.0, heights[None, :])
+    closest = np.broadcast_to(centers[None, :, :], (p.shape[0],) + centers.shape).copy()
+    closest[:, :, 2] = centers[None, :, 2] + s
+
+    e = p[:, None, :] - closest                                # (m, k, 3)
+    d_true = np.linalg.norm(e, axis=2)                         # (m, k)
+    d = np.maximum(d_true, d_min)
+    normal = e / d[:, :, None]
+
+    # On the shaft the closest point slides with the monitored point, so the
+    # z-component of motion neither closes nor opens the gap and must be
+    # projected out. Past a cap the closest point is pinned and every axis
+    # counts. Same distinction, applied to velocity and to dJ@dq.
+    on_shaft = (t > 0.0) & (t < heights[None, :])              # (m, k)
+    axis_mask = np.ones((p.shape[0], centers.shape[0], 3))
+    axis_mask[:, :, 2] = np.where(on_shaft, 0.0, 1.0)
+
+    h1 = d_true - (radii[None, :] + link_radii[:, None])       # (m, k)
+
+    v = np.einsum('icn,n->ic', J_v, dq)                        # (m, 3)
+    v_eff = v[:, None, :] * axis_mask                          # (m, k, 3)
+    h1_dot = np.einsum('ijc,ijc->ij', normal, v_eff)           # (m, k)
+
+    Jh = np.einsum('ijc,icn->ijn', normal, J_v)                # (m, k, n)
+
+    drift_lin = np.einsum('ijc,ijc->ij', normal,
+                          dJdq_v[:, None, :] * axis_mask)
+    # Tangential speed squared over distance: |v_eff|^2 - (n . v_eff)^2.
+    curvature = (np.einsum('ijc,ijc->ij', v_eff, v_eff) - h1_dot ** 2) / d
+    drift = drift_lin + curvature
+
+    n_joints = J_v.shape[2]
+    A, b = compute_hocbf_rows(h1.reshape(-1), h1_dot.reshape(-1),
+                              Jh.reshape(-1, n_joints), drift.reshape(-1),
+                              alpha1, alpha2)
+    info = {"h": h1, "d": d_true, "degenerate": int(np.sum(d_true < d_min))}
+    return A, b, info
 
 
 def torque_limit_rows(M, tau_bias, tau_max):
