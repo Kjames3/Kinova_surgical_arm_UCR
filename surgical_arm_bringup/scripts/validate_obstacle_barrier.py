@@ -18,6 +18,16 @@ Checks:
   7. degenerate cases are reported, not silently passed off as protection
   8. timing at a realistic point x obstacle count
 
+Then, only where urdf_parser_py exists (the robot machine), the same barrier
+against the REAL arm chain and KDL's exact dJ@dq:
+
+  9.  point_barrier_terms agrees bit-identically with height_barrier_terms
+  10. Jh == d(h)/dq on the real chain
+  11. drift == (dJh/dt) @ dq, against an exact dJ@dq rather than another
+      finite difference
+  12. determinism under KDL scratch reuse
+  13. real-chain hot-loop cost
+
 Run:  python3 validate_obstacle_barrier.py
 """
 import os
@@ -397,6 +407,154 @@ for _ in range(REP):
     compute_obstacle_hocbf_rows(Pm, Jm, dJm, dqm, cm, rm, hm, 0.055)
 us = (time.perf_counter() - t0) / REP * 1e6
 check(f"row build under 150 us", us < 150.0, f"{us:.1f} us for {m*k} rows")
+
+# ── 9-13. the REAL arm: URDF + KDL ──────────────────────────────────────────
+# Everything above deliberately used a synthetic chain so a KDL bug and a
+# barrier bug could not land in the same number. That leaves one gap: nothing
+# has checked the obstacle barrier against THIS arm. These need urdf_parser_py,
+# which only the robot machine has, so they skip cleanly on the laptop.
+print("\n" + "=" * 60)
+try:
+    import impedance as imp                                    # noqa: E402
+    model = imp.KinDynModel(imp.DEFAULT_URDF, imp.DEFAULT_BASE_LINK,
+                            imp.DEFAULT_TIP_LINK)
+except Exception as exc:                                       # noqa: BLE001
+    print(f"REAL-CHAIN CHECKS SKIPPED ({type(exc).__name__}: {exc})")
+    print("Run these on REAL-1, where urdf_parser_py is available.")
+    model = None
+
+if model is not None:
+    links = [nm for nm in imp.DEFAULT_TABLE_LINKS if nm in model.segment_names()]
+    segs = [model.segment_index(nm) for nm in links]
+    nq = model.n
+    print(f"REAL CHAIN: {nq} joints, {len(links)} guarded links: "
+          + ", ".join(nm.replace("gen3_", "") for nm in links))
+
+    # --- 9. new API vs the already-trusted one ------------------------------
+    # point_barrier_terms duplicates height_barrier_terms' extraction with two
+    # more rows. The z row must come out bit-identical -- that pins the new
+    # code against something validate_table_barrier.py already certifies
+    # against KDL, without re-deriving anything.
+    print("\n9. point_barrier_terms vs height_barrier_terms (z row)")
+    ok_p = ok_J = ok_d = True
+    for _ in range(50):
+        q = rng.uniform(-2.0, 2.0, nq)
+        dq = rng.uniform(-1.5, 1.5, nq)
+        z, J_z, dJdq_z = model.height_barrier_terms(q, dq, segs)
+        pp, J_v, dJdq_v = model.point_barrier_terms(q, dq, segs)
+        ok_p &= np.array_equal(pp[:, 2], z)
+        ok_J &= np.array_equal(J_v[:, 2, :], J_z)
+        ok_d &= np.array_equal(dJdq_v[:, 2], dJdq_z)
+    check("positions agree bit-identically", ok_p)
+    check("Jacobian z-rows agree bit-identically", ok_J)
+    check("dJ@dq z-components agree bit-identically", ok_d)
+
+    OB = dict(center=np.array([[0.45, -0.10, -0.03]]), radius=np.array([0.04]),
+              height=np.array([0.15]), link_radius=0.055)
+
+    def real_h(q, obs=OB):
+        """Capsule clearance of every guarded link, from the real chain."""
+        pp, _, _ = model.point_barrier_terms(q, np.zeros(nq), segs)
+        t = pp[:, None, 2] - obs["center"][None, :, 2]
+        sclamp = np.clip(t, 0.0, obs["height"][None, :])
+        closest = np.broadcast_to(obs["center"][None, :, :],
+                                  (pp.shape[0],) + obs["center"].shape).copy()
+        closest[:, :, 2] = obs["center"][None, :, 2] + sclamp
+        return (np.linalg.norm(pp[:, None, :] - closest, axis=2)
+                - (obs["radius"][None, :] + obs["link_radius"]))
+
+    def real_rows(q, dq, obs=OB):
+        pp, J_v, dJdq_v = model.point_barrier_terms(q, dq, segs)
+        return compute_obstacle_hocbf_rows(
+            pp, J_v, dJdq_v, dq, obs["center"], obs["radius"], obs["height"],
+            obs["link_radius"])
+
+    def near_pose(obs=OB, lo=0.05, hi=0.50):
+        while True:
+            q = rng.uniform(-1.5, 1.5, nq)
+            h = real_h(q, obs)
+            if lo < h.min() and h.min() < hi:
+                return q
+
+    # --- 10. Jh is the true gradient, on the real chain ---------------------
+    print("\n10. constraint rows vs numerical d(h)/dq on the real chain")
+    worst = 0.0
+    for _ in range(15):
+        q = near_pose()
+        A, _, _ = real_rows(q, np.zeros(nq))
+        Jh = -A                                    # (m*k, nq), k = 1
+        num = np.zeros_like(Jh)
+        eps = 1e-7
+        for j in range(nq):
+            qp, qm = q.copy(), q.copy()
+            qp[j] += eps
+            qm[j] -= eps
+            num[:, j] = ((real_h(qp) - real_h(qm)).reshape(-1)) / (2 * eps)
+        worst = max(worst, np.max(np.abs(Jh - num)))
+    check("Jh == d(h)/dq on the real chain", worst < 1e-5, f"max err {worst:.2e}")
+
+    # --- 11. drift, with KDL's exact dJ@dq ----------------------------------
+    # KDL's dJ@dq is exact here (validate_table_barrier.py check 2 pins it to
+    # 2.3e-10), so unlike the synthetic section this tests the barrier's
+    # combination against a trusted input rather than against another FD.
+    print("\n11. drift on the real chain, using KDL's exact dJ@dq")
+    worst = 0.0
+    for _ in range(10):
+        q = near_pose()
+        dq = rng.uniform(-1.0, 1.0, nq)
+        A, b, _ = real_rows(q, dq)
+        Jh = -A
+        h1 = real_h(q).reshape(-1)
+        h1_dot = Jh @ dq
+        drift = b - 10.0 * h1_dot - 10.0 * (h1_dot + 10.0 * h1)
+
+        def Jh_at(qq):
+            Aq, _, _ = real_rows(qq, np.zeros(nq))
+            return -Aq
+        best = min(np.max(np.abs(
+                    drift - (Jh_at(q + e * dq) - Jh_at(q - e * dq)) @ dq / (2 * e)))
+                   for e in (1e-3, 3e-4, 1e-4, 3e-5))
+        worst = max(worst, best)
+    check("drift == (dJh/dt) @ dq on the real chain", worst < 1e-5,
+          f"max err {worst:.2e} m/s^2")
+
+    # --- 12. determinism under scratch reuse --------------------------------
+    # KinDynModel reuses KDL scratch objects across calls; the table validator
+    # checks this for its path, so check it for the new one too.
+    print("\n12. repeated calls are deterministic (KDL scratch reuse)")
+    q = near_pose()
+    dq = rng.uniform(-1.0, 1.0, nq)
+    ref = real_rows(q, dq)
+    same = all(np.array_equal(ref[i], real_rows(q, dq)[i]) for i in (0, 1)
+               for _ in range(5))
+    check("identical inputs give identical rows", same)
+
+    # --- 13. hot-loop cost on the real chain --------------------------------
+    print("\n13. real-chain hot-loop cost")
+    for n_obs in (1, 4, 8):
+        obs = dict(center=rng.uniform(-0.4, 0.4, (n_obs, 3)),
+                   radius=np.full(n_obs, 0.04),
+                   height=np.full(n_obs, 0.15), link_radius=0.055)
+        t0 = time.perf_counter()
+        REP = 500
+        for _ in range(REP):
+            real_rows(q, dq, obs)
+        tot = (time.perf_counter() - t0) / REP * 1e6
+        t0 = time.perf_counter()
+        for _ in range(REP):
+            model.point_barrier_terms(q, dq, segs)
+        kin = (time.perf_counter() - t0) / REP * 1e6
+        print(f"  {len(links)} links x {n_obs} obstacles: {tot:7.1f} us total "
+              f"({kin:.1f} us kinematics + {tot-kin:.1f} us rows)")
+        if n_obs == 8:
+            check("8 obstacles fit the 1 kHz budget", tot < 400.0,
+                  f"{tot:.1f} us of a 1000 us cycle")
+
+    # --- readout: what a real tabletop obstacle looks like -------------------
+    print("\n    clearance readout at a random near pose (mm per link):")
+    hs = real_h(near_pose()).reshape(-1)
+    for nm, hv in zip(links, hs):
+        print(f"      {nm.replace('gen3_',''):<24} {hv*1000:+8.1f}")
 
 print()
 if fails:

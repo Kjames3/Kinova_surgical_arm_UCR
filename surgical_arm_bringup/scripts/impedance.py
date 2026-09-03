@@ -848,6 +848,57 @@ class KinDynModel:
 
         return z, J_z, dJdq_z
 
+    def point_barrier_terms(self, q, dq, seg_indices):
+        """Per-link (p, J_v, dJdq_v) for distance barriers.
+
+        The 3-D counterpart of `height_barrier_terms`. A plane barrier needs
+        only the vertical row because its normal never rotates; an obstacle's
+        normal does, so `compute_obstacle_hocbf_rows` needs all three linear
+        rows and the full dJ @ dq vector.
+
+        Deliberately NOT refactored to share code with `height_barrier_terms`.
+        That one runs every cycle for the table and skips two thirds of this
+        copying on purpose; folding them together would pay the obstacle cost
+        even when no obstacle exists.
+
+        Args:
+            q, dq (np.ndarray): joint position/velocity (n,)
+            seg_indices (sequence[int]): segment indices from segment_index()
+
+        Returns:
+            p (np.ndarray): (m, 3) link-tip positions in base frame
+            J_v (np.ndarray): (m, 3, n) linear-velocity Jacobians
+            dJdq_v (np.ndarray): (m, 3) dJ @ dq (exact, from KDL)
+        """
+        m = len(seg_indices)
+        p = np.empty((m, 3))
+        J_v = np.zeros((m, 3, self.n))
+        dJdq_v = np.empty((m, 3))
+
+        ja = self._to_jnt(q)
+        qv = self._scratch_qv
+        for i in range(self.n):
+            qv.q[i] = float(q[i])
+            qv.qdot[i] = float(dq[i])
+
+        frame, jac, twist = (self._scratch_frame, self._scratch_jac,
+                             self._scratch_twist)
+        for k, s in enumerate(seg_indices):
+            self._fk.JntToCart(ja, frame, s)
+            for r in range(3):
+                p[k, r] = frame.p[r]
+
+            self._jac.JntToJac(ja, jac, s)
+            for r in range(3):
+                for c in range(self.n):
+                    J_v[k, r, c] = jac[r, c]
+
+            self._jdot.JntToJacDot(qv, twist, s)
+            for r in range(3):
+                dJdq_v[k, r] = twist.vel[r]
+
+        return p, J_v, dJdq_v
+
     def mass(self, q):
         """Return the NxN joint-space inertia matrix M(q)."""
         M = self.kdl.JntSpaceInertiaMatrix(self.n)
