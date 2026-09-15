@@ -1878,11 +1878,10 @@ class AngledInserter(Node):
                 req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
                 req_vert= self._build_pilz_lin(*ee_start_circ, q_vertical, vel_scale)
                 ok_v, t_v = self._plan(req_via)
-                if ok_v:
+                if ok_v and execute:
                     if self._wait_for_user("Phase6b_via"): self._execute_fjt(t_v, "Phase6b_via")
-                # ok_r and t_r were typos from earlier, fixed to ok_vert and t_vert if needed, but let's just leave it or fix it:
                 ok_vert, t_vert = self._plan(req_vert)
-                if ok_vert:
+                if ok_vert and execute:
                     if self._wait_for_user("Phase6b_vertical"): self._execute_fjt(t_vert, "Phase6b_vertical")
             else:
                 self.get_logger().info("  [PASS] Reverse CIRC planned.")
