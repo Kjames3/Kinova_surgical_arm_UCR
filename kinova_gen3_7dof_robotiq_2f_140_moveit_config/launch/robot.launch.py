@@ -160,7 +160,16 @@ def launch_setup(context, *args, **kwargs):
         package="moveit_ros_move_group",
         executable="move_group",
         output="screen",
-        parameters=[moveit_config.to_dict()],
+        parameters=[
+            moveit_config.to_dict(),
+            # move_group reads a top-level "capabilities"; the one in
+            # pilz_industrial_motion_planner_planning.yaml lands namespaced
+            # under the pipeline and is ignored. insertion.py's blended
+            # transit needs /plan_sequence_path.
+            {"capabilities":
+                "pilz_industrial_motion_planner/MoveGroupSequenceAction "
+                "pilz_industrial_motion_planner/MoveGroupSequenceService"},
+        ],
         # Suppress the "Joint 'finger_joint' not found in model 'gen3'" flood.
         # thesis_ee has no gripper joint; the KortexMultiInterfaceHardware plugin
         # still advertises one internally (via gripper_joint_name param in the
