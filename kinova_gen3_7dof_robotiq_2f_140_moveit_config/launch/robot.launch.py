@@ -77,7 +77,12 @@ def launch_setup(context, *args, **kwargs):
             publish_robot_description=True,
             publish_robot_description_semantic=True,
         )
-        .planning_pipelines(pipelines=["ompl", "pilz_industrial_motion_planner"])
+        # Pilz is the default because Humble's /plan_sequence_path ignores each
+        # item's pipeline_id and plans on the default pipeline. Every script
+        # that wants OMPL already sets pipeline_id="ompl" explicitly.
+        .planning_pipelines(
+            default_planning_pipeline="pilz_industrial_motion_planner",
+            pipelines=["ompl", "pilz_industrial_motion_planner"])
         .to_moveit_configs()
     )
 
