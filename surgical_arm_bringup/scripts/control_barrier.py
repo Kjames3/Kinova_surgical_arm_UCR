@@ -244,8 +244,105 @@ def compute_obstacle_hocbf_rows(p, J_v, dJdq_v, dq, centers, radii, heights,
     A, b = compute_hocbf_rows(h1.reshape(-1), h1_dot.reshape(-1),
                               Jh.reshape(-1, n_joints), drift.reshape(-1),
                               alpha1, alpha2)
-    info = {"h": h1, "d": d_true, "degenerate": int(np.sum(d_true < d_min))}
+    info = {"h": h1, "h_dot": h1_dot, "d": d_true,
+            "degenerate": int(np.sum(d_true < d_min))}
     return A, b, info
+
+
+def capsule_clearance(p, centers, radii, heights, link_radii=0.0):
+    """(m, k) signed clearance between monitored points and vertical capsules.
+
+    The same closest-point clamp as `compute_obstacle_hocbf_rows`, without the
+    Jacobian work, for ranking obstacles OFF the 1 kHz loop (see
+    `cull_obstacles`). Negative means penetrating.
+    """
+    p = np.atleast_2d(np.asarray(p, dtype=float))
+    centers = np.atleast_2d(np.asarray(centers, dtype=float))
+    radii = np.atleast_1d(np.asarray(radii, dtype=float))
+    heights = np.atleast_1d(np.asarray(heights, dtype=float))
+    link_radii = np.broadcast_to(np.asarray(link_radii, dtype=float), (p.shape[0],))
+    s = np.clip(p[:, None, 2] - centers[None, :, 2], 0.0, heights[None, :])
+    e = p[:, None, :] - centers[None, :, :]
+    e[:, :, 2] -= s
+    return np.linalg.norm(e, axis=2) - (radii[None, :] + link_radii[:, None])
+
+
+def cull_obstacles(p, centers, radii, heights, link_radii, max_obstacles):
+    """Indices of at most `max_obstacles` obstacles, nearest to the arm first.
+
+    Stage one of the sliding window, meant for the perception rate (~30 Hz),
+    not the torque loop: it bounds how many obstacles `compute_obstacle_hocbf_rows`
+    pays for (cost is linear in m * k). An obstacle is ranked by its smallest
+    clearance to ANY monitored point, so a far obstacle near the elbow still
+    beats a near-ish one nobody is approaching. Speed is deliberately ignored
+    here -- between perception frames the arm can reverse, so velocity-based
+    ranking belongs to `ObstacleWindow`, which runs every cycle.
+    """
+    h = capsule_clearance(p, centers, radii, heights, link_radii)
+    if h.shape[1] <= max_obstacles:
+        return np.argsort(h.min(axis=0), kind="stable")
+    return np.argsort(h.min(axis=0), kind="stable")[:max_obstacles]
+
+
+class ObstacleWindow:
+    """Stage two of the sliding window: which (point, obstacle) rows to enforce.
+
+    A rolling CONSTRAINT set, not a rolling map. Every cycle each pair gets a
+    predicted clearance over a short horizon,
+
+        pred = h + horizon * min(h_dot, 0)
+
+    i.e. where the gap will be if the current closing speed holds. Pairs that
+    are opening are scored on today's clearance alone. Rows are kept in order
+    of increasing pred, capped at `max_rows` so the QP's active-set solve stays
+    bounded, and pairs whose pred exceeds `ignore_clearance` are not enforced
+    at all.
+
+    Guarantee, checked by validate_obstacle_window.py: a dropped pair is never
+    more urgent than a kept one by more than `hysteresis`. Hysteresis exists
+    because a row that flickers in and out of the QP makes the filtered
+    acceleration jump; pairs kept last cycle get their score lowered by
+    `hysteresis` so near-ties do not trade places every millisecond.
+
+    When the cap binds, `info["overflow"]` is True and `info["dropped_min_pred"]`
+    says how close the most urgent unenforced pair is. A caller must treat a
+    small value there as lost protection, not as a tuning detail.
+    """
+
+    def __init__(self, max_rows=12, horizon=0.2, ignore_clearance=0.30,
+                 hysteresis=0.01):
+        self.max_rows = int(max_rows)
+        self.horizon = float(horizon)
+        self.ignore_clearance = float(ignore_clearance)
+        self.hysteresis = float(hysteresis)
+        self._prev = np.zeros(0, dtype=int)
+        self._shape = None
+
+    def reset(self):
+        self._prev = np.zeros(0, dtype=int)
+        self._shape = None
+
+    def select(self, h, h_dot):
+        """Flat row indices (point-major, as in compute_obstacle_hocbf_rows)."""
+        h = np.asarray(h, dtype=float)
+        pred = (h + self.horizon * np.minimum(np.asarray(h_dot, dtype=float), 0.0)).ravel()
+        score = pred.copy()
+        if self._shape == h.shape and self._prev.size:
+            # Obstacle indices are only comparable across cycles when the set
+            # did not change shape; after a re-cull start fresh.
+            score[self._prev] -= self.hysteresis
+        cand = np.flatnonzero(score < self.ignore_clearance)
+        order = cand[np.argsort(score[cand], kind="stable")]
+        keep = order[:self.max_rows]
+        dropped = order[self.max_rows:]
+        self._prev, self._shape = keep, h.shape
+        info = {
+            "overflow": dropped.size > 0,
+            "n_candidates": int(cand.size),
+            "dropped_min_pred": float(pred[dropped].min()) if dropped.size else np.inf,
+            "kept_min_pred": float(pred[keep].min()) if keep.size else np.inf,
+        }
+        return keep, info
 
 
 def torque_limit_rows(M, tau_bias, tau_max):
