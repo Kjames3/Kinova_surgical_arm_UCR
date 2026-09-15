@@ -378,9 +378,17 @@ class AngledInserter(Node):
         # transit can be fluid while the insertion stays rigid and slow.
         # transit_velocity_scaling < 0 falls back to max_velocity_scaling.
         self.declare_parameter("transit_velocity_scaling", -1.0)
-        self.declare_parameter("insert_speed_mps",         0.01)  # Kortex LIN, m/s
-        self.declare_parameter("insert_rot_speed_dps",     5.0)   # Kortex LIN, deg/s
-        self.declare_parameter("insert_velocity_scaling",  0.05)  # Pilz fallback
+        self.declare_parameter("insert_speed_mps",         0.01)  # m/s
+        self.declare_parameter("insert_rot_speed_dps",     5.0)   # deg/s, Kortex LIN only
+        # Pilz LIN speed = velocity scaling * max_trans_vel from
+        # pilz_cartesian_limits.yaml (1.0 m/s). Measured on REAL-1 2026-09-14:
+        # scale 0.05 -> 4.6 cm/s, 0.01 -> 9.4 mm/s average including ramps.
+        self.declare_parameter("pilz_max_trans_vel",       1.0)
+        # Native Kortex ReachPose for straight lines. OFF: switching servoing
+        # mode under a running ros2_control driver stops its hardware interface
+        # (WRONG_SERVOING_MODE, 2026-09-14), and the pose it sends is
+        # bracelet_link while Kortex interprets it as the tool frame (+0.20 m).
+        self.declare_parameter("use_kortex_lin",           False)
         # Phase 4/6a travel the whole insertion axis from hover (~300 mm at 45 deg).
         # Only the stretch within insert_slow_zone_m (tip height above the
         # container top) runs at insert speed; the rest of the axis is a
@@ -918,9 +926,29 @@ class AngledInserter(Node):
             self.get_logger().error(f"  FJT timed out ({label}).")
             return False
         code = result.result.error_code
+        if code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
+            # -5 also comes back when the arm never moved (e.g. the hardware
+            # interface stopped, 2026-09-14), so check before calling it success.
+            time.sleep(0.5)
+            final = traj.joint_trajectory.points[-1].positions
+            errs = []
+            for name, want in zip(traj.joint_trajectory.joint_names, final):
+                have = self._live_joints.get(name)
+                if have is None:
+                    continue
+                d = want - have
+                if name in self.continuous_joints:
+                    d = (d + math.pi) % (2 * math.pi) - math.pi
+                errs.append(abs(d))
+            worst = max(errs) if errs else float("inf")
+            if worst > 0.05:
+                self.get_logger().error(
+                    f"  [FAIL] {label} FJT error -5 and arm is {math.degrees(worst):.1f} deg "
+                    f"from the goal -- it did not get there.")
+                return False
+            self.get_logger().info(
+                f"  [INFO] {label} FJT error -5 ignored: arm within {math.degrees(worst):.2f} deg of goal.")
         if code == FollowJointTrajectory.Result.SUCCESSFUL or code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
-            if code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
-                self.get_logger().info(f"  [INFO] {label} FJT error -5 (Goal Tolerance Violated) ignored. Arm reached target.")
             self.get_logger().info(f"  [PASS] {label}")
             self._arm_moved = True
             return True
@@ -1034,13 +1062,17 @@ class AngledInserter(Node):
         self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
         return False, None
 
-    def _axis_lin(self, ee_xyz, q, label, speed_mps, rot_speed_dps, pilz_scale):
-        """Rigid straight line along the insertion axis: Kortex LIN, else Pilz LIN."""
-        if self._kortex_base:
+    def _use_kortex_lin(self):
+        return bool(self._kortex_base) and self.get_parameter("use_kortex_lin").value
+
+    def _axis_lin(self, ee_xyz, q, label, speed_mps, rot_speed_dps):
+        """Rigid straight line along the insertion axis at speed_mps (Pilz LIN via FJT)."""
+        if self._use_kortex_lin():
             return self._execute_kortex_lin(*ee_xyz, (q.x, q.y, q.z, q.w), label,
                                             speed_mps=speed_mps,
                                             rot_speed_dps=rot_speed_dps)
-        ok, traj = self._plan(self._build_pilz_lin(*ee_xyz, q, pilz_scale))
+        scale = min(1.0, max(1e-3, speed_mps / self.get_parameter("pilz_max_trans_vel").value))
+        ok, traj = self._plan(self._build_pilz_lin(*ee_xyz, q, scale))
         if not ok:
             self.get_logger().error(f"  {label} LIN planning failed.")
             return False
@@ -1559,7 +1591,6 @@ class AngledInserter(Node):
         vel_scale  = self.get_parameter("transit_velocity_scaling").value
         if vel_scale <= 0.0:
             vel_scale = self.get_parameter("max_velocity_scaling").value
-        ins_scale  = self.get_parameter("insert_velocity_scaling").value
         ins_speed  = self.get_parameter("insert_speed_mps").value
         ins_rot    = self.get_parameter("insert_rot_speed_dps").value
         blend      = self.get_parameter("blend_transit").value
@@ -1819,7 +1850,7 @@ class AngledInserter(Node):
             self.get_logger().info(
                 f"  EE hover: ({ee_hover[0]:.3f}, {ee_hover[1]:.3f}, {ee_hover[2]:.3f})")
             if execute and self._wait_for_user("Phase1_vertical_descent"):
-                if self._kortex_base:
+                if self._use_kortex_lin():
                     if not self._execute_kortex_lin(ee_hover[0], ee_hover[1], ee_hover[2], (q_vertical.x, q_vertical.y, q_vertical.z, q_vertical.w), "Phase1_vertical_descent"):
                         self._recovery_return(p); return
                 else:
@@ -1981,10 +2012,10 @@ class AngledInserter(Node):
 
         if execute and self._wait_for_user("Phase4_angled_descent"):
             if geo["descent_m"] - pre_d > 1e-3 and not self._axis_lin(
-                    ee_pre, q_tilted, "Phase4a_axis_approach", axis_speed, 15.0, vel_scale):
+                    ee_pre, q_tilted, "Phase4a_axis_approach", axis_speed, 15.0):
                 self._recovery_return(p); return
             if not self._axis_lin(ee_target, q_tilted, "Phase4b_insert",
-                                  ins_speed, ins_rot, ins_scale):
+                                  ins_speed, ins_rot):
                 self._recovery_return(p); return
 
         # ── Phase 5: Hold ──────────────────────────────────────────────────
@@ -2002,10 +2033,10 @@ class AngledInserter(Node):
         self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
         if execute and self._wait_for_user("Phase6a_angled_ascent"):
             if not self._axis_lin(ee_pre, q_tilted, "Phase6a_extract",
-                                  ins_speed, ins_rot, ins_scale):
+                                  ins_speed, ins_rot):
                 self._recovery_return(p); return
             if geo["descent_m"] - pre_d > 1e-3 and not self._axis_lin(
-                    ee_end_circ, q_tilted, "Phase6a_axis_retreat", axis_speed, 15.0, vel_scale):
+                    ee_end_circ, q_tilted, "Phase6a_axis_retreat", axis_speed, 15.0):
                 self._recovery_return(p); return
 
         if not self.get_parameter("direct_to_angled_hover").value:
@@ -2080,7 +2111,7 @@ class AngledInserter(Node):
             # ── Phase 7: Vertical ascent + return ─────────────────────────────
             self.get_logger().info(f"\n--- [Phase 7] Vertical ascent to approach height ---")
             if execute and self._wait_for_user("Phase7_vertical_ascent"):
-                if self._kortex_base:
+                if self._use_kortex_lin():
                     if not self._execute_kortex_lin(ee_ready[0], ee_ready[1], ee_ready[2], (q_vertical.x, q_vertical.y, q_vertical.z, q_vertical.w), "Phase7_vertical_ascent"):
                         self._recovery_return(p); return
                 else:
