@@ -113,6 +113,7 @@ from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import JointState
 from moveit_msgs.srv import GetMotionPlan, GetMotionSequence
 from std_msgs.msg import String
+from action_msgs.msg import GoalStatus
 from moveit_msgs.action import ExecuteTrajectory
 from builtin_interfaces.msg import Duration as RosDuration
 from control_msgs.action import FollowJointTrajectory
@@ -341,6 +342,62 @@ def check_wall_clearance(offset_x_m, offset_y_m, depth_m,
 # Main node
 # ---------------------------------------------------------------------------
 
+class EffortGuard:
+    """Joint-torque contact guard for position-mode motions.
+
+    Fed from /joint_states effort. The baseline is the mean effort over the
+    first baseline_s of the motion (the arm starts from rest), each joint is
+    low-pass filtered, and the guard trips when any joint's |filtered -
+    baseline| stays above its threshold for hold_s. This is a CONTACT PROXY:
+    gravity torque also changes with posture, which is why it is only armed
+    on the short, fixed-orientation insertion-axis moves.
+    """
+
+    def __init__(self, thresholds_nm, filter_s=0.02, hold_s=0.03, baseline_s=0.05):
+        self.thr = [float(x) for x in thresholds_nm]
+        self.filter_s, self.hold_s, self.baseline_s = filter_s, hold_s, baseline_s
+        self.t0 = None
+        self.base_acc = []
+        self.base = None
+        self.filt = None
+        self.t_prev = None
+        self.over_since = None
+        self.peak = [0.0] * len(self.thr)
+        self.tripped = None           # (joint_index, delta_nm, t_rel)
+
+    def update(self, t, tau):
+        if self.t0 is None:
+            self.t0 = t
+        if self.base is None:
+            self.base_acc.append(list(tau))
+            if t - self.t0 >= self.baseline_s:
+                n = len(self.base_acc)
+                self.base = [sum(r[i] for r in self.base_acc) / n for i in range(len(tau))]
+                self.filt = list(self.base)
+                self.t_prev = t
+            return False
+        dt = max(t - self.t_prev, 0.0)
+        self.t_prev = t
+        a = dt / (self.filter_s + dt) if self.filter_s > 0 else 1.0
+        over = None
+        for i, x in enumerate(tau):
+            self.filt[i] += a * (x - self.filt[i])
+            d = abs(self.filt[i] - self.base[i])
+            if d > self.peak[i]:
+                self.peak[i] = d
+            if d > self.thr[i] and (over is None or d / self.thr[i] > over[1] / self.thr[over[0]]):
+                over = (i, d)
+        if over is None:
+            self.over_since = None
+            return False
+        if self.over_since is None:
+            self.over_since = t
+        if self.tripped is None and t - self.over_since >= self.hold_s:
+            self.tripped = (over[0], over[1], t - self.t0)
+            return True
+        return False
+
+
 class AngledInserter(Node):
 
     def __init__(self):
@@ -393,6 +450,15 @@ class AngledInserter(Node):
         self.declare_parameter("use_kortex_lin",           False)
         # Record every executed run with `ros2 bag record` for offline analysis.
         # Phase boundaries go on /insertion/phase ("start:<label>" / "end:<label>:ok|fail").
+        # Over-force guard on Phase 4a/4b (joint-torque contact proxy, see
+        # EffortGuard). mode: abort | monitor (log only) | off. Thresholds are
+        # per joint, Nm above the torque at the start of the move. Defaults are
+        # a first guess -- calibrate from the "peak d-tau" line each run prints
+        # and analyze_insertion_bag.py.
+        self.declare_parameter("force_guard_mode",         "abort")
+        self.declare_parameter("force_guard_nm",           [6.0, 6.0, 6.0, 6.0, 3.0, 3.0, 3.0])
+        self.declare_parameter("force_guard_hold_s",       0.03)
+        self.declare_parameter("force_guard_filter_s",     0.02)
         self.declare_parameter("record_bag",               True)
         self.declare_parameter("bag_dir",                  "~/insertion_bags")
         # Phase 4/6a travel the whole insertion axis from hover (~300 mm at 45 deg).
@@ -507,6 +573,8 @@ class AngledInserter(Node):
         # Used to rewind planned trajectories onto the arm's actual joint
         # winding before execution — see _unwrap_trajectory.
         self._live_joints  = {}
+        self._guard        = None
+        self._guard_lock   = threading.Lock()
         self._js_frozen    = False
         self._js_sub       = self.create_subscription(
             JointState, "/joint_states", self._js_cb, 10,
@@ -584,6 +652,20 @@ class AngledInserter(Node):
         # anchor to where the arm physically is, even while _start_joints is frozen.
         for name, pos in zip(msg.name, msg.position):
             self._live_joints[name] = pos
+        guard = self._guard
+        if guard is not None and len(msg.effort) == len(msg.name):
+            try:
+                tau = [msg.effort[msg.name.index(j)] for j in self.arm_joint_names]
+            except ValueError:
+                tau = None
+            if tau is not None:
+                t = time.monotonic()   # header stamps can be zero or sim time
+                with self._guard_lock:
+                    tripped = guard.update(t, tau)
+                if tripped and self.get_parameter("force_guard_mode").value == "abort":
+                    gh = self._active_gh
+                    if gh is not None:
+                        gh.cancel_goal_async()
         if self._js_frozen:
             return
         for name, pos in zip(msg.name, msg.position):
@@ -949,6 +1031,10 @@ class AngledInserter(Node):
         if result is None:
             self.get_logger().error(f"  FJT timed out ({label}).")
             return False
+        if result.status == GoalStatus.STATUS_CANCELED:
+            # error_code is 0 (== SUCCESSFUL) on a cancel, so check status first.
+            self.get_logger().warn(f"  [STOP] {label} cancelled.")
+            return False
         code = result.result.error_code
         if code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
             # -5 also comes back when the arm never moved (e.g. the hardware
@@ -1085,6 +1171,39 @@ class AngledInserter(Node):
             return True, resp.trajectory
         self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
         return False, None
+
+    def _guarded(self, label, fn):
+        """Run fn() with the effort guard armed. Returns (ok, tripped_info_or_None)."""
+        mode = self.get_parameter("force_guard_mode").value
+        if mode == "off":
+            return fn(), None
+        thr = list(self.get_parameter("force_guard_nm").value)
+        guard = EffortGuard(thr, self.get_parameter("force_guard_filter_s").value,
+                            self.get_parameter("force_guard_hold_s").value)
+        with self._guard_lock:
+            self._guard = guard
+        try:
+            ok = fn()
+        finally:
+            with self._guard_lock:
+                self._guard = None
+        if guard.base is None:
+            self.get_logger().warn(f"  [guard] {label}: no joint effort received -- guard was blind.")
+            return ok, None
+        peaks = " ".join(f"j{i+1}={p:.2f}" for i, p in enumerate(guard.peak))
+        margin = min(t - p for t, p in zip(thr, guard.peak))
+        self.get_logger().info(f"  [guard] {label} peak d-tau Nm: {peaks} (min margin {margin:.2f})")
+        if guard.tripped is None:
+            return ok, None
+        j, d, t_rel = guard.tripped
+        self._mark_phase(f"guard_trip:{label}:joint_{j+1}:{d:.2f}")
+        msg = (f"  [guard] {label}: joint_{j+1} torque changed {d:.2f} Nm "
+               f"(limit {thr[j]:.2f}) at {t_rel:.2f} s")
+        if mode == "abort":
+            self.get_logger().error(msg + " -- motion STOPPED.")
+            return False, guard.tripped
+        self.get_logger().warn(msg + " -- monitor mode, not stopping.")
+        return ok, None
 
     def _use_kortex_lin(self):
         return bool(self._kortex_base) and self.get_parameter("use_kortex_lin").value
@@ -2063,17 +2182,42 @@ class AngledInserter(Node):
             f"  Fast axis:   {(geo['descent_m'] - pre_d)*1000:.1f} mm at {axis_speed*100:.1f} cm/s\n"
             f"  Slow insert: {pre_d*1000:.1f} mm at {ins_speed*1000:.1f} mm/s")
 
+        insert_state = "done"      # done | aborted_4a | aborted_4b
         if execute and self._wait_for_user("Phase4_angled_descent"):
-            if geo["descent_m"] - pre_d > 1e-3 and not self._axis_lin(
-                    ee_pre, q_tilted, "Phase4a_axis_approach", axis_speed, 15.0):
-                self._recovery_return(p); return
-            if not self._axis_lin(ee_target, q_tilted, "Phase4b_insert",
-                                  ins_speed, ins_rot):
-                self._recovery_return(p); return
+            if geo["descent_m"] - pre_d > 1e-3:
+                ok, trip = self._guarded("Phase4a_axis_approach", lambda: self._axis_lin(
+                    ee_pre, q_tilted, "Phase4a_axis_approach", axis_speed, 15.0))
+                if trip:
+                    # Contact before the container top: back straight out to hover,
+                    # then take the normal reverse path.
+                    insert_state = "aborted_4a"
+                    if not self._axis_lin(ee_end_circ, q_tilted, "Phase4a_guard_retreat",
+                                          ins_speed, ins_rot):
+                        self.get_logger().error("  Guard retreat failed -- arm left where it stopped.")
+                        return
+                elif not ok:
+                    self._recovery_return(p); return
+            if insert_state == "done":
+                ok, trip = self._guarded("Phase4b_insert", lambda: self._axis_lin(
+                    ee_target, q_tilted, "Phase4b_insert", ins_speed, ins_rot))
+                if trip:
+                    insert_state = "aborted_4b"      # Phase 6a extracts along the axis
+                elif not ok:
+                    # Never PTP home with the tip possibly in the container:
+                    # extract along the axis first.
+                    if (self._axis_lin(ee_pre, q_tilted, "Phase4b_fail_extract", ins_speed, ins_rot)
+                            and self._axis_lin(ee_end_circ, q_tilted, "Phase4b_fail_retreat",
+                                               axis_speed, 15.0)):
+                        self._recovery_return(p)
+                    else:
+                        self.get_logger().error("  Extraction failed -- arm left where it stopped.")
+                    return
 
         # ── Phase 5: Hold ──────────────────────────────────────────────────
         self.get_logger().info(f"\n--- [Phase 5] Hold at target ---")
-        if execute:
+        if insert_state != "done":
+            self.get_logger().warn(f"  Insertion {insert_state} by the force guard -- skipping hold.")
+        elif execute:
             try:
                 input(f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
                       f"{target_xyz[2]:.3f}).  Press ENTER to reverse ...")
@@ -2084,7 +2228,7 @@ class AngledInserter(Node):
 
         # ── Phase 6a: Reverse angled ascent ───────────────────────────────
         self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
-        if execute and self._wait_for_user("Phase6a_angled_ascent"):
+        if execute and insert_state != "aborted_4a" and self._wait_for_user("Phase6a_angled_ascent"):
             if not self._axis_lin(ee_pre, q_tilted, "Phase6a_extract",
                                   ins_speed, ins_rot):
                 self._recovery_return(p); return
