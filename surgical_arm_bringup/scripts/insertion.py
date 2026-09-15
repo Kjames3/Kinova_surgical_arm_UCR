@@ -110,7 +110,7 @@ except ImportError:
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import JointState
-from moveit_msgs.srv import GetMotionPlan
+from moveit_msgs.srv import GetMotionPlan, GetMotionSequence
 from moveit_msgs.action import ExecuteTrajectory
 from builtin_interfaces.msg import Duration as RosDuration
 from control_msgs.action import FollowJointTrajectory
@@ -119,7 +119,7 @@ from moveit_msgs.msg import (
     RobotState, Constraints, OrientationConstraint,
     MotionPlanRequest, WorkspaceParameters,
     PositionConstraint, BoundingVolume, JointConstraint,
-    RobotTrajectory,
+    RobotTrajectory, MotionSequenceItem,
 )
 from shape_msgs.msg import SolidPrimitive
 
@@ -373,6 +373,20 @@ class AngledInserter(Node):
 
         # Motion parameters
         self.declare_parameter("max_velocity_scaling", 0.25)
+        # Transit (free space: Phases 0/1/3/6b/7/8) and insertion (tip entering
+        # or inside the container: Phases 4/6a) are tuned separately so the
+        # transit can be fluid while the insertion stays rigid and slow.
+        # transit_velocity_scaling < 0 falls back to max_velocity_scaling.
+        self.declare_parameter("transit_velocity_scaling", -1.0)
+        self.declare_parameter("insert_speed_mps",         0.01)  # Kortex LIN, m/s
+        self.declare_parameter("insert_rot_speed_dps",     5.0)   # Kortex LIN, deg/s
+        self.declare_parameter("insert_velocity_scaling",  0.05)  # Pilz fallback
+        # Blend Phase 0 -> 1 and Phase 7 -> 8 into single motions via Pilz
+        # /plan_sequence_path. Only free-space corners are blended: the tip
+        # pivot (Phase 3) and the insertion stay exact. Falls back to the
+        # separate phases if sequence planning fails.
+        self.declare_parameter("blend_transit",            True)
+        self.declare_parameter("blend_radius",             0.05)  # m, at ee_link
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
         # True = action server (wait for goals on /insert_container).
@@ -478,6 +492,9 @@ class AngledInserter(Node):
         # Clients
         self._plan_cli = self.create_client(
             GetMotionPlan, "/plan_kinematic_path",
+            callback_group=self._cb_group)
+        self._seq_cli = self.create_client(
+            GetMotionSequence, "/plan_sequence_path",
             callback_group=self._cb_group)
         self._execute_cli = ActionClient(
             self, ExecuteTrajectory, "/execute_trajectory",
@@ -710,7 +727,8 @@ class AngledInserter(Node):
         yaw = math.degrees(math.atan2(t3, t4))
         return roll, pitch, yaw
 
-    def _execute_kortex_lin(self, ee_x, ee_y, ee_z, q_xyzw, label):
+    def _execute_kortex_lin(self, ee_x, ee_y, ee_z, q_xyzw, label,
+                            speed_mps=0.05, rot_speed_dps=15.0):
         """Execute a straight Cartesian line via native Kortex API (bypassing MoveIt/IK)"""
         if not _HAS_KORTEX_API or not self._kortex_base:
             self.get_logger().error(f"  [{label}] Kortex API not connected!")
@@ -735,11 +753,19 @@ class AngledInserter(Node):
         
         # Define the speed constraint
         speed = Base_pb2.CartesianSpeed()
-        speed.translation = 0.05  # 5 cm/s
-        speed.orientation = 15.0  # 15 deg/s
-        
+        speed.translation = speed_mps
+        speed.orientation = rot_speed_dps
+
         action.reach_pose.constraint.speed.CopyFrom(speed)
-        
+        # Timeout scales with the move so a slow insertion is not cut off.
+        tf0 = self._get_tf(self.get_parameter("world_frame").value,
+                           self.get_parameter("ee_link").value, timeout=0.5)
+        dist0 = 0.3
+        if tf0:
+            t0 = tf0.transform.translation
+            dist0 = math.sqrt((t0.x-ee_x)**2 + (t0.y-ee_y)**2 + (t0.z-ee_z)**2)
+        action_timeout = max(30.0, 3.0 * dist0 / max(speed_mps, 1e-3) + 10.0)
+
         try:
             # Switch to High-Level servoing to accept API commands
             mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
@@ -765,12 +791,11 @@ class AngledInserter(Node):
             
             self._kortex_base.ExecuteAction(action)
             
-            finished = e.wait(30.0)
+            finished = e.wait(action_timeout)
             self._kortex_base.Unsubscribe(notification_handle)
             
             if finished and not error_details:
                 # Wait for arm to settle
-                import math, time
                 time.sleep(1.0)
                 tf = self._get_tf(self.get_parameter("world_frame").value, self.get_parameter("ee_link").value, timeout=0.5)
                 if tf:
@@ -999,6 +1024,64 @@ class AngledInserter(Node):
             return True, resp.trajectory
         self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
         return False, None
+
+    def _plan_sequence(self, reqs, blend_radii, timeout=45.0):
+        """Plan several Pilz requests as one blended motion via /plan_sequence_path.
+
+        reqs[0] keeps its start state; later items must leave it empty (Pilz
+        chains them). The final blend radius is forced to 0 so the motion ends
+        at rest on the last goal. Returns (ok, [RobotTrajectory, ...]).
+        """
+        if not self._seq_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("  /plan_sequence_path not available.")
+            return False, None
+        svc = GetMotionSequence.Request()
+        for i, (req, r) in enumerate(zip(reqs, blend_radii)):
+            if i > 0:
+                req.start_state = RobotState()
+            item = MotionSequenceItem()
+            item.req = req
+            item.blend_radius = 0.0 if i == len(reqs) - 1 else float(r)
+            svc.request.items.append(item)
+        result = self._wait_for_future(self._seq_cli.call_async(svc), timeout)
+        if result is None:
+            self.get_logger().warn("  Sequence planning timed out.")
+            return False, None
+        resp = result.response
+        if resp.error_code.val != 1 or not resp.planned_trajectories:
+            self.get_logger().warn(
+                f"  Sequence planning failed (code {resp.error_code.val}).")
+            return False, None
+        return True, list(resp.planned_trajectories)
+
+    def _blended_transit(self, reqs, seg_lengths, label, execute):
+        """Plan and run a blended free-space transit.
+
+        Returns "done", "fallback" (planning failed, nothing moved -- caller
+        runs the separate phases) or "failed" (execution failed mid-motion).
+        """
+        r = self.get_parameter("blend_radius").value
+        # Pilz rejects a blend sphere that swallows a segment endpoint.
+        r_max = 0.4 * min(seg_lengths)
+        if r > r_max:
+            self.get_logger().warn(
+                f"  blend_radius {r*1000:.0f} mm too large for a "
+                f"{min(seg_lengths)*1000:.0f} mm segment; using {r_max*1000:.0f} mm.")
+            r = r_max
+        self.get_logger().info(f"\n--- [{label}] Blended transit (r={r*1000:.0f} mm) ---")
+        ok, trajs = self._plan_sequence(reqs, [r] * len(reqs))
+        if not ok:
+            self.get_logger().warn(f"  {label}: falling back to separate phases.")
+            return "fallback"
+        self.get_logger().info(f"  [PASS] {label} planned ({len(trajs)} trajectory segment(s)).")
+        if not execute:
+            return "done"
+        if not self._wait_for_user(label):
+            return "done"
+        for i, traj in enumerate(trajs):
+            if not self._execute_fjt(traj, f"{label}[{i}]"):
+                return "failed"
+        return "done"
 
     # ------------------------------------------------------------------
     # Recovery
@@ -1443,7 +1526,13 @@ class AngledInserter(Node):
         return result
 
     def _run_impl(self, goal_handle, pub_fb):
-        vel_scale  = self.get_parameter("max_velocity_scaling").value
+        vel_scale  = self.get_parameter("transit_velocity_scaling").value
+        if vel_scale <= 0.0:
+            vel_scale = self.get_parameter("max_velocity_scaling").value
+        ins_scale  = self.get_parameter("insert_velocity_scaling").value
+        ins_speed  = self.get_parameter("insert_speed_mps").value
+        ins_rot    = self.get_parameter("insert_rot_speed_dps").value
+        blend      = self.get_parameter("blend_transit").value
         execute    = not goal_handle.request.dry_run
         real_robot = self.get_parameter("real_robot").value
         world_frame= self.get_parameter("world_frame").value
@@ -1664,10 +1753,23 @@ class AngledInserter(Node):
         ee_via_circ   = self._ee_for_tip(hover_xyz, q_via_xyzw)
         ee_end_circ   = self._ee_for_tip(hover_xyz, q_tilted_xyzw)
 
-        if not self.get_parameter("direct_to_angled_hover").value:
+        ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
+        transit_01 = "fallback"
+        if not self.get_parameter("direct_to_angled_hover").value and blend:
+            seg0 = math.dist((ee_w.x, ee_w.y, ee_w.z), ee_ready)
+            seg1 = math.dist(ee_ready, ee_hover)
+            transit_01 = self._blended_transit(
+                [self._build_pilz_ptp(
+                     *ee_ready, q_vertical, vel_scale,
+                     joint_band=self.get_parameter("approach_joint_band").value),
+                 self._build_pilz_lin(*ee_hover, q_vertical, vel_scale)],
+                [seg0, seg1], "Phase0-1_blended", execute)
+            if transit_01 == "failed":
+                self._recovery_return(p); return
+
+        if not self.get_parameter("direct_to_angled_hover").value and transit_01 == "fallback":
             self.get_logger().info(
                 f"\n--- [Phase 0] Approach above container ---")
-            ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
             self.get_logger().info(
                 f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
             req = self._build_pilz_ptp(
@@ -1822,14 +1924,15 @@ class AngledInserter(Node):
 
         if execute and self._wait_for_user("Phase4_angled_descent"):
             if self._kortex_base:
-                if not self._execute_kortex_lin(ee_target[0], ee_target[1], ee_target[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase4_angled_descent"):
+                if not self._execute_kortex_lin(ee_target[0], ee_target[1], ee_target[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase4_angled_descent",
+                                                speed_mps=ins_speed, rot_speed_dps=ins_rot):
                     self._recovery_return(p); return
             else:
-                req = self._build_pilz_lin(*ee_target, q_tilted, vel_scale)
+                req = self._build_pilz_lin(*ee_target, q_tilted, ins_scale)
                 ok, traj_descent = self._plan(req)
                 if not ok:
                     self.get_logger().warn("  Pilz LIN failed for Phase 4. Falling back to Pilz PTP.")
-                    req = self._build_pilz_ptp(*ee_target, q_tilted, vel_scale)
+                    req = self._build_pilz_ptp(*ee_target, q_tilted, ins_scale)
                     ok, traj_descent = self._plan(req)
                 if not ok:
                     self.get_logger().error("  Phase 4 angled descent planning failed (both LIN and PTP).")
@@ -1852,10 +1955,11 @@ class AngledInserter(Node):
         self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
         if execute and self._wait_for_user("Phase6a_angled_ascent"):
             if self._kortex_base:
-                if not self._execute_kortex_lin(ee_end_circ[0], ee_end_circ[1], ee_end_circ[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase6a_angled_ascent"):
+                if not self._execute_kortex_lin(ee_end_circ[0], ee_end_circ[1], ee_end_circ[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase6a_angled_ascent",
+                                                speed_mps=ins_speed, rot_speed_dps=ins_rot):
                     self._recovery_return(p); return
             else:
-                req = self._build_pilz_lin(*ee_end_circ, q_tilted, vel_scale)
+                req = self._build_pilz_lin(*ee_end_circ, q_tilted, ins_scale)
                 ok, traj_asc = self._plan(req)
                 if ok:
                     if not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
@@ -1888,6 +1992,41 @@ class AngledInserter(Node):
                 if execute:
                     if self._wait_for_user("Phase6b_circ_reverse"): self._execute_fjt(traj_circ_rev, "Phase6b_circ_reverse")
 
+        req_return = None
+        if ret and self._start_joints:
+            req_return = MotionPlanRequest()
+            req_return.group_name = group_name
+            req_return.planner_id = "PTP"
+            req_return.pipeline_id = "pilz_industrial_motion_planner"
+            req_return.num_planning_attempts = 1
+            req_return.allowed_planning_time = 10.0
+            req_return.max_velocity_scaling_factor = vel_scale
+            req_return.max_acceleration_scaling_factor = vel_scale * 0.5
+            req_return.start_state.is_diff = True
+            goal_c = Constraints()
+            for name, pos in self._start_joints.items():
+                if name not in self.arm_joint_names:
+                    continue
+                jc = JointConstraint(); jc.joint_name = name
+                # Wrap to nearest equivalent of the current winding so this
+                # return doesn't hit the same 2pi abort as Phase 0
+                # (mirrors _recovery_return and home_move).
+                jc.position = self._nearest_equiv_angle(name, pos)
+                jc.tolerance_above = 0.05; jc.tolerance_below = 0.05
+                jc.weight = 1.0; goal_c.joint_constraints.append(jc)
+            req_return.goal_constraints.append(goal_c)
+
+        transit_78 = "fallback"
+        if not self.get_parameter("direct_to_angled_hover").value and blend and req_return is not None:
+            # Phase 7's LIN starts where Phase 6b ended (vertical at hover).
+            seg7 = math.dist(ee_hover, ee_ready)
+            transit_78 = self._blended_transit(
+                [self._build_pilz_lin(*ee_ready, q_vertical, vel_scale), req_return],
+                [seg7, seg7], "Phase7-8_blended", execute)
+            if transit_78 == "failed":
+                self._recovery_return(p); return
+
+        if not self.get_parameter("direct_to_angled_hover").value and transit_78 == "fallback":
             # ── Phase 7: Vertical ascent + return ─────────────────────────────
             self.get_logger().info(f"\n--- [Phase 7] Vertical ascent to approach height ---")
             if execute and self._wait_for_user("Phase7_vertical_ascent"):
@@ -1903,30 +2042,9 @@ class AngledInserter(Node):
                     else:
                         self.get_logger().warn("  Vertical ascent failed — skipping.")
 
-        if ret and self._start_joints:
+        if req_return is not None and transit_78 == "fallback":
             self.get_logger().info(f"\n--- [Phase 8] Return to start joints ---")
-            req = MotionPlanRequest()
-            req.group_name = group_name
-            req.planner_id = "PTP"
-            req.pipeline_id = "pilz_industrial_motion_planner"
-            req.num_planning_attempts = 1
-            req.allowed_planning_time = 10.0
-            req.max_velocity_scaling_factor = vel_scale
-            req.max_acceleration_scaling_factor = vel_scale * 0.5
-            req.start_state.is_diff = True
-            goal_c = Constraints()
-            for name, pos in self._start_joints.items():
-                if name not in self.arm_joint_names:
-                    continue
-                jc = JointConstraint(); jc.joint_name = name
-                # Wrap to nearest equivalent of the current winding so this
-                # _execute_moveit return doesn't hit the same 2pi abort as Phase 0
-                # (mirrors _recovery_return and home_move).
-                jc.position = self._nearest_equiv_angle(name, pos)
-                jc.tolerance_above = 0.05; jc.tolerance_below = 0.05
-                jc.weight = 1.0; goal_c.joint_constraints.append(jc)
-            req.goal_constraints.append(goal_c)
-            ok, traj = self._plan(req)
+            ok, traj = self._plan(req_return)
             if ok and execute and self._wait_for_user("Phase8_return"):
                 self._execute_moveit(traj, "Phase8_return", timeout=90.0)
 
