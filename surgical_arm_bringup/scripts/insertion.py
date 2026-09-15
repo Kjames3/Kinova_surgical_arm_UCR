@@ -88,6 +88,8 @@ import sys
 import threading
 import time
 import subprocess
+import collections
+import collections.abc
 
 import rclpy
 import rclpy.time
@@ -121,13 +123,20 @@ from moveit_msgs.msg import (
 )
 from shape_msgs.msg import SolidPrimitive
 
+# Kortex API 2.6.0 ships protobuf 3.5.1, which still imports these aliases
+# from collections.  Python 3.10 moved them to collections.abc.
+for _name in ("MutableMapping", "Mapping", "Sequence", "MutableSequence",
+              "Callable", "Iterable"):
+    if not hasattr(collections, _name):
+        setattr(collections, _name, getattr(collections.abc, _name))
+
 try:
     from kortex_api.TCPTransport import TCPTransport
     from kortex_api.RouterClient import RouterClient
     from kortex_api.SessionManager import SessionManager
     from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
     from kortex_api.autogen.messages import Session_pb2, Base_pb2
-    _HAS_KORTEX_API = False
+    _HAS_KORTEX_API = True
 except ImportError:
     _HAS_KORTEX_API = False
 
@@ -781,12 +790,13 @@ class AngledInserter(Node):
             self.get_logger().error(f"  Kortex API Error: {e}")
             return False
         finally:
-            # Always restore Low-Level servoing for ros2_control
+            # ros2_control's position controller owns the arm in single-level
+            # servoing.  LOW_LEVEL_SERVOING is reserved for cyclic torque control.
             try:
-                mode.servoing_mode = Base_pb2.LOW_LEVEL_SERVOING
+                mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
                 self._kortex_base.SetServoingMode(mode)
             except Exception as e2:
-                self.get_logger().error(f"  Failed to restore LOW_LEVEL_SERVOING: {e2}")
+                self.get_logger().error(f"  Failed to restore SINGLE_LEVEL_SERVOING: {e2}")
 
     def _execute_moveit(self, traj, label, timeout=120.0):
         """Execute via MoveIt /execute_trajectory (OMPL / Pilz PTP paths)."""
@@ -1655,33 +1665,25 @@ class AngledInserter(Node):
         ee_end_circ   = self._ee_for_tip(hover_xyz, q_tilted_xyzw)
 
         if not self.get_parameter("direct_to_angled_hover").value:
-            # ── Phase 0: Approach above container ────────────────────────────
             self.get_logger().info(
                 f"\n--- [Phase 0] Approach above container ---")
-        ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
-        self.get_logger().info(
-            f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
-        req = self._build_pilz_ptp(
-            ee_ready[0], ee_ready[1], ee_ready[2], q_vertical, vel_scale,
-            joint_band=self.get_parameter("approach_joint_band").value)
-        ok, traj = self._plan(req)
-        if not ok:
-            self.get_logger().error("  Phase 0 planning failed.")
-            return
-        # Execute via direct FJT (NOT _execute_moveit): move_group re-normalizes
-        # continuous joints (1,3,5,7) into [-pi, pi] before forwarding, which the
-        # Pilz PTP-to-pose IK can leave 2pi from the arm's physical winding ->
-        # controller aborts with a state-tolerance violation (error -4). _execute_fjt
-        # goes straight to the controller and unwraps onto the live winding.
-        if execute and self._wait_for_user("Phase0_approach") and not self._execute_fjt(traj, "Phase0_approach"):
-            self._recovery_return(p); return
+            ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
+            self.get_logger().info(
+                f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
+            req = self._build_pilz_ptp(
+                ee_ready[0], ee_ready[1], ee_ready[2], q_vertical, vel_scale,
+                joint_band=self.get_parameter("approach_joint_band").value)
+            ok, traj = self._plan(req)
+            if not ok:
+                self.get_logger().error("  Phase 0 planning failed.")
+                return
+            if execute and self._wait_for_user("Phase0_approach") and not self._execute_fjt(traj, "Phase0_approach"):
+                self._recovery_return(p); return
 
-            # ── Phase 1: Vertical descent to hover_z ─────────────────────────
             pub_fb("Phase1_vertical_descent", 0.0)
             self.get_logger().info(f"\n--- [Phase 1] Vertical descent to hover_z ---")
             self.get_logger().info(
                 f"  EE hover: ({ee_hover[0]:.3f}, {ee_hover[1]:.3f}, {ee_hover[2]:.3f})")
-            
             if execute and self._wait_for_user("Phase1_vertical_descent"):
                 if self._kortex_base:
                     if not self._execute_kortex_lin(ee_hover[0], ee_hover[1], ee_hover[2], (q_vertical.x, q_vertical.y, q_vertical.z, q_vertical.w), "Phase1_vertical_descent"):
@@ -1707,6 +1709,7 @@ class AngledInserter(Node):
             if ret: self._recovery_return(p)
             return
 
+        if not self.get_parameter("direct_to_angled_hover").value:
             # ── Phase 2: Print geometry summary and optionally confirm ─────────
             self.get_logger().info(
                 f"\n--- [Phase 2] Tilt geometry ---\n"
