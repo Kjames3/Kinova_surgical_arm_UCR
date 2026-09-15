@@ -83,6 +83,7 @@ Usage
 import math
 from robot_model_parser import get_robot_info
 from kortex_utils import *
+import os
 import signal
 import sys
 import threading
@@ -111,6 +112,7 @@ import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import JointState
 from moveit_msgs.srv import GetMotionPlan, GetMotionSequence
+from std_msgs.msg import String
 from moveit_msgs.action import ExecuteTrajectory
 from builtin_interfaces.msg import Duration as RosDuration
 from control_msgs.action import FollowJointTrajectory
@@ -389,6 +391,10 @@ class AngledInserter(Node):
         # (WRONG_SERVOING_MODE, 2026-09-14), and the pose it sends is
         # bracelet_link while Kortex interprets it as the tool frame (+0.20 m).
         self.declare_parameter("use_kortex_lin",           False)
+        # Record every executed run with `ros2 bag record` for offline analysis.
+        # Phase boundaries go on /insertion/phase ("start:<label>" / "end:<label>:ok|fail").
+        self.declare_parameter("record_bag",               True)
+        self.declare_parameter("bag_dir",                  "~/insertion_bags")
         # Phase 4/6a travel the whole insertion axis from hover (~300 mm at 45 deg).
         # Only the stretch within insert_slow_zone_m (tip height above the
         # container top) runs at insert speed; the rest of the axis is a
@@ -510,6 +516,7 @@ class AngledInserter(Node):
         self._plan_cli = self.create_client(
             GetMotionPlan, "/plan_kinematic_path",
             callback_group=self._cb_group)
+        self._phase_pub = self.create_publisher(String, "/insertion/phase", 10)
         self._seq_cli = self.create_client(
             GetMotionSequence, "/plan_sequence_path",
             callback_group=self._cb_group)
@@ -841,6 +848,13 @@ class AngledInserter(Node):
                 self.get_logger().error(f"  Failed to restore SINGLE_LEVEL_SERVOING: {e2}")
 
     def _execute_moveit(self, traj, label, timeout=120.0):
+        """Execute via MoveIt /execute_trajectory, publishing phase markers for the bag."""
+        self._mark_phase(f"start:{label}")
+        ok = self._execute_moveit_inner(traj, label, timeout)
+        self._mark_phase(f"end:{label}:{'ok' if ok else 'fail'}")
+        return ok
+
+    def _execute_moveit_inner(self, traj, label, timeout):
         """Execute via MoveIt /execute_trajectory (OMPL / Pilz PTP paths)."""
         # Rewind onto the arm's actual joint winding: Pilz PTP-to-pose goals
         # (e.g. Phase 0) can sit 2π from the physical pose on a continuous joint,
@@ -871,7 +885,17 @@ class AngledInserter(Node):
         self.get_logger().warn(f"  [WARN] {label} MoveIt error {result.result.error_code.val}")
         return False
 
+    def _mark_phase(self, text):
+        self._phase_pub.publish(String(data=text))
+
     def _execute_fjt(self, traj, label, timeout=60.0):
+        """Execute via direct FJT, publishing phase start/end markers for the bag."""
+        self._mark_phase(f"start:{label}")
+        ok = self._execute_fjt_inner(traj, label, timeout)
+        self._mark_phase(f"end:{label}:{'ok' if ok else 'fail'}")
+        return ok
+
+    def _execute_fjt_inner(self, traj, label, timeout):
         """Execute via direct FJT (Cartesian paths — overrides 0.1 rad path tol)."""
         self._unwrap_trajectory(traj, ref_joints=self._live_joints)
         self._clamp_traj(traj)
@@ -1587,7 +1611,52 @@ class AngledInserter(Node):
 
         return result
 
+    _BAG_TOPICS = [
+        "/joint_states",                                   # positions + efforts
+        "/joint_trajectory_controller/controller_state",   # desired vs actual
+        "/tf", "/tf_static",
+        "/insertion/phase",
+        "/fused_marker_square_center",
+    ]
+
+    def _start_bag(self):
+        bag_dir = os.path.expanduser(self.get_parameter("bag_dir").value)
+        os.makedirs(bag_dir, exist_ok=True)
+        path = os.path.join(bag_dir, time.strftime("insertion_%Y%m%d_%H%M%S"))
+        try:
+            proc = subprocess.Popen(
+                ["ros2", "bag", "record", "-o", path] + self._BAG_TOPICS,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to start rosbag: {e}")
+            return None
+        time.sleep(1.5)   # let the recorder discover topics before motion starts
+        if proc.poll() is not None:
+            self.get_logger().warn(f"rosbag exited immediately (code {proc.returncode}).")
+            return None
+        self.get_logger().info(f"Recording bag: {path}")
+        return proc
+
+    def _stop_bag(self, proc):
+        if proc is None or proc.poll() is not None:
+            return
+        proc.send_signal(signal.SIGINT)   # SIGINT lets the recorder write its metadata
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        self.get_logger().info("Bag recording stopped.")
+
     def _run_impl(self, goal_handle, pub_fb):
+        record = (self.get_parameter("record_bag").value
+                  and not goal_handle.request.dry_run)
+        bag = self._start_bag() if record else None
+        try:
+            self._run_phases(goal_handle, pub_fb)
+        finally:
+            self._stop_bag(bag)
+
+    def _run_phases(self, goal_handle, pub_fb):
         vel_scale  = self.get_parameter("transit_velocity_scaling").value
         if vel_scale <= 0.0:
             vel_scale = self.get_parameter("max_velocity_scaling").value
@@ -1706,14 +1775,6 @@ class AngledInserter(Node):
         # The hollow container mesh should be published by setup_planning_scene.py instead.
 
         
-        # --- Telemetry: Start Rosbag ---
-        bag_process = None
-        bag_name = f"insertion_bag_{int(time.time())}"
-        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
-        try:
-            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
-        except Exception as e:
-            self.get_logger().warn(f"Failed to start rosbag: {e}")
 
         self.get_logger().info("=" * 62)
         self.get_logger().info("angled_insert — geometry")
@@ -1736,14 +1797,6 @@ class AngledInserter(Node):
             f"  Descent:          {geo['descent_m']*1000:.1f} mm")
         self.get_logger().info(f"  execute={execute}")
         
-        # --- Telemetry: Start Rosbag ---
-        bag_process = None
-        bag_name = f"insertion_bag_{int(time.time())}"
-        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
-        try:
-            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
-        except Exception as e:
-            self.get_logger().warn(f"Failed to start rosbag: {e}")
 
         self.get_logger().info("=" * 62)
 
@@ -2130,26 +2183,10 @@ class AngledInserter(Node):
                 self._execute_moveit(traj, "Phase8_return", timeout=90.0)
 
         
-        # --- Telemetry: Start Rosbag ---
-        bag_process = None
-        bag_name = f"insertion_bag_{int(time.time())}"
-        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
-        try:
-            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
-        except Exception as e:
-            self.get_logger().warn(f"Failed to start rosbag: {e}")
 
         self.get_logger().info("=" * 62)
         self.get_logger().info("angled_insert complete.")
         
-        # --- Telemetry: Start Rosbag ---
-        bag_process = None
-        bag_name = f"insertion_bag_{int(time.time())}"
-        self.get_logger().info(f"Starting telemetry recording: {bag_name}")
-        try:
-            bag_process = subprocess.Popen(["rosbag2", "record", "-o", bag_name, "/joint_states", "/tf", "/fused_marker_square_center"])
-        except Exception as e:
-            self.get_logger().warn(f"Failed to start rosbag: {e}")
 
         self.get_logger().info("=" * 62)
 
