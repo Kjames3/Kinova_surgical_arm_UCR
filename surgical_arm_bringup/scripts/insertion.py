@@ -381,6 +381,12 @@ class AngledInserter(Node):
         self.declare_parameter("insert_speed_mps",         0.01)  # Kortex LIN, m/s
         self.declare_parameter("insert_rot_speed_dps",     5.0)   # Kortex LIN, deg/s
         self.declare_parameter("insert_velocity_scaling",  0.05)  # Pilz fallback
+        # Phase 4/6a travel the whole insertion axis from hover (~300 mm at 45 deg).
+        # Only the stretch within insert_slow_zone_m (tip height above the
+        # container top) runs at insert speed; the rest of the axis is a
+        # straight LIN at axis_speed_mps. Both halves are rigid position moves.
+        self.declare_parameter("insert_slow_zone_m",       0.02)
+        self.declare_parameter("axis_speed_mps",           0.05)
         # Blend Phase 0 -> 1 and Phase 7 -> 8 into single motions via Pilz
         # /plan_sequence_path. Only free-space corners are blended: the tip
         # pivot (Phase 3) and the insertion stay exact. Falls back to the
@@ -423,7 +429,10 @@ class AngledInserter(Node):
         # Joint path-constraint half-width (rad) for the Phase 0 reorientation
         # PTP. Wider than the 1.2 used elsewhere because reaching tool-down from
         # a horizontal home can require a ~90° wrist swing.
-        self.declare_parameter("approach_joint_band", 2.6)
+        # 2026-09-14: 2.6 rejected target (0.45, -0.20) -- joint_6 needs -2.88 rad
+        # from home to tool-down there. joint_6 is bounded (+/-2.58 rad), so 3.6
+        # never binds it, while still keeping continuous joints off a 2*pi flip.
+        self.declare_parameter("approach_joint_band", 3.6)
 
         # CIRC arc parameters
         # n_circ_via_points: number of intermediate via-points for the arc.
@@ -1025,6 +1034,18 @@ class AngledInserter(Node):
         self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
         return False, None
 
+    def _axis_lin(self, ee_xyz, q, label, speed_mps, rot_speed_dps, pilz_scale):
+        """Rigid straight line along the insertion axis: Kortex LIN, else Pilz LIN."""
+        if self._kortex_base:
+            return self._execute_kortex_lin(*ee_xyz, (q.x, q.y, q.z, q.w), label,
+                                            speed_mps=speed_mps,
+                                            rot_speed_dps=rot_speed_dps)
+        ok, traj = self._plan(self._build_pilz_lin(*ee_xyz, q, pilz_scale))
+        if not ok:
+            self.get_logger().error(f"  {label} LIN planning failed.")
+            return False
+        return self._execute_fjt(traj, label)
+
     def _plan_sequence(self, reqs, blend_radii, timeout=45.0):
         """Plan several Pilz requests as one blended motion via /plan_sequence_path.
 
@@ -1533,6 +1554,8 @@ class AngledInserter(Node):
         ins_speed  = self.get_parameter("insert_speed_mps").value
         ins_rot    = self.get_parameter("insert_rot_speed_dps").value
         blend      = self.get_parameter("blend_transit").value
+        axis_speed = self.get_parameter("axis_speed_mps").value
+        slow_zone  = self.get_parameter("insert_slow_zone_m").value
         execute    = not goal_handle.request.dry_run
         real_robot = self.get_parameter("real_robot").value
         world_frame= self.get_parameter("world_frame").value
@@ -1922,23 +1945,25 @@ class AngledInserter(Node):
             f"  Descent:     {geo['descent_m']*1000:.1f} mm along "
             f"{math.degrees(geo['tilt_rad']):.1f}° axis")
 
+        # Pre-insert point: on the insertion axis, tip slow_zone above the top.
+        # Clamped so it never sits above the hover point.
+        pre_d = min((d_m + slow_zone) / max(math.cos(geo["tilt_rad"]), 1e-3),
+                    geo["descent_m"])
+        ax = geo["tool_axis"]
+        pre_tip = (target_xyz[0] - ax[0] * pre_d, target_xyz[1] - ax[1] * pre_d,
+                   target_xyz[2] - ax[2] * pre_d)
+        ee_pre = self._ee_for_tip(pre_tip, q_tilted_xyzw)
+        self.get_logger().info(
+            f"  Fast axis:   {(geo['descent_m'] - pre_d)*1000:.1f} mm at {axis_speed*100:.1f} cm/s\n"
+            f"  Slow insert: {pre_d*1000:.1f} mm at {ins_speed*1000:.1f} mm/s")
+
         if execute and self._wait_for_user("Phase4_angled_descent"):
-            if self._kortex_base:
-                if not self._execute_kortex_lin(ee_target[0], ee_target[1], ee_target[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase4_angled_descent",
-                                                speed_mps=ins_speed, rot_speed_dps=ins_rot):
-                    self._recovery_return(p); return
-            else:
-                req = self._build_pilz_lin(*ee_target, q_tilted, ins_scale)
-                ok, traj_descent = self._plan(req)
-                if not ok:
-                    self.get_logger().warn("  Pilz LIN failed for Phase 4. Falling back to Pilz PTP.")
-                    req = self._build_pilz_ptp(*ee_target, q_tilted, ins_scale)
-                    ok, traj_descent = self._plan(req)
-                if not ok:
-                    self.get_logger().error("  Phase 4 angled descent planning failed (both LIN and PTP).")
-                    self._recovery_return(p); return
-                if not self._execute_fjt(traj_descent, "Phase4_angled_descent"):
-                    self._recovery_return(p); return
+            if geo["descent_m"] - pre_d > 1e-3 and not self._axis_lin(
+                    ee_pre, q_tilted, "Phase4a_axis_approach", axis_speed, 15.0, vel_scale):
+                self._recovery_return(p); return
+            if not self._axis_lin(ee_target, q_tilted, "Phase4b_insert",
+                                  ins_speed, ins_rot, ins_scale):
+                self._recovery_return(p); return
 
         # ── Phase 5: Hold ──────────────────────────────────────────────────
         self.get_logger().info(f"\n--- [Phase 5] Hold at target ---")
@@ -1954,20 +1979,13 @@ class AngledInserter(Node):
         # ── Phase 6a: Reverse angled ascent ───────────────────────────────
         self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
         if execute and self._wait_for_user("Phase6a_angled_ascent"):
-            if self._kortex_base:
-                if not self._execute_kortex_lin(ee_end_circ[0], ee_end_circ[1], ee_end_circ[2], (q_tilted.x, q_tilted.y, q_tilted.z, q_tilted.w), "Phase6a_angled_ascent",
-                                                speed_mps=ins_speed, rot_speed_dps=ins_rot):
-                    self._recovery_return(p); return
-            else:
-                req = self._build_pilz_lin(*ee_end_circ, q_tilted, ins_scale)
-                ok, traj_asc = self._plan(req)
-                if ok:
-                    if not self._execute_fjt(traj_asc, "Phase6a_angled_ascent"):
-                        self._recovery_return(p); return
-                else:
-                    self.get_logger().warn("  Angled ascent planning failed — attempting recovery.")
-                    self._recovery_return(p); return
-        
+            if not self._axis_lin(ee_pre, q_tilted, "Phase6a_extract",
+                                  ins_speed, ins_rot, ins_scale):
+                self._recovery_return(p); return
+            if geo["descent_m"] - pre_d > 1e-3 and not self._axis_lin(
+                    ee_end_circ, q_tilted, "Phase6a_axis_retreat", axis_speed, 15.0, vel_scale):
+                self._recovery_return(p); return
+
         if not self.get_parameter("direct_to_angled_hover").value:
             # ── Phase 6b: Reverse CIRC rotation back to vertical ──────────────
             self.get_logger().info(f"\n--- [Phase 6b] Reverse CIRC rotation to vertical ---")
