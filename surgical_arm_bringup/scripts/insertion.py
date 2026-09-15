@@ -1202,8 +1202,14 @@ class AngledInserter(Node):
         return req
 
     def _build_pilz_lin(self, ee_x, ee_y, ee_z, pen_q, vel_scale,
-                         start_state=None):
-        """Pilz LIN straight-line Cartesian move to EE pose."""
+                         start_state=None, link=None):
+        """Pilz LIN straight-line Cartesian move to a pose of `link` (default ee_link).
+
+        With link=tip_link and the tip position unchanged, this is a pure
+        rotation about the tip (verified 2026-09-14: 0.01 mm tip drift). The
+        tip frame shares bracelet_link's orientation, so the same quaternions apply.
+        """
+        link = link or self.get_parameter("ee_link").value
         req = MotionPlanRequest()
         req.group_name   = self.get_parameter("move_group_name").value
         req.planner_id   = "LIN"
@@ -1226,11 +1232,11 @@ class AngledInserter(Node):
         bv.primitives.append(sphere); bv.primitive_poses.append(bv_pose)
         pos_c = PositionConstraint()
         pos_c.header.frame_id = self.get_parameter("world_frame").value
-        pos_c.link_name       = self.get_parameter("ee_link").value
+        pos_c.link_name       = link
         pos_c.constraint_region = bv; pos_c.weight = 1.0
         ori_c = OrientationConstraint()
         ori_c.header.frame_id = self.get_parameter("world_frame").value
-        ori_c.link_name       = self.get_parameter("ee_link").value
+        ori_c.link_name       = link
         ori_c.orientation = pen_q
         ori_c.absolute_x_axis_tolerance = 0.01
         ori_c.absolute_y_axis_tolerance = 0.01
@@ -1324,6 +1330,9 @@ class AngledInserter(Node):
         pos_via.constraint_region = bv_via
         pos_via.weight            = 1.0
         path_c = Constraints()
+        # Pilz only accepts a CIRC path constraint named "interim" or "center";
+        # unnamed, every CIRC was rejected and Phase 3/6b fell back to two LINs.
+        path_c.name = "interim"
         path_c.position_constraints.append(pos_via)
         req.path_constraints = path_c
 
@@ -1884,13 +1893,26 @@ class AngledInserter(Node):
                 f"  Arc radius (EE from tip): {arc_r*100:.1f} cm  "
                 f"(expected {math.sqrt(sum(v**2 for v in local_tip_offset))*100:.1f} cm)")
     
-            req = self._build_pilz_circ(
-                ee_start_circ, ee_via_circ, ee_end_circ,
-                q_vertical, q_via, q_tilted,
-                vel_scale)
-            ok, traj = self._plan(req, timeout=20.0)
+            # Primary: LIN on the tip link -- the tip holds still and the wrist
+            # swings. Pilz CIRC through /plan_kinematic_path is rejected in
+            # Humble (its "interim" via-point is re-checked as a path constraint).
+            ok, traj = self._plan(self._build_pilz_lin(
+                *hover_xyz, q_tilted, vel_scale, link=tip_link))
+            tip_rotated = ok
+            if ok:
+                self.get_logger().info("  [PASS] tip-pivot rotation planned.")
+                if execute and self._wait_for_user("Phase3_tip_rotate") and not self._execute_fjt(traj, "Phase3_tip_rotate"):
+                    self._recovery_return(p); return
+            else:
+                req = self._build_pilz_circ(
+                    ee_start_circ, ee_via_circ, ee_end_circ,
+                    q_vertical, q_via, q_tilted,
+                    vel_scale)
+                ok, traj = self._plan(req, timeout=20.0)
     
-            if not ok:
+            if tip_rotated:
+                pass
+            elif not ok:
                 self.get_logger().warn(
                     "  Pilz CIRC failed — falling back to two sequential Pilz LIN "
                     "moves (via half-tilt, then full tilt).\n"
@@ -1988,13 +2010,23 @@ class AngledInserter(Node):
 
         if not self.get_parameter("direct_to_angled_hover").value:
             # ── Phase 6b: Reverse CIRC rotation back to vertical ──────────────
-            self.get_logger().info(f"\n--- [Phase 6b] Reverse CIRC rotation to vertical ---")
-            req = self._build_pilz_circ(
-                ee_end_circ, ee_via_circ, ee_start_circ,
-                q_tilted, q_via, q_vertical,
-                vel_scale)
-            ok, traj_circ_rev = self._plan(req, timeout=20.0)
-            if not ok:
+            self.get_logger().info(f"\n--- [Phase 6b] Reverse rotation to vertical ---")
+            ok, traj_rot = self._plan(self._build_pilz_lin(
+                *hover_xyz, q_vertical, vel_scale, link=tip_link))
+            tip_rotated = ok
+            if ok:
+                self.get_logger().info("  [PASS] reverse tip-pivot rotation planned.")
+                if execute and self._wait_for_user("Phase6b_tip_rotate") and not self._execute_fjt(traj_rot, "Phase6b_tip_rotate"):
+                    self._recovery_return(p); return
+            else:
+                req = self._build_pilz_circ(
+                    ee_end_circ, ee_via_circ, ee_start_circ,
+                    q_tilted, q_via, q_vertical,
+                    vel_scale)
+                ok, traj_circ_rev = self._plan(req, timeout=20.0)
+            if tip_rotated:
+                pass
+            elif not ok:
                 # Fallback: two LIN moves back
                 self.get_logger().warn("  Reverse CIRC failed — using LIN fallback.")
                 req_via = self._build_pilz_lin(*ee_via_circ, q_via, vel_scale)
