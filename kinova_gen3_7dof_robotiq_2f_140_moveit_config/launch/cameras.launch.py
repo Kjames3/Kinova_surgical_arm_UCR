@@ -56,21 +56,30 @@ def launch_setup(context, *args, **kwargs):
 
     # ── Global RealSense D435I calibration TFs ───────────────────────────────
     # eye-to-base: base_link → global_camera_color_optical_frame
-    # Source: easy_handeye2 calibration result
-    # Quaternion norm: 0.999979 (OK)
+    # Source: calibration_for_cameras.py automatic sweep, 2026-09-03,
+    #   ANDREFF solver, 15 samples, consistency residual 1.8 mm / 0.25 deg.
+    #   Supersedes the pre-2026-09-03 value (0.99, -0.13, 0.77) -- the camera
+    #   was physically moved, so that one is obsolete rather than merely stale.
+    # Validated independently by validate_handeye_extrinsic.py --mode table
+    #   against a 143.7 mm tag36h11 lying on the table: +6.5 mm height error,
+    #   1.78 deg normal tilt, implied tag side 144.9 mm vs 143.7 measured.
+    #   The old value scored +80.4 mm / 3.24 deg / 159.8 mm on the same tag.
+    # NOTE the child frame. calibration_for_cameras.py prints a copy-paste line
+    #   naming "camera_color_optical_frame", which is the WRIST camera's frame;
+    #   publishing that would re-parent this static camera onto the moving arm.
     calibration_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
         name="calibration_tf_publisher",
         output="log",
         arguments=[
-            "--x",  "0.99",
-            "--y",  "-0.13",
-            "--z",  "0.77",
-            "--qx", "0.6220",
-            "--qy", "0.6099",
-            "--qz", "-0.3475",
-            "--qw", "-0.3469",
+            "--x",  "1.030907",
+            "--y",  "0.036634",
+            "--z",  "0.731535",
+            "--qx", "0.639427",
+            "--qy", "0.611209",
+            "--qz", "-0.327313",
+            "--qw", "-0.332299",
             "--frame-id",       "base_link",
             "--child-frame-id", "global_camera_color_optical_frame",
         ],

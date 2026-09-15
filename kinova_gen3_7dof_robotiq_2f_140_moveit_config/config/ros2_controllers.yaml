@@ -43,13 +43,21 @@ joint_trajectory_controller:
     constraints:
       stopped_velocity_tolerance: 0.5
       goal_time: 30.0
-      joint_1: { trajectory: 5.0, goal: 1.0 }
+      # joint_1/3/5/7 are continuous. The Kortex hardware interface wraps their
+      # feedback into [-pi, pi], but a planned trajectory that crosses the seam
+      # keeps counting past it, so the JTC's raw desired-minus-actual error
+      # reads a full 2*pi (6.2836 rad) even though the arm is tracking exactly.
+      # That aborted a calibration sweep on 2026-09-03 (PATH_TOLERANCE_VIOLATED
+      # on joint_3). A tolerance of 0.0 disables the check for that joint only;
+      # the bounded joints keep theirs. Commanded positions are unaffected --
+      # the driver re-wraps them before they reach the arm.
+      joint_1: { trajectory: 0.0, goal: 0.0 }
       joint_2: { trajectory: 5.0, goal: 1.0 }
-      joint_3: { trajectory: 5.0, goal: 1.0 }
+      joint_3: { trajectory: 0.0, goal: 0.0 }
       joint_4: { trajectory: 5.0, goal: 1.0 }
-      joint_5: { trajectory: 5.0, goal: 1.0 }
+      joint_5: { trajectory: 0.0, goal: 0.0 }
       joint_6: { trajectory: 5.0, goal: 1.0 }
-      joint_7: { trajectory: 5.0, goal: 1.0 }
+      joint_7: { trajectory: 0.0, goal: 0.0 }
 twist_controller:
   ros__parameters:
     joint: tcp

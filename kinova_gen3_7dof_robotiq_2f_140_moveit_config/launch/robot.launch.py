@@ -11,9 +11,10 @@
 # ── FRAME REFERENCE ──────────────────────────────────────────────────────────
 # world → base_link (static, identity)
 # base_link → global_camera_color_optical_frame
-#   x=0.99 y=-0.13 z=0.77
-#   qx=0.6220 qy=0.6099 qz=-0.3475 qw=-0.3469
-#   ⚠ STALE — redo easy_handeye2 calibration
+#   x=1.030907 y=0.036634 z=0.731535
+#   qx=0.639427 qy=0.611209 qz=-0.327313 qw=-0.332299
+#   Recalibrated 2026-09-03 after the camera was physically moved; validated to
+#   +6.5 mm / 1.78 deg against a 143.7 mm tag36h11 on the table.
 # end_effector_link → pen_tip
 #   xyz="0 0 -0.15452"  (154.52 mm down tool axis, EE -Z direction)
 # end_effector_link → camera_color_frame
