@@ -264,7 +264,7 @@ class CombineCamerasNode(Node):
         self.declare_parameter("realsense_info_topic", "/realsense/camera/color/camera_info")
         
         # Camera 2 Configurations: OAK-D
-        self.declare_parameter("camera_oakd_enabled", True)
+        self.declare_parameter("camera_oakd_enabled", False)  # dropped: extrinsic ~267 mm wrong
         self.declare_parameter("oakd_image_topic", "/global_camera/color/image_raw")
         self.declare_parameter("oakd_info_topic", "/global_camera/depth/camera_info")
         

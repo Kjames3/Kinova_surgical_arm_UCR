@@ -145,8 +145,10 @@ def generate_launch_description():
             description="Launch Kinova wrist camera via kinova_vision RTSP driver."),
         DeclareLaunchArgument(
             "launch_oak_camera",
-            default_value="true",
-            description="Launch OAK-D via oak_camera_node.py (depthai v3 standalone)."),
+            default_value="false",
+            description="Launch OAK-D via oak_camera_node.py (depthai v3 standalone). "
+                        "Off: the OAK-D is dropped from the paper setup and its "
+                        "extrinsic is ~267 mm wrong."),
     ]
 
     return LaunchDescription(
