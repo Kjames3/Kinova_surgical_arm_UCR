@@ -120,9 +120,38 @@ def launch_setup(context, *args, **kwargs):
         ]
     )
 
+    # ── Global RealSense D435i extrinsic — base_link → colour optical frame ──
+    # Without this the RealSense contributes NOTHING: combine_cameras.py looks up
+    # world → camera_color_optical_frame and drops every frame when it fails.
+    #
+    # Why this is published by hand rather than by setting publish_tf:=true on
+    # the camera node: the D435i's own TF tree is rooted at `camera_link`, and
+    # `camera_link` is ALREADY taken by the Kinova wrist camera, where it hangs
+    # off end_effector_link.  Letting the RealSense publish would re-parent the
+    # static table camera onto the moving wrist.  Publishing the optical frame
+    # directly from base_link sidesteps the collision entirely.
+    #
+    # Source: the 2026-09-03 recalibration after the camera was physically moved
+    # (same values as cameras.launch.py), validated to +6.5 mm / 1.78 deg against
+    # a 143.7 mm tag36h11 on the table.  Re-check after any camera move with
+    #   validate_handeye_extrinsic.py --mode table
+    realsense_static_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_tf_base_to_realsense",
+        output="log",
+        arguments=[
+            "--x", "1.030907", "--y", "0.036634", "--z", "0.731535",
+            "--qx", "0.639427", "--qy", "0.611209", "--qz", "-0.327313", "--qw", "-0.332299",
+            "--frame-id", "base_link",
+            "--child-frame-id", "camera_color_optical_frame",
+        ],
+    )
+
     return [
         robot_launch,
         realsense_node,
+        realsense_static_tf,
         oak_camera,
         oak_static_tf,
         wrist_camera_delayed,
