@@ -31,11 +31,28 @@ surface normal (straight up) and a known height, so:
     camera-to-marker range linearly and therefore biases position along the
     viewing ray.
 
+A third mode turns the invariance test around for the WRIST camera.  There the
+camera rides on the arm and the markers stay on the table, so the constant is
+the marker's position in base_link:
+
+    T_base_marker = T_base_ee . T_ee_cam . T_cam_marker
+
+`T_ee_cam` is the eye-in-hand transform under test.  Every named candidate is
+scored against the same capture, so they are compared on identical data;
+--save-samples / --load-samples keep the capture for rescoring offline (no ROS
+graph needed for --load-samples).  Samples are only taken while the arm is
+still, because the wrist stream lags TF by an unknown ~0.1-0.3 s.
+
   python3 validate_handeye_extrinsic.py --mode invariance --extrinsic new
   python3 validate_handeye_extrinsic.py --mode table --extrinsic new
   python3 validate_handeye_extrinsic.py --mode table --table-marker-size 0.04
+  python3 validate_handeye_extrinsic.py --mode wrist --table-marker-size 0.05 \\
+      --save-samples ~/robot-logs/wrist_handeye.npz
+  python3 validate_handeye_extrinsic.py --mode wrist --load-samples wrist_handeye.npz
 """
 import argparse
+import collections
+import os
 import sys
 import threading
 import time
@@ -57,6 +74,34 @@ KNOWN_EXTRINSICS = {
     # Previously published in cameras.launch.py, flagged STALE in robot.launch.py.
     "old": (0.99, -0.13, 0.77, 0.6220, 0.6099, -0.3475, -0.3469),
 }
+
+# Named eye-in-hand candidates, end_effector_link -> wrist colour optical frame
+# (camera_link == camera_color_frame; kinova_vision publishes that identity),
+# as URDF xyz + rpy.
+WRIST_HANDEYE = {
+    # Upstream ros2_kortex gen3_macro.xacro -- what this workspace's URDF uses.
+    "urdf": ((0.0, 0.05639, -0.00305), (np.pi, np.pi, 0.0)),
+    # Same mount, 16 mm further along the tool axis: the sim-camera offset that
+    # the KinovaARM stack on REAL-1 switched to on 2026-10-05.
+    "nominal_z13": ((0.0, 0.05639, 0.01305), (0.0, 0.0, np.pi)),
+    # The easy_handeye2 result quoted in cameras.launch.py / robot.launch.py.
+    # Its optical axis sits 41 deg off the tool axis; kept to be measured, not
+    # because it is plausible.
+    "easy_handeye2": ((-0.0494305, 0.049587, 0.00395126),
+                      (0.66454839, 0.30604363, 1.09121110)),
+}
+
+
+def rpy_to_matrix(roll, pitch, yaw):
+    """URDF fixed-axis rpy: R = Rz(yaw) Ry(pitch) Rx(roll)."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+        [-sp,   cp*sr,            cp*cr],
+    ])
 
 
 def quat_to_matrix(quat_xyzw):
@@ -90,6 +135,138 @@ def mean_rotation(rotations):
         U[:, -1] *= -1
         R = U @ Vt
     return R
+
+
+def parse_handeye(text):
+    """A WRIST_HANDEYE name or x,y,z,qx,qy,qz,qw -> (label, 4x4 T_ee_cam)."""
+    if text in WRIST_HANDEYE:
+        xyz, rpy = WRIST_HANDEYE[text]
+        return text, homogeneous(rpy_to_matrix(*rpy), xyz)
+    values = [float(v) for v in text.replace(" ", "").split(",")]
+    if len(values) != 7:
+        raise ValueError(
+            f"--handeye needs one of {sorted(WRIST_HANDEYE)} or x,y,z,qx,qy,qz,qw")
+    return "custom", homogeneous(quat_to_matrix(values[3:7]), values[0:3])
+
+
+def marker_in_base(corners, size, K, D, T_base_cam):
+    """Pose of one flat square marker in base_link, or None.
+
+    Same disambiguation as check_table_markers: IPPE returns both planar
+    solutions and the one whose normal is closest to vertical wins.
+    """
+    obj = np.array([[-size/2,  size/2, 0], [ size/2,  size/2, 0],
+                    [ size/2, -size/2, 0], [-size/2, -size/2, 0]],
+                   dtype=np.float32)
+    count, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+        obj, np.asarray(corners, dtype=np.float32).reshape(4, 2), K, D,
+        flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    best = None
+    for k in range(count):
+        R, _ = cv2.Rodrigues(rvecs[k])
+        T = T_base_cam @ homogeneous(R, tvecs[k].flatten())
+        normal = T[:3, 2]
+        tilt = float(np.degrees(np.arccos(np.clip(
+            abs(normal[2]) / np.linalg.norm(normal), -1.0, 1.0))))
+        if best is None or tilt < best[1]:
+            best = (T[:3, 3], tilt)
+    return best
+
+
+def score_wrist_samples(samples, K, D, candidates, marker_size, table_z):
+    """Score each eye-in-hand candidate on one capture.  Pure numpy/OpenCV.
+
+    samples: [{"T_base_ee": 4x4, "markers": {id: 4x2 pixel corners}}]
+    candidates: {label: 4x4 T_ee_cam}
+    Returns {label: {"per_marker": {id: {...}}, "spread_rms_mm", "spread_max_mm",
+    "tilt_deg", "z_err_mm", "poses"}}; a marker needs 2+ poses to count.
+    """
+    scores = {}
+    for label, T_ee_cam in candidates.items():
+        tracks = collections.defaultdict(list)
+        for sample in samples:
+            T_base_cam = sample["T_base_ee"] @ T_ee_cam
+            for marker_id, corners in sample["markers"].items():
+                solved = marker_in_base(corners, marker_size, K, D, T_base_cam)
+                if solved is not None:
+                    tracks[marker_id].append(solved)
+        per_marker, deviations, tilts, z_errors = {}, [], [], []
+        for marker_id, track in sorted(tracks.items()):
+            if len(track) < 2:
+                continue
+            positions = np.array([p for p, _ in track])
+            dev = np.linalg.norm(positions - positions.mean(axis=0), axis=1)
+            tilt = float(np.mean([t for _, t in track]))
+            per_marker[marker_id] = {
+                "n": len(track),
+                "mean": positions.mean(axis=0),
+                "spread_rms_mm": 1000 * float(np.sqrt((dev ** 2).mean())),
+                "spread_max_mm": 1000 * float(dev.max()),
+                "tilt_deg": tilt,
+            }
+            deviations.extend(dev.tolist())
+            tilts.append(tilt)
+            z_errors.append(abs(positions[:, 2].mean() - table_z))
+        if not per_marker:
+            scores[label] = None
+            continue
+        deviations = np.array(deviations)
+        scores[label] = {
+            "per_marker": per_marker,
+            "spread_rms_mm": 1000 * float(np.sqrt((deviations ** 2).mean())),
+            "spread_max_mm": 1000 * float(deviations.max()),
+            "tilt_deg": float(np.max(tilts)),
+            "z_err_mm": 1000 * float(np.max(z_errors)),
+            "poses": max(m["n"] for m in per_marker.values()),
+        }
+    return scores
+
+
+def save_wrist_samples(path, samples, K, D):
+    rows = [(i, marker_id) for i, s in enumerate(samples) for marker_id in s["markers"]]
+    np.savez(os.path.expanduser(path), K=K, D=D,
+             T_base_ee=np.array([s["T_base_ee"] for s in samples]),
+             index=np.array(rows, dtype=int).reshape(-1, 2),
+             corners=np.array([samples[i]["markers"][m] for i, m in rows],
+                              dtype=float).reshape(-1, 4, 2))
+
+
+def load_wrist_samples(path):
+    data = np.load(os.path.expanduser(path))
+    samples = [{"T_base_ee": T, "markers": {}} for T in data["T_base_ee"]]
+    for (i, marker_id), corners in zip(data["index"], data["corners"]):
+        samples[int(i)]["markers"][int(marker_id)] = corners
+    return samples, data["K"], data["D"]
+
+
+def report_wrist(scores, n_samples, args, log=print):
+    log("=" * 78)
+    log(f"WRIST EYE-IN-HAND CHECK over {n_samples} still arm poses, "
+        f"marker side {1000*args.table_marker_size:.1f} mm")
+    usable = {k: v for k, v in scores.items() if v}
+    if not usable:
+        log("  No table marker was seen from 2+ poses -- nothing to score. Put a "
+            "flat marker in the wrist view and move the arm between samples.")
+        log("=" * 78)
+        return False
+    for label, score in sorted(usable.items(), key=lambda kv: kv[1]["spread_rms_mm"]):
+        log(f"  {label:14s} position spread RMS {score['spread_rms_mm']:6.1f} mm, "
+            f"max {score['spread_max_mm']:6.1f} mm | worst tilt "
+            f"{score['tilt_deg']:5.2f} deg | worst |z - table| "
+            f"{score['z_err_mm']:6.1f} mm")
+        for marker_id, m in score["per_marker"].items():
+            p = m["mean"]
+            log(f"      id {marker_id}: {m['n']} poses, base_link mean = "
+                f"({p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f}) m, "
+                f"spread RMS {m['spread_rms_mm']:.1f} mm")
+    log("  A correct transform gives a spread near the marker-PnP noise floor "
+        "(a few mm) that does not grow with arm travel. Compare the base_link")
+    log("  means against --mode table on the RealSense for the same marker ids.")
+    if not args.table_marker_size_known:
+        log("  NOTE: --table-marker-size was not given; spreads and z are scaled "
+            "by a guess. Only the tilt and the candidate RANKING are meaningful.")
+    log("=" * 78)
+    return True
 
 
 def build_board_object_points(args):
@@ -129,6 +306,8 @@ class ExtrinsicValidator(Node):
         self.K = None
         self.D = None
         self.samples = []
+        self.recent_poses = collections.deque()
+        self.started = time.monotonic()
 
         dictionary = cv2.aruco.getPredefinedDictionary(
             getattr(cv2.aruco, args.aruco_dict))
@@ -218,11 +397,11 @@ class ExtrinsicValidator(Node):
         R, _ = cv2.Rodrigues(rvec)
         return (homogeneous(R, tvec.flatten()), len(visible), rms), None
 
-    def lookup_bracelet(self):
+    def lookup_bracelet(self, timeout=1.0):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.args.robot_base_frame, self.args.robot_effector_frame,
-                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
+                rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=timeout))
         except Exception as exc:
             return None, str(exc)
         t = tf.transform.translation
@@ -265,6 +444,54 @@ class ExtrinsicValidator(Node):
         self.get_logger().info(
             f"sample {len(self.samples)}: {visible} tags, reproj {rms:.2f}px, "
             f"board in bracelet = ({p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f}) m")
+        return None
+
+    # ── wrist eye-in-hand sampling ───────────────────────────────────────────
+    def arm_is_still(self, T_base_ee):
+        """True once the effector has not moved for --still-seconds."""
+        now = time.monotonic()
+        self.recent_poses.append((now, T_base_ee))
+        while now - self.recent_poses[0][0] > self.args.still_seconds:
+            self.recent_poses.popleft()
+        if now - self.started < self.args.still_seconds:
+            return False
+        for _, prev in self.recent_poses:
+            if (np.linalg.norm(prev[:3, 3] - T_base_ee[:3, 3]) > 0.0005 or
+                    rotation_angle_deg(prev[:3, :3].T @ T_base_ee[:3, :3]) > 0.05):
+                return False
+        return True
+
+    def try_wrist_sample(self):
+        # Never block here: a lookup that waits stops the loop draining /tf.
+        T_base_ee, err = self.lookup_bracelet(timeout=0.0)
+        if T_base_ee is None:
+            return f"TF unavailable: {err}"
+        if not self.arm_is_still(T_base_ee):
+            with self.lock:
+                self.frame = None  # frames from before the stop are stale
+            return None
+        with self.lock:
+            frame = self.frame.copy() if self.frame is not None else None
+        if frame is None:
+            return "no image yet"
+        if not self.pose_is_new(T_base_ee):
+            return None
+        corners, ids, _ = self.table_detector.detectMarkers(frame)
+        wanted = {int(x.strip()) for x in self.args.table_marker_ids.split(",")
+                  if x.strip()}
+        markers = {} if ids is None else {
+            marker_id: c.reshape(4, 2).astype(float)
+            for c, marker_id in zip(corners, ids.flatten().tolist())
+            if marker_id in wanted}
+        if not markers:
+            return "arm is still but no requested table marker is in the wrist view"
+        # "T_base_bracelet" is the key pose_is_new compares on.
+        self.samples.append({"T_base_bracelet": T_base_ee, "T_base_ee": T_base_ee,
+                             "markers": markers})
+        p = T_base_ee[:3, 3]
+        self.get_logger().info(
+            f"sample {len(self.samples)}: markers {sorted(markers)} with the "
+            f"effector at ({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}) m")
         return None
 
     # ── static table-marker check ────────────────────────────────────────────
@@ -430,13 +657,16 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--extrinsic", default="new",
                    help="'new', 'old', or x,y,z,qx,qy,qz,qw (base_link -> camera)")
-    p.add_argument("--image-topic", default="/realsense/camera/color/image_raw")
-    p.add_argument("--camera-info-topic",
-                   default="/realsense/camera/color/camera_info")
+    p.add_argument("--image-topic", default=None,
+                   help="default /realsense/camera/color/image_raw, or "
+                        "/camera/color/image_raw in wrist mode")
+    p.add_argument("--camera-info-topic", default=None,
+                   help="default: camera_info beside --image-topic")
     p.add_argument("--image-transport", choices=["raw", "compressed"],
                    default="compressed")
     p.add_argument("--robot-base-frame", default="base_link")
-    p.add_argument("--robot-effector-frame", default="bracelet_link")
+    p.add_argument("--robot-effector-frame", default=None,
+                   help="default bracelet_link, or end_effector_link in wrist mode")
     p.add_argument("--aruco-dict", default="DICT_5X5_50")
     p.add_argument("--marker-size", type=float, default=0.0533)
     p.add_argument("--marker-gap", type=float, default=0.00505)
@@ -448,9 +678,23 @@ def build_parser():
     p.add_argument("--max-reprojection-error-px", type=float, default=2.0)
     p.add_argument("--min-pose-separation-m", type=float, default=0.02)
     p.add_argument("--min-pose-separation-deg", type=float, default=4.0)
-    p.add_argument("--mode", choices=["invariance", "table"], default="invariance",
+    p.add_argument("--mode", choices=["invariance", "table", "wrist"],
+                   default="invariance",
                    help="invariance: board-on-arm, needs motion. "
-                        "table: flat markers on the table, static.")
+                        "table: flat markers on the table, static. "
+                        "wrist: eye-in-hand, table markers seen from several "
+                        "still arm poses.")
+    p.add_argument("--handeye", default=",".join(WRIST_HANDEYE),
+                   help="wrist mode: comma-separated candidate names "
+                        f"({', '.join(WRIST_HANDEYE)}), or ONE custom "
+                        "x,y,z,qx,qy,qz,qw (end_effector_link -> optical)")
+    p.add_argument("--still-seconds", type=float, default=1.0,
+                   help="wrist mode: the arm must be stationary this long "
+                        "before a frame is trusted")
+    p.add_argument("--save-samples", default=None,
+                   help="wrist mode: write the capture to this .npz")
+    p.add_argument("--load-samples", default=None,
+                   help="wrist mode: score a saved .npz instead of capturing")
     p.add_argument("--table-marker-dict", default="DICT_4X4_50")
     p.add_argument("--table-marker-ids", default="0,1")
     p.add_argument("--table-marker-size", type=float, default=None,
@@ -464,17 +708,90 @@ def build_parser():
     return p
 
 
+def parse_handeye_candidates(text):
+    names = [n.strip() for n in text.split(",") if n.strip()]
+    if names and all(n in WRIST_HANDEYE for n in names):
+        return dict(parse_handeye(n) for n in names)
+    return dict([parse_handeye(text)])
+
+
+def run_wrist(args, candidates):
+    if args.load_samples:
+        samples, K, D = load_wrist_samples(args.load_samples)
+        scores = score_wrist_samples(samples, K, D, candidates,
+                                     args.table_marker_size, args.table_z)
+        return 0 if report_wrist(scores, len(samples), args) else 1
+
+    rclpy.init()
+    node = ExtrinsicValidator(args, np.eye(4))
+    log = node.get_logger()
+    log.info(f"Wrist eye-in-hand check, candidates: {', '.join(candidates)}. "
+             f"Read-only. Move the arm through {args.samples} distinct poses "
+             "that keep a table marker in the wrist view, pausing "
+             f"{args.still_seconds:.0f} s at each. Ctrl-C to score early.")
+    deadline = time.monotonic() + args.timeout
+    last_note = None
+    try:
+        while rclpy.ok() and len(node.samples) < args.samples:
+            # spin_once handles ONE callback. With a whole stack publishing /tf
+            # that starved the buffer (empty for 12 s on 2026-10-06), so drain.
+            drain_until = time.monotonic() + 0.1
+            rclpy.spin_once(node, timeout_sec=0.1)
+            while time.monotonic() < drain_until:
+                rclpy.spin_once(node, timeout_sec=0.0)
+            if time.monotonic() > deadline:
+                log.warn("Timed out waiting for poses.")
+                break
+            note = node.try_wrist_sample()
+            if note and note != last_note:
+                log.info(f"waiting: {note}")
+            last_note = note
+    except KeyboardInterrupt:
+        pass
+    ok = False
+    try:
+        with node.lock:
+            K, D = node.K, node.D
+        if node.samples and K is not None:
+            if args.save_samples:
+                save_wrist_samples(args.save_samples, node.samples, K, D)
+                log.info(f"capture saved to {args.save_samples}")
+            scores = score_wrist_samples(node.samples, K, D, candidates,
+                                         args.table_marker_size, args.table_z)
+            ok = report_wrist(scores, len(node.samples), args, log=log.info)
+        else:
+            log.error("No samples collected.")
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0 if ok else 1
+
+
 def main():
     args = build_parser().parse_args()
     try:
         T_base_cam = parse_extrinsic(args.extrinsic)
+        candidates = parse_handeye_candidates(args.handeye)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    wrist = args.mode == "wrist"
+    if args.image_topic is None:
+        args.image_topic = ("/camera/color/image_raw" if wrist
+                            else "/realsense/camera/color/image_raw")
+    if args.camera_info_topic is None:
+        args.camera_info_topic = args.image_topic.rsplit("/", 1)[0] + "/camera_info"
+    if args.robot_effector_frame is None:
+        args.robot_effector_frame = "end_effector_link" if wrist else "bracelet_link"
+
     args.table_marker_size_known = args.table_marker_size is not None
     if args.table_marker_size is None:
         args.table_marker_size = 0.04   # placeholder; normals are scale-free
+
+    if wrist:
+        return run_wrist(args, candidates)
 
     rclpy.init()
     node = ExtrinsicValidator(args, T_base_cam)

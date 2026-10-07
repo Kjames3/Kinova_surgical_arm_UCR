@@ -17,9 +17,10 @@
 #   +6.5 mm / 1.78 deg against a 143.7 mm tag36h11 on the table.
 # end_effector_link → pen_tip
 #   xyz="0 0 -0.15452"  (154.52 mm down tool axis, EE -Z direction)
-# end_effector_link → camera_color_frame
-#   x=-0.0494305 y=0.049587 z=0.00395126
-#   qx=0.200804 qy=0.290464 qz=0.442318 qw=0.824417
+# end_effector_link → camera_color_frame (wrist camera, from the URDF)
+#   xyz="0 0.05639 -0.00305" rpy="pi pi 0"  — stock Kinova mount, uncalibrated.
+#   (The easy_handeye2 numbers once listed here were never in the xacro and are
+#   wrong by 41 deg; see cameras.launch.py.)
 # base_link → global_camera_link (OAK-D)
 #   x=0.48 y=0.72 z=1.0
 #   qx=-0.341494 qy=-0.888985 qz=0.299234 qw=0.059552

@@ -21,10 +21,14 @@
 #         → camera_color_frame                       (kinova_vision static TF)
 #         → camera_depth_frame                       (kinova_vision static TF)
 #
-# NOTE — Wrist camera calibration is baked into the URDF (gen3_macro.xacro):
-#   end_effector_link → camera_link  xyz=(-0.0494305, 0.049587, 0.00395126)
-#                                    rpy=(0.66454839, 0.30604363, 1.09121110)
-#                     ↔ quat: (qx=0.200804 qy=0.290464 qz=0.442318 qw=0.824417)
+# NOTE — The wrist camera transform comes from the URDF (gen3_macro.xacro) and
+# is the stock, UNCALIBRATED Kinova vision-module mount:
+#   end_effector_link → camera_link  xyz=(0, 0.05639, -0.00305) rpy=(pi, pi, 0)
+# An easy_handeye2 result used to be quoted here as "baked into the URDF"
+# (xyz -0.0494305 0.049587 0.00395126, rpy 0.66454839 0.30604363 1.09121110).
+# It never was in this workspace's xacro, and it is wrong: its optical axis is
+# 41 deg off the tool axis. Do not paste it in. Measure any candidate with
+#   validate_handeye_extrinsic.py --mode wrist
 #   camera_link → camera_color_frame (identity — kinova_vision publishes this)
 #   camera_link → camera_depth_frame (-0.0195, -0.005, 0 — kinova_vision publishes this)
 #
