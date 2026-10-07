@@ -186,6 +186,76 @@ def transform_point(point: np.ndarray, transform_stamped: TransformStamped) -> n
     return transformed
 
 
+def marker_centre_ray(corners: np.ndarray, K: np.ndarray, D: np.ndarray):
+    """
+    Unit ray (camera optical frame) through the centre of a square marker.
+
+    The centre is the intersection of the diagonals of the UNDISTORTED corners,
+    the exact projection of the square's centre (the corner mean is only
+    approximately that, though within 0.1 px for a 5 cm marker at 1 m).  Unlike
+    a PnP tvec this direction does not depend on the assumed marker size at all.
+    """
+    pts = cv2.undistortPoints(
+        np.asarray(corners, dtype=np.float64).reshape(-1, 1, 2),
+        np.asarray(K, dtype=np.float64), np.asarray(D, dtype=np.float64)).reshape(4, 2)
+    h = np.hstack([pts, np.ones((4, 1))])
+    centre = np.cross(np.cross(h[0], h[2]), np.cross(h[1], h[3]))
+    if abs(centre[2]) < 1e-12:
+        return None
+    ray = np.array([centre[0] / centre[2], centre[1] / centre[2], 1.0])
+    return ray / np.linalg.norm(ray)
+
+
+def solve_rays(origins, directions, weights=None, plane_z=None):
+    """
+    Weighted least-squares point closest to a set of rays, optionally
+    constrained to the horizontal plane z = plane_z.
+
+    Each ray only penalises distance PERPENDICULAR to itself, so every camera
+    constrains the point exactly where it measures well (across its line of
+    sight) and not at all where it measures badly (range).  One overhead camera
+    on the plane reduces to ray-plane intersection; a grazing side view adds a
+    strong constraint along the direction the overhead view is weakest in.
+
+    Returns (point, per-ray perpendicular residuals [m], conditioning in 0..1)
+    or None if there is nothing to solve or the point lies behind a camera.
+    Conditioning is the eigenvalue ratio of the normal matrix: ~1 is well
+    determined, ~0 means the rays leave a direction unconstrained.
+    """
+    origins = np.asarray(origins, dtype=np.float64).reshape(-1, 3)
+    directions = np.asarray(directions, dtype=np.float64).reshape(-1, 3)
+    n = len(origins)
+    if n == 0 or (plane_z is None and n < 2):
+        return None
+    weights = np.ones(n) if weights is None else np.asarray(weights, dtype=np.float64)
+    A = np.zeros((3, 3))
+    b = np.zeros(3)
+    projectors = []
+    for origin, d, w in zip(origins, directions, weights):
+        d = d / np.linalg.norm(d)
+        P = np.eye(3) - np.outer(d, d)
+        projectors.append(P)
+        A += w * P
+        b += w * (P @ origin)
+    if plane_z is None:
+        eig = np.linalg.eigvalsh(A)
+        if eig[0] <= 1e-12:
+            return None
+        point = np.linalg.solve(A, b)
+    else:
+        M = A[:2, :2]
+        eig = np.linalg.eigvalsh(M)
+        if eig[0] <= 1e-12:
+            return None
+        xy = np.linalg.solve(M, b[:2] - A[:2, 2] * plane_z)
+        point = np.array([xy[0], xy[1], plane_z])
+    if any(float((point - o) @ d) <= 0.0 for o, d in zip(origins, directions)):
+        return None
+    residuals = np.array([np.linalg.norm(P @ (point - o))
+                          for P, o in zip(projectors, origins)])
+    return point, residuals, float(eig[0] / eig[-1])
+
+
 def rotation_matrix_to_quaternion(R: np.ndarray) -> list:
     """
     Convert a 3x3 orthonormal rotation matrix to a quaternion [x, y, z, w].
@@ -333,6 +403,34 @@ class CombineCamerasNode(Node):
         self.declare_parameter("kinova_image_topic", "/camera/color/image_raw")
         self.declare_parameter("kinova_info_topic", "/camera/color/camera_info")
         
+        # Extra static cameras: comma-separated names, e.g. "side,rear".  Each
+        # needs <name>_image_topic / <name>_info_topic, and a TF from the
+        # reference frame to the frame_id in its CameraInfo (i.e. an extrinsic
+        # calibration published as a static transform).
+        self.declare_parameter("extra_cameras", "")
+        self.extra_cameras = [n.strip() for n in
+                              self.get_parameter("extra_cameras").value.split(",")
+                              if n.strip()]
+        for name in self.extra_cameras:
+            self.declare_parameter(f"{name}_image_topic", "")
+            self.declare_parameter(f"{name}_info_topic", "")
+
+        # How per-camera measurements of one marker are combined:
+        #   "positions" — average the PnP positions (the original behaviour).
+        #   "rays"      — least-squares intersection of each camera's viewing ray
+        #                 through the marker centre (solve_rays).  Needs
+        #                 constrain_to_table, or two cameras, to fix the range.
+        self.declare_parameter("fusion_mode", "positions")
+        # Below this conditioning the ray solve is rejected and the marker falls
+        # back to "positions" (0.02 ~ a lone ray 82 deg off vertical).
+        self.declare_parameter("ray_min_conditioning", 0.02)
+        self.fusion_mode = self.get_parameter("fusion_mode").value
+        self.ray_min_conditioning = float(self.get_parameter("ray_min_conditioning").value)
+        if self.fusion_mode not in ("positions", "rays"):
+            self.get_logger().warn(
+                f"Unknown fusion_mode '{self.fusion_mode}'. Using 'positions'.")
+            self.fusion_mode = "positions"
+
         # Read parameters
         self.reference_frame = self.get_parameter("reference_frame").value
         self.target_frame_id = self.get_parameter("target_frame_id").value
@@ -429,6 +527,16 @@ class CombineCamerasNode(Node):
         # Kinova Arm Camera
         if self.get_parameter("camera_kinova_enabled").value:
             self._init_camera_topics("kinova")
+
+        # Extra static cameras
+        for name in self.extra_cameras:
+            if self.get_parameter(f"{name}_image_topic").value and \
+                    self.get_parameter(f"{name}_info_topic").value:
+                self._init_camera_topics(name)
+            else:
+                self.get_logger().error(
+                    f"extra camera '{name}' needs {name}_image_topic and "
+                    f"{name}_info_topic; it is NOT subscribed.")
             
         # ----------------------------------------------------------------------
         # Main Sensor Fusion Coordination Timer (10 Hz)
@@ -588,9 +696,18 @@ class CombineCamerasNode(Node):
             
             # Transform local position (camera lens coordinates) to global reference coordinates
             global_pos = transform_point(local_pos, transform)
+
+            # Viewing ray through the marker centre, in the reference frame
+            ray = marker_centre_ray(marker_corners, K, D)
+            if ray is not None:
+                ray = rotate_vector(ray, transform.transform.rotation)
+            t = transform.transform.translation
+            origin = np.array([t.x, t.y, t.z], dtype=np.float64)
             
             # Store measurement in dynamic database
-            self._store_measurement(marker_id, camera_name, global_pos)
+            self._store_measurement(marker_id, camera_name, global_pos,
+                                    origin=origin, ray=ray,
+                                    cam_range=float(np.linalg.norm(local_pos)))
             
         if self.enable_visualization:
             self._cache_annotated_feed(camera_name, annotated_img)
@@ -676,15 +793,56 @@ class CombineCamerasNode(Node):
             flags=cv2.SOLVEPNP_ITERATIVE)
         return success, rvec, tvec
 
-    def _store_measurement(self, marker_id: int, camera_name: str, pos: np.ndarray):
+    def _store_measurement(self, marker_id: int, camera_name: str, pos: np.ndarray,
+                           origin=None, ray=None, cam_range=None):
         """Update the database with the latest transformed marker coordinates."""
         now = self.get_clock().now().nanoseconds / 1e9
         if marker_id not in self.measurements:
             self.measurements[marker_id] = {}
         self.measurements[marker_id][camera_name] = {
             "timestamp": now,
-            "position": pos
+            "position": pos,
+            "origin": origin,       # camera centre, reference frame
+            "ray": ray,             # unit ray to the marker centre, reference frame
+            "range": cam_range,     # camera-to-marker distance from PnP
         }
+
+    def _fuse_marker_rays(self, m_id: int, records: dict):
+        """Ray-based fusion of one marker; None means fall back to positions."""
+        usable = {name: r for name, r in records.items()
+                  if r.get("ray") is not None and r.get("origin") is not None}
+        if not usable:
+            return None
+        names = list(usable)
+        origins = [usable[n]["origin"] for n in names]
+        rays = [usable[n]["ray"] for n in names]
+        # Lateral error of a ray grows with range, so weight by 1 / range^2.
+        weights = [1.0 / max(usable[n]["range"] or 1.0, 0.05) ** 2 for n in names]
+
+        # The marker plane's true height in the reference frame.  The clamp
+        # below writes table_z + marker_height and z_sign is applied on publish,
+        # so the physical plane is z_sign times that.
+        plane_z = self.z_sign * (self.table_z + self.marker_height_above_table)
+
+        solved = solve_rays(origins, rays, weights,
+                            plane_z=plane_z if self.constrain_to_table else None)
+        if solved is None or solved[2] < self.ray_min_conditioning:
+            return None
+        point, residuals, _ = solved
+
+        # Two or more cameras also fix the height on their own.  That is a free
+        # check on table_z and on the extrinsics: report it, never apply it.
+        if len(names) >= 2:
+            free = solve_rays(origins, rays, weights)
+            if free is not None and free[2] >= self.ray_min_conditioning:
+                per_cam = ", ".join(f"{n} {1000 * r:.1f} mm"
+                                    for n, r in zip(names, free[1]))
+                self.get_logger().info(
+                    f"[rays] marker {m_id}: {len(names)} cameras triangulate "
+                    f"z = {free[0][2]:+.4f} m (marker plane assumed {plane_z:+.4f} m); "
+                    f"ray miss distances: {per_cam}",
+                    throttle_duration_sec=5.0)
+        return point
 
     def _cache_annotated_feed(self, name: str, img: np.ndarray):
         """Add modern banner, resize to 640x360, and cache annotated image."""
@@ -864,9 +1022,14 @@ class CombineCamerasNode(Node):
         if rs_panel is None:
             rs_panel = self._create_offline_placeholder("realsense")
             
-        oak_panel = self.debug_images.get("oakd")
+        # The OAK-D slot doubles as the first extra camera's panel when the
+        # OAK-D itself is off.
+        oak_slot = "oakd"
+        if self.extra_cameras and not self.get_parameter("camera_oakd_enabled").value:
+            oak_slot = self.extra_cameras[0]
+        oak_panel = self.debug_images.get(oak_slot)
         if oak_panel is None:
-            oak_panel = self._create_offline_placeholder("oakd")
+            oak_panel = self._create_offline_placeholder(oak_slot)
             
         kv_panel = self.debug_images.get("kinova")
         if kv_panel is None:
@@ -923,7 +1086,11 @@ class CombineCamerasNode(Node):
             if n == 0:
                 continue
 
-            if n == 1:
+            ray_pos = (self._fuse_marker_rays(m_id, self.measurements[m_id])
+                       if self.fusion_mode == "rays" else None)
+            if ray_pos is not None:
+                fused_pos = np.asarray(ray_pos, dtype=np.float64)
+            elif n == 1:
                 fused_pos = valid_positions[0].copy()
             elif n == 2:
                 # Distance-based weight: closer to origin = closer to arm = more reliable
