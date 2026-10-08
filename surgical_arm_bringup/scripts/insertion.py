@@ -2095,6 +2095,10 @@ class AngledInserter(Node):
         try:
             proc = subprocess.Popen(
                 ["ros2", "bag", "record", "-o", path] + self._BAG_TOPICS,
+                # Not the terminal: the recorder's keyboard handler switches a
+                # shared stdin to non-blocking, and every input() prompt in this
+                # script then returns EOF at once (reproduced 2026-10-08).
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             self.get_logger().warn(f"Failed to start rosbag: {e}")
