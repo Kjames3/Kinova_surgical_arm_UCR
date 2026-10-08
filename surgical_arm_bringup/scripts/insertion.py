@@ -111,7 +111,7 @@ except ImportError:
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import JointState
-from moveit_msgs.srv import GetMotionPlan, GetMotionSequence
+from moveit_msgs.srv import GetMotionPlan, GetMotionSequence, GetPositionIK
 from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
 from moveit_msgs.action import ExecuteTrajectory
@@ -247,6 +247,79 @@ def _tilt_quaternion(q_vertical, azimuth_rad, tilt_rad):
     # Compose: q_new = q_tilt * q_az * q_vertical
     q_new = quat_multiply(q_tilt, quat_multiply(q_az, q_vertical))
     return _quat_normalize(q_new)
+
+
+# ---------------------------------------------------------------------------
+# Insertion-axis geometry and approach-direction (azimuth) ranking
+# ---------------------------------------------------------------------------
+
+# Gen3 7-DOF position limits of the bounded joints [rad]; 1/3/5/7 are continuous.
+GEN3_BOUNDED_LIMITS = {"joint_2": 2.24, "joint_4": 2.57, "joint_6": 2.09}
+
+
+def insertion_axis_geometry(cont_x, cont_y, ready_z, target_z, tilt_rad, azimuth_rad):
+    """Tool axis, descent length and hover point for one approach azimuth.
+
+    The tip ends at (cont_x, cont_y, target_z).  It starts at the hover point,
+    which lies back along the tilted tool axis at height ready_z.
+    Returns (hover_xyz, tool_axis, descent_m).
+    """
+    axis = (math.sin(tilt_rad) * math.cos(azimuth_rad),
+            math.sin(tilt_rad) * math.sin(azimuth_rad),
+            -math.cos(tilt_rad))
+    cos_t = math.cos(tilt_rad)
+    descent = (ready_z - target_z) / cos_t if cos_t > 1e-3 else 0.0
+    hover = (cont_x - axis[0] * descent, cont_y - axis[1] * descent, ready_z)
+    return hover, axis, descent
+
+
+def unwrap_to_seed(solution, seed, joint_names, continuous_joints):
+    """Shift each continuous joint by 2*pi multiples to sit nearest the seed."""
+    out = []
+    for name, value, ref in zip(joint_names, solution, seed):
+        if name in continuous_joints:
+            value += 2.0 * math.pi * round((ref - value) / (2.0 * math.pi))
+        out.append(value)
+    return out
+
+
+def rank_azimuth_candidates(start, solved, joint_names, continuous_joints,
+                            limits=None, limit_margin=0.10):
+    """Order approach azimuths by how little the arm has to move.
+
+    start:  joint vector the arm is at now.
+    solved: {azimuth_deg: [q_ready, q_hover, q_tilted, q_target]} -- the IK
+            chain for that azimuth, or None where some waypoint has no solution.
+    A candidate is dropped if any waypoint puts a bounded joint within
+    limit_margin of its limit.  The rest are sorted by the largest travel of
+    any single joint over start -> ready -> hover -> tilted -> target, then by
+    total travel.  Continuous joints are compared modulo 2*pi.
+
+    Returns [{"azimuth_deg", "max_travel", "total_travel", "limit_margin",
+    "limit_joint"}].
+    """
+    limits = GEN3_BOUNDED_LIMITS if limits is None else limits
+    ranked = []
+    for azimuth_deg, chain in solved.items():
+        if not chain:
+            continue
+        previous = list(start)
+        travel = [0.0] * len(joint_names)
+        margin, tightest = float("inf"), None
+        for waypoint in chain:
+            q = unwrap_to_seed(waypoint, previous, joint_names, continuous_joints)
+            for i, name in enumerate(joint_names):
+                travel[i] += abs(q[i] - previous[i])
+                if name in limits and limits[name] - abs(q[i]) < margin:
+                    margin, tightest = limits[name] - abs(q[i]), name
+            previous = q
+        if margin < limit_margin:
+            continue
+        ranked.append({"azimuth_deg": azimuth_deg, "max_travel": max(travel),
+                       "total_travel": sum(travel), "limit_margin": margin,
+                       "limit_joint": tightest})
+    ranked.sort(key=lambda c: (round(c["max_travel"], 3), c["total_travel"]))
+    return ranked
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +494,26 @@ class AngledInserter(Node):
         self.declare_parameter("insertion_angle_deg",  45.0)
         self.declare_parameter("insertion_azimuth_deg",  -90.0)
         self.declare_parameter("auto_azimuth", False)
+        # How the approach direction is chosen:
+        #   "fixed"      insertion_azimuth_deg as given
+        #   "tangential" perpendicular to the base->container line (= auto_azimuth)
+        #   "search"     try every azimuth_search_step_deg, keep the one that
+        #                moves the joints least and still plans end to end
+        # Empty keeps the old behaviour: tangential if auto_azimuth, else fixed.
+        self.declare_parameter("azimuth_mode", "")
+        # Each IK call costs the solver's full kinematics_solver_timeout (0.2 s
+        # with TRAC-IK solve_type Distance), so the step sets the search time:
+        # 15 deg is 24 directions, ~73 calls, ~15 s.
+        self.declare_parameter("azimuth_search_step_deg", 15.0)
+        # Reject approach directions that carry the wrist closer than this to
+        # the base axis (it would hang over the robot's own shoulder).
+        self.declare_parameter("azimuth_search_min_base_radius", 0.15)
+        # How many of the best-ranked directions to fully plan before giving up.
+        self.declare_parameter("azimuth_search_confirm", 3)
+        # Reject directions that bring a bounded joint (2/4/6) this close to its limit.
+        self.declare_parameter("azimuth_search_limit_margin_deg", 5.7)
+        # Extra random IK seeds tried for the vertical pose above the target.
+        self.declare_parameter("azimuth_search_ready_seeds", 6)
         # Hard cap on tilt angle (deg). The geometric wall-clearance check still
         # runs regardless; this just rejects obviously-too-steep angles early.
         self.declare_parameter("max_tilt_deg",         45.0)
@@ -584,6 +677,12 @@ class AngledInserter(Node):
         self._plan_cli = self.create_client(
             GetMotionPlan, "/plan_kinematic_path",
             callback_group=self._cb_group)
+        self._ik_cli = self.create_client(
+            GetPositionIK, "/compute_ik",
+            callback_group=self._cb_group)
+        # Dry runs never move the arm, so each phase must be planned from where
+        # the previous one would have ended: {joint: position}, None when live.
+        self._dry_chain = None
         self._phase_pub = self.create_publisher(String, "/insertion/phase", 10)
         self._seq_cli = self.create_client(
             GetMotionSequence, "/plan_sequence_path",
@@ -1155,10 +1254,23 @@ class AngledInserter(Node):
     # ------------------------------------------------------------------
     # Planning helpers
     # ------------------------------------------------------------------
-    def _plan(self, req, timeout=45.0):
+    def _chain_start(self, req):
+        """Dry run: start this request where the previous planned phase ended."""
+        if self._dry_chain and not req.start_state.joint_state.name:
+            req.start_state.is_diff = True
+            req.start_state.joint_state.name = list(self._dry_chain)
+            req.start_state.joint_state.position = list(self._dry_chain.values())
+
+    def _chain_advance(self, traj):
+        if self._dry_chain is not None and traj.joint_trajectory.points:
+            jt = traj.joint_trajectory
+            self._dry_chain = dict(zip(jt.joint_names, jt.points[-1].positions))
+
+    def _plan(self, req, timeout=45.0, quiet=False):
         if not self._plan_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().error("  /plan_kinematic_path not available.")
             return False, None
+        self._chain_start(req)
         svc = GetMotionPlan.Request()
         svc.motion_plan_request = req
         f      = self._plan_cli.call_async(svc)
@@ -1168,8 +1280,10 @@ class AngledInserter(Node):
             return False, None
         resp = result.motion_plan_response
         if resp.error_code.val == 1:
+            self._chain_advance(resp.trajectory)
             return True, resp.trajectory
-        self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
+        if not quiet:
+            self.get_logger().error(f"  Planning failed (code {resp.error_code.val}).")
         return False, None
 
     def _guarded(self, label, fn):
@@ -1231,6 +1345,7 @@ class AngledInserter(Node):
         if not self._seq_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn("  /plan_sequence_path not available.")
             return False, None
+        self._chain_start(reqs[0])
         svc = GetMotionSequence.Request()
         for i, (req, r) in enumerate(zip(reqs, blend_radii)):
             if i > 0:
@@ -1248,6 +1363,7 @@ class AngledInserter(Node):
             self.get_logger().warn(
                 f"  Sequence planning failed (code {resp.error_code.val}).")
             return False, None
+        self._chain_advance(resp.planned_trajectories[-1])
         return True, list(resp.planned_trajectories)
 
     def _blended_transit(self, reqs, seg_lengths, label, execute):
@@ -1373,6 +1489,27 @@ class AngledInserter(Node):
         goal_c = Constraints()
         goal_c.position_constraints.append(pos_c)
         goal_c.orientation_constraints.append(ori_c)
+        req.goal_constraints.append(goal_c)
+        return req
+
+    def _build_pilz_ptp_joints(self, joints, vel_scale):
+        """Pilz PTP to a joint configuration (list in arm_joint_names order)."""
+        req = MotionPlanRequest()
+        req.group_name   = self.get_parameter("move_group_name").value
+        req.planner_id   = "PTP"
+        req.pipeline_id  = "pilz_industrial_motion_planner"
+        req.num_planning_attempts = 1
+        req.allowed_planning_time = 10.0
+        req.max_velocity_scaling_factor     = vel_scale
+        req.max_acceleration_scaling_factor = vel_scale * 0.5
+        req.start_state.is_diff = True
+        goal_c = Constraints()
+        for name, position in zip(self.arm_joint_names, joints):
+            jc = JointConstraint(); jc.joint_name = name
+            jc.position = float(position)
+            jc.tolerance_above = 0.01; jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            goal_c.joint_constraints.append(jc)
         req.goal_constraints.append(goal_c)
         return req
 
@@ -1525,6 +1662,194 @@ class AngledInserter(Node):
             return False
         except EOFError:
             return False
+
+    # ------------------------------------------------------------------
+    # Approach-direction search
+    # ------------------------------------------------------------------
+    def _ik(self, xyz, q_xyzw, seed, timeout_s=0.05):
+        """Collision-aware IK for ee_link at a world pose, seeded; None if unsolved."""
+        req = GetPositionIK.Request()
+        r = req.ik_request
+        r.group_name = self.get_parameter("move_group_name").value
+        r.ik_link_name = self.get_parameter("ee_link").value
+        r.avoid_collisions = True
+        r.robot_state.is_diff = True
+        r.robot_state.joint_state.name = list(self.arm_joint_names)
+        r.robot_state.joint_state.position = [float(v) for v in seed]
+        r.pose_stamped.header.frame_id = self.get_parameter("world_frame").value
+        pose = r.pose_stamped.pose
+        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in xyz)
+        (pose.orientation.x, pose.orientation.y,
+         pose.orientation.z, pose.orientation.w) = (float(v) for v in q_xyzw)
+        r.timeout = RosDuration(sec=0, nanosec=int(timeout_s * 1e9))
+        result = self._wait_for_future(self._ik_cli.call_async(req), 2.0)
+        if result is None or result.error_code.val != 1:
+            return None
+        js = result.solution.joint_state
+        try:
+            return [js.position[js.name.index(j)] for j in self.arm_joint_names]
+        except ValueError:
+            return None
+
+    def _azimuth_waypoints(self, cont_x, cont_y, ready_z, target_z, tilt_rad,
+                           azimuth_rad, q_vertical_xyzw):
+        """EE poses [(xyz, quat)] for ready, hover, tilted-at-hover, target."""
+        hover, _, _ = insertion_axis_geometry(
+            cont_x, cont_y, ready_z, target_z, tilt_rad, azimuth_rad)
+        q_tilted = _tilt_quaternion(q_vertical_xyzw, azimuth_rad, tilt_rad)
+        return [
+            (self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw), q_vertical_xyzw),
+            (self._ee_for_tip(hover, q_vertical_xyzw), q_vertical_xyzw),
+            (self._ee_for_tip(hover, q_tilted), q_tilted),
+            (self._ee_for_tip((cont_x, cont_y, target_z), q_tilted), q_tilted),
+        ], hover, q_tilted
+
+    def _confirm_azimuth(self, waypoints, hover, q_tilted_xyzw, start, q_ready, vel_scale):
+        """Plan approach, tip-pivot and descent for real, each from the previous end."""
+        def quat(q):
+            return Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+        (_, q_v), (ee_hover, _), _, (ee_target, _) = waypoints
+        steps = [
+            self._build_pilz_ptp_joints(q_ready, vel_scale),
+            self._build_pilz_lin(*ee_hover, quat(q_v), vel_scale),
+            self._build_pilz_lin(*hover, quat(q_tilted_xyzw), vel_scale,
+                                 link=self.get_parameter("tip_link").value),
+            self._build_pilz_lin(*ee_target, quat(q_tilted_xyzw), vel_scale),
+        ]
+        names, positions = list(self.arm_joint_names), list(start)
+        for req in steps:
+            req.start_state.is_diff = True
+            req.start_state.joint_state.name = names
+            req.start_state.joint_state.position = [float(v) for v in positions]
+            ok, traj = self._plan(req, quiet=True)
+            if not ok:
+                return False
+            jt = traj.joint_trajectory
+            names, positions = list(jt.joint_names), list(jt.points[-1].positions)
+        return True
+
+    def _search_azimuth(self, cont_x, cont_y, ready_z, target_z, tilt_rad,
+                        q_vertical_xyzw, vel_scale):
+        """Azimuth [rad] needing the least joint motion that plans end to end, or None."""
+        log = self.get_logger()
+        start = [self._live_joints.get(j) for j in self.arm_joint_names]
+        if any(v is None for v in start):
+            log.error("  Azimuth search: no joint state yet.")
+            return None
+        if not self._ik_cli.wait_for_service(timeout_sec=5.0):
+            log.error("  Azimuth search: /compute_ik not available.")
+            return None
+        step = max(1.0, float(self.get_parameter("azimuth_search_step_deg").value))
+        min_r = float(self.get_parameter("azimuth_search_min_base_radius").value)
+        t0 = time.monotonic()
+        stages = ("ready", "hover", "tilted", "target")
+        dropped = collections.Counter()
+        solved, plans, n_ik = {}, {}, 0
+
+        def solve(xyz, q, seed):
+            solution = self._ik(xyz, q, seed)
+            return None if solution is None else unwrap_to_seed(
+                solution, seed, self.arm_joint_names, self.continuous_joints)
+
+        # The ready pose (vertical, above the centre) is the same for every
+        # direction: solve it once.
+        ready_pose = self._azimuth_waypoints(
+            cont_x, cont_y, ready_z, target_z, tilt_rad, 0.0, q_vertical_xyzw)[0][0]
+        margin = math.radians(float(
+            self.get_parameter("azimuth_search_limit_margin_deg").value))
+        # The arm is redundant, and the solver returns the posture nearest its
+        # seed -- which for a far target is often one with joint_6 on its limit
+        # (seen 2026-10-08).  Seed from several postures and keep the nearest one
+        # that leaves room on the bounded joints.
+        rng = __import__("random").Random(0)
+        seeds = [start, [self.home_joints.get(j, 0.0) for j in self.arm_joint_names]]
+        for _ in range(int(self.get_parameter("azimuth_search_ready_seeds").value)):
+            seeds.append([rng.uniform(-math.pi, math.pi) if j in self.continuous_joints
+                          else rng.uniform(-0.8, 0.8) * GEN3_BOUNDED_LIMITS.get(j, 2.0)
+                          for j in self.arm_joint_names])
+        postures = {}
+        for ready_seed in seeds:
+            n_ik += 1
+            solution = self._ik(*ready_pose, ready_seed)
+            if solution is not None:
+                # travel is always measured from where the arm really is
+                q = unwrap_to_seed(solution, start, self.arm_joint_names,
+                                   self.continuous_joints)
+                postures[tuple(round(v, 2) for v in q)] = q
+        if not postures:
+            log.error("  Azimuth search: the vertical pose above the target has no "
+                      "IK solution -- the target itself is out of reach.")
+            return None
+        ready_ranked = rank_azimuth_candidates(
+            start, {i: [q] for i, q in enumerate(postures.values())},
+            self.arm_joint_names, self.continuous_joints, limit_margin=-math.inf)
+        roomy = [c for c in ready_ranked if c["limit_margin"] >= margin]
+        if not roomy:
+            best = max(ready_ranked, key=lambda c: c["limit_margin"])
+            log.error(
+                f"  Azimuth search: even vertically above the target, {best['limit_joint']} "
+                f"is within {math.degrees(best['limit_margin']):.1f} deg of its limit in "
+                f"every posture found ({len(postures)}). The target is too far out; "
+                "move it closer to the robot.")
+            return None
+        q_ready = list(postures.values())[roomy[0]["azimuth_deg"]]
+        log.info(f"  ready posture: {len(postures)} found, using the nearest with "
+                 f"{math.degrees(roomy[0]['limit_margin']):.1f} deg of joint-limit room "
+                 f"(largest joint move {math.degrees(roomy[0]['max_travel']):.1f} deg)")
+        azimuth_deg = -180.0
+        while azimuth_deg < 180.0 - 1e-6:
+            waypoints, hover, q_tilted = self._azimuth_waypoints(
+                cont_x, cont_y, ready_z, target_z, tilt_rad,
+                math.radians(azimuth_deg), q_vertical_xyzw)
+            plans[azimuth_deg] = (waypoints, hover, q_tilted)
+            chain, seed = [q_ready], q_ready
+            if min(math.hypot(xyz[0], xyz[1]) for xyz, _ in waypoints) < min_r:
+                dropped["wrist over the base"] += 1
+                chain = None
+            else:
+                for stage, (xyz, q) in zip(stages[1:], waypoints[1:]):
+                    n_ik += 1
+                    seed = solve(xyz, q, seed)
+                    if seed is None:
+                        dropped[f"no IK at {stage}"] += 1
+                        chain = None
+                        break
+                    chain.append(seed)
+            solved[azimuth_deg] = chain
+            azimuth_deg += step
+        with_ik = rank_azimuth_candidates(start, solved, self.arm_joint_names,
+                                          self.continuous_joints, limit_margin=-math.inf)
+        ranked = [c for c in with_ik if c["limit_margin"] >= margin]
+        for c in with_ik:
+            if c["limit_margin"] < margin:
+                dropped["joint near its limit"] += 1
+                log.info(f"  az {c['azimuth_deg']:+7.1f} deg rejected: {c['limit_joint']} "
+                         f"comes within {math.degrees(c['limit_margin']):.1f} deg of its limit")
+        log.info(f"\n--- [Azimuth search] {len(solved)} directions, {n_ik} IK calls, "
+                 f"{time.monotonic() - t0:.2f} s: {len(ranked)} usable ---")
+        if dropped:
+            log.info("  rejected: " + ", ".join(f"{n} x {why}" for why, n in dropped.items()))
+        for c in ranked[:8]:
+            log.info(f"  az {c['azimuth_deg']:+7.1f} deg | largest joint move "
+                     f"{math.degrees(c['max_travel']):6.1f} deg | total "
+                     f"{math.degrees(c['total_travel']):6.1f} deg | limit margin "
+                     f"{math.degrees(c['limit_margin']):5.1f} deg")
+        # IK at the waypoints does not prove the straight segments between
+        # them are feasible, so the best few are planned for real.
+        chain_backup, self._dry_chain = self._dry_chain, None
+        try:
+            for c in ranked[:int(self.get_parameter("azimuth_search_confirm").value)]:
+                waypoints, hover, q_tilted = plans[c["azimuth_deg"]]
+                if self._confirm_azimuth(waypoints, hover, q_tilted, start, q_ready, vel_scale):
+                    log.info(f"  [PASS] az {c['azimuth_deg']:+.1f} deg plans end to end "
+                             f"-- selected ({time.monotonic() - t0:.2f} s in all).")
+                    return math.radians(c["azimuth_deg"]), q_ready
+                log.warn(f"  az {c['azimuth_deg']:+.1f} deg has IK but does not plan; "
+                         "trying the next.")
+        finally:
+            self._dry_chain = chain_backup
+        return None
 
     # ------------------------------------------------------------------
     # EE pose computation
@@ -1800,6 +2125,7 @@ class AngledInserter(Node):
         p = dict(group_name=group_name, vel_scale=vel_scale,
                  execute=execute, world_frame=world_frame,
                  tip_link=tip_link, ee_link=ee_link)
+        self._dry_chain = None if execute else {}
 
 
         pub_fb("home_move", 0.0)
@@ -1856,27 +2182,44 @@ class AngledInserter(Node):
         
         import math
         tilt_rad = math.radians(angle_deg)
-        if self.get_parameter("auto_azimuth").value:
+        # Tip must end exactly in the center
+        target_xyz = (cont_x, cont_y, container_top - d_m)
+
+        azimuth_mode = self.get_parameter("azimuth_mode").value or (
+            "tangential" if self.get_parameter("auto_azimuth").value else "fixed")
+        azimuth_rad, search_ready = None, None
+        if azimuth_mode == "search":
+            if self.get_parameter("use_current_orientation").value:
+                ee_now = self._get_tf(world_frame, ee_link)
+                if ee_now is None:
+                    self.get_logger().error("  TF lookup failed.")
+                    return
+                r_now = ee_now.transform.rotation
+                q_search = (r_now.x, r_now.y, r_now.z, r_now.w)
+            else:
+                q_search = _quat_normalize(tuple(
+                    self.get_parameter(f"vertical_quat_{a}").value for a in "xyzw"))
+            found = self._search_azimuth(
+                cont_x, cont_y, ready_z, target_xyz[2], tilt_rad, q_search, vel_scale)
+            if found is None:
+                self.get_logger().error(
+                    "  Azimuth search found no approach direction that plans. Aborting.")
+                return
+            # Phase 0 must go to the posture the search ranked, not to whatever
+            # posture a pose-goal PTP would pick for the same Cartesian pose.
+            azimuth_rad, search_ready = found
+        elif azimuth_mode == "tangential":
             # Tangential insertion keeps the wrist at a comfortable radius
             azimuth_rad = math.atan2(cont_y, cont_x) + math.pi / 2.0
-            azimuth_deg = math.degrees(azimuth_rad)
-        else:
-            azimuth_deg = self.get_parameter("insertion_azimuth_deg").value
-            azimuth_rad = math.radians(azimuth_deg)
-        
-        # Tip must end exactly in the center
-        target_xyz = (cont_x, cont_y, container_top - d_m) 
-        
-        # Tool axis direction
-        axis_x = math.sin(tilt_rad) * math.cos(azimuth_rad)
-        axis_y = math.sin(tilt_rad) * math.sin(azimuth_rad)
-        axis_z = -math.cos(tilt_rad)
-        
-        vertical_dist = ready_z - target_xyz[2]
-        D = vertical_dist / math.cos(tilt_rad) if math.cos(tilt_rad) > 1e-3 else 0.0
-        
-        hover_xyz = (cont_x - axis_x * D, cont_y - axis_y * D, ready_z)
-        
+        elif azimuth_mode != "fixed":
+            self.get_logger().warn(
+                f"  Unknown azimuth_mode '{azimuth_mode}'; using insertion_azimuth_deg.")
+        if azimuth_rad is None:
+            azimuth_rad = math.radians(self.get_parameter("insertion_azimuth_deg").value)
+
+        hover_xyz, (axis_x, axis_y, axis_z), D = insertion_axis_geometry(
+            cont_x, cont_y, ready_z, target_xyz[2], tilt_rad, azimuth_rad)
+
         geo = dict(
             azimuth_rad=azimuth_rad, 
             tilt_rad=tilt_rad, 
@@ -1994,7 +2337,9 @@ class AngledInserter(Node):
             seg0 = math.dist((ee_w.x, ee_w.y, ee_w.z), ee_ready)
             seg1 = math.dist(ee_ready, ee_hover)
             transit_01 = self._blended_transit(
-                [self._build_pilz_ptp(
+                [self._build_pilz_ptp_joints(search_ready, vel_scale)
+                 if search_ready is not None else
+                 self._build_pilz_ptp(
                      *ee_ready, q_vertical, vel_scale,
                      joint_band=self.get_parameter("approach_joint_band").value),
                  self._build_pilz_lin(*ee_hover, q_vertical, vel_scale)],
@@ -2007,9 +2352,10 @@ class AngledInserter(Node):
                 f"\n--- [Phase 0] Approach above container ---")
             self.get_logger().info(
                 f"  EE target: ({ee_ready[0]:.3f}, {ee_ready[1]:.3f}, {ee_ready[2]:.3f})")
-            req = self._build_pilz_ptp(
+            req = (self._build_pilz_ptp_joints(search_ready, vel_scale)
+                   if search_ready is not None else self._build_pilz_ptp(
                 ee_ready[0], ee_ready[1], ee_ready[2], q_vertical, vel_scale,
-                joint_band=self.get_parameter("approach_joint_band").value)
+                joint_band=self.get_parameter("approach_joint_band").value))
             ok, traj = self._plan(req)
             if not ok:
                 self.get_logger().error("  Phase 0 planning failed.")
@@ -2183,6 +2529,11 @@ class AngledInserter(Node):
             f"  Slow insert: {pre_d*1000:.1f} mm at {ins_speed*1000:.1f} mm/s")
 
         insert_state = "done"      # done | aborted_4a | aborted_4b
+        if not execute:
+            for label, pose in (("Phase4a_axis_approach", ee_pre),
+                                ("Phase4b_insert", ee_target)):
+                ok, _ = self._plan(self._build_pilz_lin(*pose, q_tilted, vel_scale))
+                self.get_logger().info(f"  [{'PASS' if ok else 'FAIL'}] {label} planned (dry run).")
         if execute and self._wait_for_user("Phase4_angled_descent"):
             if geo["descent_m"] - pre_d > 1e-3:
                 ok, trip = self._guarded("Phase4a_axis_approach", lambda: self._axis_lin(
@@ -2228,6 +2579,11 @@ class AngledInserter(Node):
 
         # ── Phase 6a: Reverse angled ascent ───────────────────────────────
         self.get_logger().info(f"\n--- [Phase 6a] Reverse angled ascent ---")
+        if not execute:
+            for label, pose in (("Phase6a_extract", ee_pre),
+                                ("Phase6a_axis_retreat", ee_end_circ)):
+                ok, _ = self._plan(self._build_pilz_lin(*pose, q_tilted, vel_scale))
+                self.get_logger().info(f"  [{'PASS' if ok else 'FAIL'}] {label} planned (dry run).")
         if execute and insert_state != "aborted_4a" and self._wait_for_user("Phase6a_angled_ascent"):
             if not self._axis_lin(ee_pre, q_tilted, "Phase6a_extract",
                                   ins_speed, ins_rot):
