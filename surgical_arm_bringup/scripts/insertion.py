@@ -683,6 +683,7 @@ class AngledInserter(Node):
         # Dry runs never move the arm, so each phase must be planned from where
         # the previous one would have ended: {joint: position}, None when live.
         self._dry_chain = None
+        self._step_declined = False
         self._phase_pub = self.create_publisher(String, "/insertion/phase", 10)
         self._seq_cli = self.create_client(
             GetMotionSequence, "/plan_sequence_path",
@@ -935,6 +936,8 @@ class AngledInserter(Node):
     def _execute_kortex_lin(self, ee_x, ee_y, ee_z, q_xyzw, label,
                             speed_mps=0.05, rot_speed_dps=15.0):
         """Execute a straight Cartesian line via native Kortex API (bypassing MoveIt/IK)"""
+        if self._motion_blocked(label):
+            return False
         if not _HAS_KORTEX_API or not self._kortex_base:
             self.get_logger().error(f"  [{label}] Kortex API not connected!")
             return False
@@ -1030,6 +1033,8 @@ class AngledInserter(Node):
 
     def _execute_moveit(self, traj, label, timeout=120.0):
         """Execute via MoveIt /execute_trajectory, publishing phase markers for the bag."""
+        if self._motion_blocked(label):
+            return False
         self._mark_phase(f"start:{label}")
         ok = self._execute_moveit_inner(traj, label, timeout)
         self._mark_phase(f"end:{label}:{'ok' if ok else 'fail'}")
@@ -1071,6 +1076,8 @@ class AngledInserter(Node):
 
     def _execute_fjt(self, traj, label, timeout=60.0):
         """Execute via direct FJT, publishing phase start/end markers for the bag."""
+        if self._motion_blocked(label):
+            return False
         self._mark_phase(f"start:{label}")
         ok = self._execute_fjt_inner(traj, label, timeout)
         self._mark_phase(f"end:{label}:{'ok' if ok else 'fail'}")
@@ -1651,17 +1658,35 @@ class AngledInserter(Node):
         return req
 
 
+    def _motion_blocked(self, label):
+        """True once a step was declined: every phase assumes the previous one
+        ran, so after a skip the arm is not where the next plan starts from."""
+        if self._step_declined:
+            self.get_logger().error(
+                f"  {label} NOT executed: an earlier step was declined, so the arm "
+                "is not where this motion expects. Rerun to continue.")
+        return self._step_declined
+
     def _wait_for_user(self, label):
         if not self.get_parameter("step_by_step").value:
             return True
+        if self._step_declined:
+            return False
         try:
             ans = input(f"  [Step] Execute {label}? [Y/n]: ").strip().lower()
             if ans in ('', 'y', 'yes'):
                 return True
-            self.get_logger().warn(f"  Skipping {label} by user request.")
-            return False
+            self.get_logger().warn(
+                f"  {label} declined -- no further motion will run in this insertion.")
         except EOFError:
-            return False
+            # Seen 2026-10-08 under tmux: the prompt returned at once, the
+            # approach was skipped silently and the next phase was planned from
+            # the wrong pose.
+            self.get_logger().error(
+                f"  No terminal answered the {label} prompt -- no further motion "
+                "will run in this insertion.")
+        self._step_declined = True
+        return False
 
     # ------------------------------------------------------------------
     # Approach-direction search
@@ -2126,6 +2151,7 @@ class AngledInserter(Node):
                  execute=execute, world_frame=world_frame,
                  tip_link=tip_link, ee_link=ee_link)
         self._dry_chain = None if execute else {}
+        self._step_declined = False
 
 
         pub_fb("home_move", 0.0)
