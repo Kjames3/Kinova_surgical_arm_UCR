@@ -63,5 +63,15 @@ check("no candidates -> empty list", ins.rank_azimuth_candidates(start, {0.0: No
 loose = ins.rank_azimuth_candidates(start, solved, J, CONT, limit_margin=0.0)
 check("limit margin is configurable", 60.0 in [c["azimuth_deg"] for c in loose])
 
+# marker-centre filtering (target_source:=markers)
+c = ins.robust_centre([(0.300, 0.010), (0.301, 0.011), (0.299, 0.009), (0.300, 0.010), (0.302, 0.010)], 0.005)
+check("median of steady centre samples", c is not None and abs(c[0] - 0.300) < 1e-9 and abs(c[1] - 0.010) < 1e-9, c)
+check("spread is reported", c is not None and abs(c[2] - 0.002) < 1e-9)
+check("one outlier does not move the median but is caught by the spread limit",
+      ins.robust_centre([(0.300, 0.010)] * 4 + [(0.360, 0.010)], 0.005) is None)
+check("no samples -> None", ins.robust_centre([], 0.005) is None)
+check("even sample count averages the middle pair",
+      abs(ins.robust_centre([(0.0, 0.0), (0.002, 0.0)], 0.005)[0] - 0.001) < 1e-12)
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)

@@ -322,6 +322,29 @@ def rank_azimuth_candidates(start, solved, joint_names, continuous_joints,
     return ranked
 
 
+def robust_centre(samples, max_spread_m):
+    """Median of repeated (x, y) centre measurements, or None if they disagree.
+
+    Returns (x, y, spread) where spread is the largest distance of any sample
+    from the median; None when there are no samples or spread > max_spread_m
+    (the markers or the arm were still moving, or the detection is flickering
+    between corner subsets).
+    """
+    if not samples:
+        return None
+    xs = sorted(p[0] for p in samples)
+    ys = sorted(p[1] for p in samples)
+    mid = len(samples) // 2
+    if len(samples) % 2:
+        mx, my = xs[mid], ys[mid]
+    else:
+        mx, my = (xs[mid - 1] + xs[mid]) / 2.0, (ys[mid - 1] + ys[mid]) / 2.0
+    spread = max(math.hypot(x - mx, y - my) for x, y in samples)
+    if spread > max_spread_m:
+        return None
+    return mx, my, spread
+
+
 # ---------------------------------------------------------------------------
 # Geometry: compute tilt from hover point to target
 # ---------------------------------------------------------------------------
@@ -500,6 +523,20 @@ class AngledInserter(Node):
         #   "search"     try every azimuth_search_step_deg, keep the one that
         #                moves the joints least and still plans end to end
         # Empty keeps the old behaviour: tangential if auto_azimuth, else fixed.
+        # Where the target centre comes from:
+        #   "auto"    target_x/target_y, overridden by the last
+        #             /fused_marker_square_center ever received (old behaviour)
+        #   "params"  target_x/target_y only
+        #   "markers" the centre of the four table markers, measured NOW: fresh
+        #             messages only, median-filtered; aborts a real run if none.
+        self.declare_parameter("target_source", "auto")
+        # "markers": if no fresh centre arrives, first move the tool vertically
+        # above target_x/target_y (the approach pose) so the wrist camera looks
+        # straight down at the square, then measure.
+        self.declare_parameter("marker_look_first", True)
+        self.declare_parameter("marker_wait_s", 5.0)
+        self.declare_parameter("marker_min_samples", 5)
+        self.declare_parameter("marker_max_spread_mm", 5.0)
         self.declare_parameter("azimuth_mode", "")
         # Each IK call costs the solver's full kinematics_solver_timeout (0.2 s
         # with TRAC-IK solve_type Distance), so the step sets the search time:
@@ -719,6 +756,7 @@ class AngledInserter(Node):
         self.add_on_set_parameters_callback(self._parameter_callback)
         self._collision_pub = self.create_publisher(CollisionObject, "/collision_object", 10)
         self._camera_target = None
+        self._marker_centres = collections.deque(maxlen=300)   # (monotonic, x, y, frame)
         self.create_subscription(PoseStamped, "/fused_marker_square_center", self._camera_target_cb, 10)
         self._done = False
 
@@ -740,6 +778,41 @@ class AngledInserter(Node):
 
     def _camera_target_cb(self, msg: PoseStamped):
         self._camera_target = msg
+        self._marker_centres.append((time.monotonic(), msg.pose.position.x,
+                                     msg.pose.position.y, msg.header.frame_id))
+
+    def _fresh_marker_centre(self):
+        """Median marker-square centre from messages arriving from now on, or None."""
+        timeout = float(self.get_parameter("marker_wait_s").value)
+        need = int(self.get_parameter("marker_min_samples").value)
+        max_spread = float(self.get_parameter("marker_max_spread_mm").value) / 1000.0
+        world = self.get_parameter("world_frame").value
+        t_start = time.monotonic()
+        fresh = []
+        while time.monotonic() - t_start < timeout:
+            fresh = [m for m in list(self._marker_centres) if m[0] >= t_start]
+            if len(fresh) >= need:
+                break
+            time.sleep(0.1)
+        log = self.get_logger()
+        if len(fresh) < need:
+            log.warn(f"  [Markers] only {len(fresh)} fresh centre message(s) in "
+                     f"{timeout:.0f} s (need {need}) -- is combine_cameras.py running "
+                     "and are the markers in view?")
+            return None
+        frames = {m[3] for m in fresh}
+        if frames != {world}:
+            log.error(f"  [Markers] centre is published in {sorted(frames)}, "
+                      f"expected '{world}'.")
+            return None
+        centre = robust_centre([(m[1], m[2]) for m in fresh], max_spread)
+        if centre is None:
+            log.warn(f"  [Markers] {len(fresh)} centre messages disagree by more than "
+                     f"{max_spread*1000:.0f} mm -- not using them.")
+            return None
+        log.info(f"  [Markers] centre ({centre[0]:.4f}, {centre[1]:.4f}) from "
+                 f"{len(fresh)} fresh messages, spread {centre[2]*1000:.1f} mm")
+        return centre[0], centre[1]
     def _parameter_callback(self, params):
         from rcl_interfaces.msg import SetParametersResult
         for p in params:
@@ -2194,17 +2267,72 @@ class AngledInserter(Node):
         if real_robot:
             self.get_logger().info("Arm is ready.")
 
-        # Get container position
-        cont_x = goal_handle.request.target_x
-        cont_y = goal_handle.request.target_y
-        if getattr(self, '_camera_target', None) is not None:
-            cont_x = self._camera_target.pose.position.x
-            cont_y = self._camera_target.pose.position.y
-            self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({cont_x:.3f}, {cont_y:.3f})")
-
         container_top = table_z + cont_h
         hover_z  = container_top + hover_top
         ready_z  = container_top + approach
+
+        # Tool-down orientation, from the measured parameters or the live pose
+        if self.get_parameter("use_current_orientation").value:
+            ee_now = self._get_tf(world_frame, ee_link)
+            if ee_now is None:
+                self.get_logger().error("  TF lookup failed.")
+                return
+            r_now = ee_now.transform.rotation
+            q_search = (r_now.x, r_now.y, r_now.z, r_now.w)
+        else:
+            q_search = _quat_normalize(tuple(
+                self.get_parameter(f"vertical_quat_{a}").value for a in "xyzw"))
+
+        # Get container position
+        cont_x = goal_handle.request.target_x
+        cont_y = goal_handle.request.target_y
+        target_source = self.get_parameter("target_source").value
+        if target_source == "markers":
+            self.get_logger().info("\n--- [Markers] Locating the marker square ---")
+            centre = self._fresh_marker_centre()
+            if centre is None and self.get_parameter("marker_look_first").value:
+                ee_look = self._ee_for_tip((cont_x, cont_y, ready_z), q_search)
+                self.get_logger().info(
+                    f"  Moving above the nominal target ({cont_x:.3f}, {cont_y:.3f}) so "
+                    f"the wrist camera looks down at it: EE ({ee_look[0]:.3f}, "
+                    f"{ee_look[1]:.3f}, {ee_look[2]:.3f})")
+                ok, traj = self._plan(self._build_pilz_ptp(
+                    *ee_look, Quaternion(x=q_search[0], y=q_search[1],
+                                         z=q_search[2], w=q_search[3]), vel_scale,
+                    joint_band=self.get_parameter("approach_joint_band").value))
+                if not ok:
+                    self.get_logger().error("  Look move planning failed. Aborting.")
+                    return
+                if execute:
+                    if not (self._wait_for_user("marker_look")
+                            and self._execute_fjt(traj, "marker_look")):
+                        self.get_logger().error("  Look move did not run. Aborting.")
+                        return
+                    time.sleep(1.0)   # let the image settle after the stop
+                    centre = self._fresh_marker_centre()
+                else:
+                    self.get_logger().info(
+                        "  Dry run -- the arm does not move, so nothing new can be seen.")
+            if centre is not None:
+                cont_x, cont_y = centre
+            elif execute:
+                self.get_logger().error(
+                    "  No marker centre available -- refusing to insert at the "
+                    "nominal parameters. Aborting.")
+                return
+            else:
+                self.get_logger().warn(
+                    f"  Dry run without a marker centre: planning for the nominal "
+                    f"target ({cont_x:.3f}, {cont_y:.3f}) instead.")
+        elif target_source == "auto":
+            if getattr(self, '_camera_target', None) is not None:
+                cont_x = self._camera_target.pose.position.x
+                cont_y = self._camera_target.pose.position.y
+                self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({cont_x:.3f}, {cont_y:.3f})")
+        elif target_source != "params":
+            self.get_logger().error(
+                f"  Unknown target_source '{target_source}' (auto | params | markers).")
+            return
 
         # Phase 2 — Compute fixed 45 degree tilt geometry
         d_m  = self.get_parameter("target_depth_mm").value / 1000.0
@@ -2219,16 +2347,6 @@ class AngledInserter(Node):
             "tangential" if self.get_parameter("auto_azimuth").value else "fixed")
         azimuth_rad, search_ready = None, None
         if azimuth_mode == "search":
-            if self.get_parameter("use_current_orientation").value:
-                ee_now = self._get_tf(world_frame, ee_link)
-                if ee_now is None:
-                    self.get_logger().error("  TF lookup failed.")
-                    return
-                r_now = ee_now.transform.rotation
-                q_search = (r_now.x, r_now.y, r_now.z, r_now.w)
-            else:
-                q_search = _quat_normalize(tuple(
-                    self.get_parameter(f"vertical_quat_{a}").value for a in "xyzw"))
             found = self._search_azimuth(
                 cont_x, cont_y, ready_z, target_xyz[2], tilt_rad, q_search, vel_scale)
             if found is None:
