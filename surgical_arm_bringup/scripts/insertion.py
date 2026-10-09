@@ -101,6 +101,7 @@ from moveit_msgs.msg import CollisionObject
 from shape_msgs.msg import SolidPrimitive
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 
 try:
@@ -112,7 +113,7 @@ except ImportError:
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
 from sensor_msgs.msg import JointState
-from moveit_msgs.srv import GetMotionPlan, GetMotionSequence, GetPositionIK
+from moveit_msgs.srv import GetMotionPlan, GetMotionSequence, GetPositionIK, GetPlanningScene
 from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
 from moveit_msgs.action import ExecuteTrajectory
@@ -123,7 +124,7 @@ from moveit_msgs.msg import (
     RobotState, Constraints, OrientationConstraint,
     MotionPlanRequest, WorkspaceParameters,
     PositionConstraint, BoundingVolume, JointConstraint,
-    RobotTrajectory, MotionSequenceItem,
+    RobotTrajectory, MotionSequenceItem, PlanningScene, PlanningSceneComponents,
 )
 from shape_msgs.msg import SolidPrimitive
 
@@ -740,6 +741,12 @@ class AngledInserter(Node):
         self._info_pub = self.create_publisher(String, "/insertion/run_info", 10)
         self._traj_pub = self.create_publisher(
             RobotTrajectory, "/insertion/planned_trajectory", 10)
+        self._scene_snapshot_pub = self.create_publisher(
+            PlanningScene, "/insertion/planning_scene_snapshot",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE))
+        self._scene_snapshot_cli = self.create_client(
+            GetPlanningScene, "/get_planning_scene", callback_group=self._cb_group)
         self._run_log = {}
         self._seq_cli = self.create_client(
             GetMotionSequence, "/plan_sequence_path",
@@ -2203,21 +2210,78 @@ class AngledInserter(Node):
         "/insertion/run_info",
         "/insertion/planned_trajectory",
         "/fused_marker_square_center",
+        "/planning_scene",                   # scene inputs / diffs
+        "/monitored_planning_scene",         # MoveIt's applied scene updates
+        "/insertion/planning_scene_snapshot",  # complete initial scene
+        "/robot_description",                # exact expanded URDF
+        "/robot_description_semantic",       # SRDF / disabled collision pairs
     ]
+
+    @staticmethod
+    def _bag_qos_overrides():
+        # Receive latched data published before the recorder started. Leave
+        # dynamic topics on rosbag's offered-QoS detection (e.g. best-effort JS).
+        return {topic: dict(history="keep_last", depth=100,
+                            reliability="reliable", durability="transient_local")
+                for topic in ("/tf_static", "/robot_description",
+                              "/robot_description_semantic",
+                              "/insertion/planning_scene_snapshot")}
+
+    def _record_scene_snapshot(self):
+        """Read-only snapshot: topic diffs alone cannot reconstruct an old scene."""
+        try:
+            if not self._scene_snapshot_cli.wait_for_service(timeout_sec=2.0):
+                raise RuntimeError("/get_planning_scene unavailable")
+            request = GetPlanningScene.Request()
+            request.components.components = (
+                PlanningSceneComponents.SCENE_SETTINGS
+                | PlanningSceneComponents.ROBOT_STATE
+                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+                | PlanningSceneComponents.WORLD_OBJECT_NAMES
+                | PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+                | PlanningSceneComponents.OCTOMAP
+                | PlanningSceneComponents.TRANSFORMS
+                | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+                | PlanningSceneComponents.LINK_PADDING_AND_SCALING
+                | PlanningSceneComponents.OBJECT_COLORS)
+            future = self._scene_snapshot_cli.call_async(request)
+            response = self._wait_for_future(future, 5.0)
+            if response is None:
+                future.cancel()
+                raise RuntimeError("/get_planning_scene timed out")
+            if response.scene.is_diff:
+                raise RuntimeError("MoveIt returned a diff instead of a full scene")
+            self._scene_snapshot_pub.publish(response.scene)
+            objects = [obj.id for obj in response.scene.world.collision_objects]
+            self._run_info("planning_scene_snapshot", success=True, object_ids=objects)
+            self.get_logger().info(f"Recorded initial planning scene: objects={objects}")
+            if not objects:
+                self.get_logger().warn("Initial planning scene has no world objects; check scene setup.")
+        except Exception as exc:
+            self.get_logger().warn(f"Bag lacks initial planning-scene snapshot: {exc}")
+            self._run_info("planning_scene_snapshot", success=False, error=str(exc))
 
     def _start_bag(self):
         bag_dir = os.path.expanduser(self.get_parameter("bag_dir").value)
         os.makedirs(bag_dir, exist_ok=True)
         path = os.path.join(bag_dir, time.strftime("insertion_%Y%m%d_%H%M%S"))
         try:
-            proc = subprocess.Popen(
-                ["ros2", "bag", "record", "-o", path] + self._BAG_TOPICS
-                + [t for t in self.get_parameter("bag_extra_topics").value if t],
-                # Not the terminal: the recorder's keyboard handler switches a
-                # shared stdin to non-blocking, and every input() prompt in this
-                # script then returns EOF at once (reproduced 2026-10-08).
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # JSON is valid YAML; keep the exact QoS and recorder errors beside
+            # the bag for diagnosis without another runtime YAML dependency.
+            qos_path = path + ".qos.yaml"
+            with open(qos_path, "w") as qos_file:
+                json.dump(self._bag_qos_overrides(), qos_file, indent=2)
+            topics = list(dict.fromkeys(self._BAG_TOPICS + [
+                t for t in self.get_parameter("bag_extra_topics").value if t]))
+            with open(path + ".recorder.log", "w") as recorder_log:
+                proc = subprocess.Popen(
+                    ["ros2", "bag", "record", "--qos-profile-overrides-path", qos_path,
+                     "-o", path] + topics,
+                    # Not the terminal: the recorder's keyboard handler switches a
+                    # shared stdin to non-blocking, and every input() prompt in this
+                    # script then returns EOF at once (reproduced 2026-10-08).
+                    stdin=subprocess.DEVNULL,
+                    stdout=recorder_log, stderr=subprocess.STDOUT)
         except Exception as e:
             self.get_logger().warn(f"Failed to start rosbag: {e}")
             return None
@@ -2226,6 +2290,7 @@ class AngledInserter(Node):
             self.get_logger().warn(f"rosbag exited immediately (code {proc.returncode}).")
             return None
         self.get_logger().info(f"Recording bag: {path}")
+        self._record_scene_snapshot()
         return proc
 
     def _stop_bag(self, proc):
@@ -2779,16 +2844,24 @@ class AngledInserter(Node):
             self.get_logger().warn(f"  Insertion {insert_state} by the force guard -- skipping hold.")
         elif execute:
             try:
-                ans = input(f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
-                            f"{target_xyz[2]:.3f}).  Measured tip offset from the centre "
-                            "'dx dy' in mm (world X Y), or just ENTER, to reverse ... ")
-                try:
-                    dx, dy = (float(v) for v in ans.replace(",", " ").split())
+                prompt = (f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
+                          f"{target_xyz[2]:.3f}).\n"
+                          "  Type the measured tip offset from the centre as two numbers in mm,\n"
+                          "  X then Y in the world frame (example: 4 -6), then ENTER.\n"
+                          "  Or just ENTER to reverse without a measurement: ")
+                while True:
+                    ans = input(prompt)
+                    if not ans.strip():
+                        break
+                    try:
+                        dx, dy = (float(v) for v in ans.replace(",", " ").split())
+                    except ValueError:
+                        prompt = (f"  '{ans.strip()}' is not two numbers. Example: 4 -6   "
+                                  "(or just ENTER to skip): ")
+                        continue
                     self._run_info("measured_offset", dx_mm=dx, dy_mm=dy)
                     self.get_logger().info(f"  Recorded tip offset ({dx:+.1f}, {dy:+.1f}) mm.")
-                except ValueError:
-                    if ans.strip():
-                        self.get_logger().warn(f"  '{ans}' is not 'dx dy' -- no offset recorded.")
+                    break
             except EOFError:
                 time.sleep(post_wait)
         else:

@@ -121,11 +121,14 @@ ros2 run surgical_arm_bringup insertion.py --ros-args \
 When the tip is at depth the script stops and asks:
 
 ```
-Tip at target (...).  Measured tip offset from the centre 'dx dy' in mm (world X Y), or just ENTER, to reverse ...
+Tip at target (...).  Type the measured tip offset from the centre as two numbers in mm,
+  X then Y in the world frame (example: 4 -6), then ENTER.
+  Or just ENTER to reverse without a measurement:
 ```
 
 Measure with a ruler where the tip is relative to the centre of the marker
-square and type it, e.g. `1.5 -2`, then Enter.
+square and type the two numbers, e.g. `1.5 -2`, then Enter. Type numbers, not the
+letters "dx dy"; anything that is not two numbers is asked for again.
 
 - `dx`: positive = tip is farther from the robot base than the centre
   (toward the front camera).
