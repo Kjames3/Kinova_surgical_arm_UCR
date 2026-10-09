@@ -83,14 +83,22 @@ python3 combine_cameras.py --ros-args \
   -p realsense_info_topic:=/realsense/front_cam/color/camera_info
 ```
 
-**If this was already running from before 2026-10-09, restart it** — the older
-process does not publish `/marker_observations`.
+**If this was already running from before 2026-10-09 15:10, restart it** — the
+older process does not publish `/marker_observations` or the 5 Hz camera JPEGs
+the bag records.
 
 Check that the markers are seen (should print a pose at ~10 Hz):
 
 ```bash
 ros2 topic echo --once /fused_marker_square_center
 ```
+
+**Do not subscribe to the raw camera topics while the arm driver is running**
+— no `ros2 topic echo/hz` on `.../image_raw`, no rqt image view, no RViz image
+display. A second subscriber makes DDS broadcast the raw video onto the arm's
+Ethernet link; the arm driver then times out and the arm silently stops
+accepting motion (terminal 1 shows `timeout detected: BaseCyclicClient::Refresh`).
+If that happens, restart terminal 1.
 
 ## Terminal 6 — the insertion run (repeat per run)
 
@@ -162,7 +170,7 @@ These must all have a non-zero count:
 - `/insertion/planned_trajectory`
 - `/insertion/phase`
 
-If an image topic is 0, that camera is not publishing. If
+If an image topic is 0, that camera is not publishing or terminal 5 is the old code. If
 `/marker_observations` is 0, restart terminal 5.
 
 ## When you are done
@@ -185,4 +193,5 @@ reboot, but copy them off the same day anyway.
 | Prompts return instantly / phases skipped | Terminal has no real stdin (tmux quirk) — run terminal 6 in a plain terminal |
 | `guard_trip` / motion STOPPED during insert | Force guard saw contact; the arm extracts along the axis. Note it in the log |
 | Planning failed (code −31 / −1) | Square is out of reach at this angle; move it closer and rerun |
+| `FJT error -5 ... it did not get there`, arm never moved | Arm driver stopped itself after cyclic timeouts — see the raw-camera warning above; restart terminal 1 |
 | Arm does anything unexpected | E-stop. Do not rerun until someone has looked at it |

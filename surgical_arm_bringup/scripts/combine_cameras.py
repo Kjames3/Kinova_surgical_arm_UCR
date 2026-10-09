@@ -94,7 +94,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration as RclpyDuration
 from rclpy.callback_groups import ReentrantCallbackGroup
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped, PointStamped, PoseArray, Pose, TransformStamped
 
@@ -423,6 +423,12 @@ class CombineCamerasNode(Node):
         #                 through the marker centre (solve_rays).  Needs
         #                 constrain_to_table, or two cameras, to fix the range.
         self.declare_parameter("fusion_mode", "positions")
+        # JPEG copy of every camera at this rate on /insertion/throttled<image
+        # topic>/compressed, for insertion.py's bag. Published from here because
+        # a second subscriber to the raw topics makes CycloneDDS multicast the
+        # raw video onto every interface, including the arm's Ethernet link
+        # (57 MB/s measured 2026-10-09; the Kortex driver's cyclic I/O timed out).
+        self.declare_parameter("bag_image_hz", 5.0)
         # Below this conditioning the ray solve is rejected and the marker falls
         # back to "positions" (0.02 ~ a lone ray 82 deg off vertical).
         self.declare_parameter("ray_min_conditioning", 0.02)
@@ -498,6 +504,8 @@ class CombineCamerasNode(Node):
         self.debug_images = {}
         # Schema: { camera_name: timestamp_received }
         self.last_image_received = {}
+        self._jpeg_pubs = {}
+        self._jpeg_last = {}
         # Cache of the latest calculated center for live visual diagnostics
         self.latest_center = None
         
@@ -594,6 +602,8 @@ class CombineCamerasNode(Node):
             callback_group=self._cb_group
         )
         self.subs.extend([sub_info, sub_image])
+        self._jpeg_pubs[name] = self.create_publisher(
+            CompressedImage, "/insertion/throttled" + image_topic + "/compressed", 5)
 
     # ----------------------------------------------------------------------
     # Callback Handlers
@@ -621,6 +631,14 @@ class CombineCamerasNode(Node):
 
         now = self.get_clock().now().nanoseconds / 1e9
         self.last_image_received[camera_name] = now
+
+        hz = self.get_parameter("bag_image_hz").value
+        if hz > 0.0 and now - self._jpeg_last.get(camera_name, 0.0) >= 1.0 / hz:
+            self._jpeg_last[camera_name] = now
+            ok, jpg = cv2.imencode(".jpg", cv_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                self._jpeg_pubs[camera_name].publish(CompressedImage(
+                    header=msg.header, format="jpeg", data=jpg.tobytes()))
 
         # CameraInfo not yet received — show raw feed but skip ArUco detection
         if camera_name not in self.camera_intrinsics:

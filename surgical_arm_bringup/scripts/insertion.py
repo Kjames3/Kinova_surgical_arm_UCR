@@ -111,9 +111,7 @@ except ImportError:
 
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
-from sensor_msgs.msg import JointState, CompressedImage, Image
-from rclpy.serialization import deserialize_message
-from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import JointState
 from moveit_msgs.srv import GetMotionPlan, GetMotionSequence, GetPositionIK
 from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
@@ -594,14 +592,14 @@ class AngledInserter(Node):
         self.declare_parameter("force_guard_filter_s",     0.02)
         self.declare_parameter("record_bag",               True)
         self.declare_parameter("bag_dir",                  "~/insertion_bags")
-        # Camera streams for the bag, relayed as JPEG at bag_image_hz onto
-        # /insertion/throttled<topic>/compressed (`ros2 bag record` cannot
-        # throttle, and our camera drivers publish raw images only). A topic
-        # that already ends in /compressed is passed through untouched.
-        self.declare_parameter("bag_image_topics",         ["/camera/color/image_raw",
-                                                            "/realsense/front_cam/color/image_raw"])
-        self.declare_parameter("bag_image_hz",             5.0)
-        self.declare_parameter("bag_extra_topics",         ["/camera/color/camera_info",
+        # combine_cameras.py publishes a 5 Hz JPEG copy of each camera on
+        # /insertion/throttled<image topic>/compressed. Never subscribe to the
+        # raw image topics from here: a second subscriber makes CycloneDDS
+        # multicast the raw video onto the arm's Ethernet link, and the Kortex
+        # driver's cyclic I/O times out (2026-10-09: the arm did not move).
+        self.declare_parameter("bag_extra_topics",         ["/insertion/throttled/camera/color/image_raw/compressed",
+                                                            "/insertion/throttled/realsense/front_cam/color/image_raw/compressed",
+                                                            "/camera/color/camera_info",
                                                             "/realsense/front_cam/color/camera_info",
                                                             "/fused_corners",
                                                             "/marker_observations"])
@@ -742,17 +740,7 @@ class AngledInserter(Node):
         self._info_pub = self.create_publisher(String, "/insertion/run_info", 10)
         self._traj_pub = self.create_publisher(
             RobotTrajectory, "/insertion/planned_trajectory", 10)
-        self._bag_recording = False
         self._run_log = {}
-        self._bag_image_topics = []
-        for topic in self.get_parameter("bag_image_topics").value:
-            if not topic:
-                continue
-            out = "/insertion/throttled" + topic
-            if not out.endswith("/compressed"):
-                out += "/compressed"
-            self._bag_image_topics.append(out)
-            self._make_image_relay(topic, out)
         self._seq_cli = self.create_client(
             GetMotionSequence, "/plan_sequence_path",
             callback_group=self._cb_group)
@@ -806,40 +794,6 @@ class AngledInserter(Node):
 
     # ------------------------------------------------------------------
 
-
-    def _make_image_relay(self, topic, out):
-        """Relay an image topic as JPEG at bag_image_hz while a bag is recording."""
-        pub = self.create_publisher(CompressedImage, out, 5)
-        encode = not topic.endswith("/compressed")
-        last = [0.0]
-
-        def cb(raw):
-            if not self._bag_recording:
-                return
-            now = time.monotonic()
-            hz = self.get_parameter("bag_image_hz").value
-            if hz <= 0.0 or now - last[0] < 1.0 / hz:
-                return
-            last[0] = now
-            if not encode:
-                pub.publish(raw)
-                return
-            try:
-                import cv2
-                from combine_cameras import _imgmsg_to_bgr   # cv_bridge segfaults on REAL-1
-                msg = deserialize_message(raw, Image)
-                ok, jpg = cv2.imencode(".jpg", _imgmsg_to_bgr(msg), [cv2.IMWRITE_JPEG_QUALITY, 90])
-                if ok:
-                    pub.publish(CompressedImage(header=msg.header, format="jpeg",
-                                                data=jpg.tobytes()))
-            except Exception as e:
-                self.get_logger().warn(f"  bag image relay {topic}: {e}",
-                                       throttle_duration_sec=30.0)
-
-        # raw: only the frames that are kept get deserialised.
-        self.create_subscription(Image if encode else CompressedImage, topic, cb,
-                                 qos_profile_sensor_data,
-                                 callback_group=self._cb_group, raw=True)
 
     def _run_info(self, event, **data):
         self._info_pub.publish(String(data=json.dumps(dict(event=event, **data), default=list)))
@@ -2258,7 +2212,6 @@ class AngledInserter(Node):
         try:
             proc = subprocess.Popen(
                 ["ros2", "bag", "record", "-o", path] + self._BAG_TOPICS
-                + self._bag_image_topics
                 + [t for t in self.get_parameter("bag_extra_topics").value if t],
                 # Not the terminal: the recorder's keyboard handler switches a
                 # shared stdin to non-blocking, and every input() prompt in this
@@ -2290,7 +2243,6 @@ class AngledInserter(Node):
                   and not goal_handle.request.dry_run)
         bag = self._start_bag() if record else None
         self._run_log = {}
-        self._bag_recording = bag is not None
         self._run_info("params", **{name: prm.value for name, prm in self._parameters.items()})
         try:
             self._run_phases(goal_handle, pub_fb)
@@ -2306,7 +2258,6 @@ class AngledInserter(Node):
                 step_declined=self._step_declined,
                 phases=phases, guard_trips=log.get("guard_trips", []))
             time.sleep(0.2)   # let the recorder take the outcome before SIGINT
-            self._bag_recording = False
             self._stop_bag(bag)
 
     def _run_phases(self, goal_handle, pub_fb):
