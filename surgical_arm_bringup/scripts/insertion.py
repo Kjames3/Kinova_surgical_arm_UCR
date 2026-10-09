@@ -91,6 +91,7 @@ import time
 import subprocess
 import collections
 import collections.abc
+import json
 
 import rclpy
 import rclpy.time
@@ -110,7 +111,8 @@ except ImportError:
 
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, CompressedImage
+from rclpy.qos import qos_profile_sensor_data
 from moveit_msgs.srv import GetMotionPlan, GetMotionSequence, GetPositionIK
 from std_msgs.msg import String
 from action_msgs.msg import GoalStatus
@@ -591,6 +593,14 @@ class AngledInserter(Node):
         self.declare_parameter("force_guard_filter_s",     0.02)
         self.declare_parameter("record_bag",               True)
         self.declare_parameter("bag_dir",                  "~/insertion_bags")
+        # Camera streams for the bag, relayed at bag_image_hz onto
+        # /insertion/throttled<topic> (`ros2 bag record` cannot throttle, and
+        # the wrist camera at full rate is ~1 GB per run).
+        self.declare_parameter("bag_image_topics",         ["/camera/color/image_raw/compressed"])
+        self.declare_parameter("bag_image_hz",             5.0)
+        self.declare_parameter("bag_extra_topics",         ["/camera/color/camera_info",
+                                                            "/fused_corners",
+                                                            "/marker_observations"])
         # Phase 4/6a travel the whole insertion axis from hover (~300 mm at 45 deg).
         # Only the stretch within insert_slow_zone_m (tip height above the
         # container top) runs at insert speed; the rest of the axis is a
@@ -722,6 +732,21 @@ class AngledInserter(Node):
         self._dry_chain = None
         self._step_declined = False
         self._phase_pub = self.create_publisher(String, "/insertion/phase", 10)
+        # Bag-only topics: run_info is JSON, one message per event (params,
+        # target, measured_offset, outcome); planned_trajectory is every
+        # trajectory as sent, between that phase's start/end markers.
+        self._info_pub = self.create_publisher(String, "/insertion/run_info", 10)
+        self._traj_pub = self.create_publisher(
+            RobotTrajectory, "/insertion/planned_trajectory", 10)
+        self._bag_recording = False
+        self._run_log = {}
+        self._bag_image_topics = []
+        for topic in self.get_parameter("bag_image_topics").value:
+            if not topic:
+                continue
+            out = "/insertion/throttled" + topic
+            self._bag_image_topics.append(out)
+            self._make_image_relay(topic, out)
         self._seq_cli = self.create_client(
             GetMotionSequence, "/plan_sequence_path",
             callback_group=self._cb_group)
@@ -775,6 +800,27 @@ class AngledInserter(Node):
 
     # ------------------------------------------------------------------
 
+
+    def _make_image_relay(self, topic, out):
+        """Relay a compressed image topic at bag_image_hz while a bag is recording."""
+        pub = self.create_publisher(CompressedImage, out, 5)
+        last = [0.0]
+
+        def cb(raw):
+            if not self._bag_recording:
+                return
+            now = time.monotonic()
+            hz = self.get_parameter("bag_image_hz").value
+            if hz > 0.0 and now - last[0] >= 1.0 / hz:
+                last[0] = now
+                pub.publish(raw)
+
+        # raw: the JPEG bytes are passed through without being deserialised.
+        self.create_subscription(CompressedImage, topic, cb, qos_profile_sensor_data,
+                                 callback_group=self._cb_group, raw=True)
+
+    def _run_info(self, event, **data):
+        self._info_pub.publish(String(data=json.dumps(dict(event=event, **data), default=list)))
 
     def _camera_target_cb(self, msg: PoseStamped):
         self._camera_target = msg
@@ -1120,6 +1166,7 @@ class AngledInserter(Node):
         # which the controller aborts on (error -4 / state-tolerance violation).
         self._unwrap_trajectory(traj, ref_joints=self._live_joints)
         self._clamp_traj(traj)
+        self._traj_pub.publish(traj)
         if not self._execute_cli.wait_for_server(timeout_sec=5.0):
             self.get_logger().error(f"  /execute_trajectory not available ({label}).")
             return False
@@ -1146,6 +1193,11 @@ class AngledInserter(Node):
 
     def _mark_phase(self, text):
         self._phase_pub.publish(String(data=text))
+        if text.startswith("end:"):
+            label, _, status = text[len("end:"):].rpartition(":")
+            self._run_log.setdefault("phases", []).append([label, status])
+        elif text.startswith("guard_trip:"):
+            self._run_log.setdefault("guard_trips", []).append(text[len("guard_trip:"):])
 
     def _execute_fjt(self, traj, label, timeout=60.0):
         """Execute via direct FJT, publishing phase start/end markers for the bag."""
@@ -1160,6 +1212,7 @@ class AngledInserter(Node):
         """Execute via direct FJT (Cartesian paths — overrides 0.1 rad path tol)."""
         self._unwrap_trajectory(traj, ref_joints=self._live_joints)
         self._clamp_traj(traj)
+        self._traj_pub.publish(traj)
         deadline = time.time() + 5.0
         while not self._fjt_cli.server_is_ready() and time.time() < deadline:
             time.sleep(0.05)
@@ -1347,6 +1400,13 @@ class AngledInserter(Node):
             self._dry_chain = dict(zip(jt.joint_names, jt.points[-1].positions))
 
     def _plan(self, req, timeout=45.0, quiet=False):
+        """Plan via /plan_kinematic_path, publishing plan_start/plan_end markers for the bag."""
+        self._mark_phase("plan_start")
+        ok, traj = self._plan_inner(req, timeout, quiet)
+        self._mark_phase(f"plan_end:{'ok' if ok else 'fail'}")
+        return ok, traj
+
+    def _plan_inner(self, req, timeout, quiet):
         if not self._plan_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().error("  /plan_kinematic_path not available.")
             return False, None
@@ -1416,6 +1476,12 @@ class AngledInserter(Node):
         return self._execute_fjt(traj, label)
 
     def _plan_sequence(self, reqs, blend_radii, timeout=45.0):
+        self._mark_phase("plan_start")
+        ok, trajs = self._plan_sequence_inner(reqs, blend_radii, timeout)
+        self._mark_phase(f"plan_end:{'ok' if ok else 'fail'}")
+        return ok, trajs
+
+    def _plan_sequence_inner(self, reqs, blend_radii, timeout):
         """Plan several Pilz requests as one blended motion via /plan_sequence_path.
 
         reqs[0] keeps its start state; later items must leave it empty (Pilz
@@ -2158,6 +2224,8 @@ class AngledInserter(Node):
         "/joint_trajectory_controller/controller_state",   # desired vs actual
         "/tf", "/tf_static",
         "/insertion/phase",
+        "/insertion/run_info",
+        "/insertion/planned_trajectory",
         "/fused_marker_square_center",
     ]
 
@@ -2167,7 +2235,9 @@ class AngledInserter(Node):
         path = os.path.join(bag_dir, time.strftime("insertion_%Y%m%d_%H%M%S"))
         try:
             proc = subprocess.Popen(
-                ["ros2", "bag", "record", "-o", path] + self._BAG_TOPICS,
+                ["ros2", "bag", "record", "-o", path] + self._BAG_TOPICS
+                + self._bag_image_topics
+                + [t for t in self.get_parameter("bag_extra_topics").value if t],
                 # Not the terminal: the recorder's keyboard handler switches a
                 # shared stdin to non-blocking, and every input() prompt in this
                 # script then returns EOF at once (reproduced 2026-10-08).
@@ -2197,9 +2267,24 @@ class AngledInserter(Node):
         record = (self.get_parameter("record_bag").value
                   and not goal_handle.request.dry_run)
         bag = self._start_bag() if record else None
+        self._run_log = {}
+        self._bag_recording = bag is not None
+        self._run_info("params", **{name: prm.value for name, prm in self._parameters.items()})
         try:
             self._run_phases(goal_handle, pub_fb)
         finally:
+            log = self._run_log
+            phases = log.get("phases", [])
+            self._run_info(
+                "outcome",
+                success=bool(log.get("reached_end") and log.get("insert_state") == "done"
+                             and all(st == "ok" for _, st in phases)),
+                reached_end=bool(log.get("reached_end")),
+                insert_state=log.get("insert_state"),
+                step_declined=self._step_declined,
+                phases=phases, guard_trips=log.get("guard_trips", []))
+            time.sleep(0.2)   # let the recorder take the outcome before SIGINT
+            self._bag_recording = False
             self._stop_bag(bag)
 
     def _run_phases(self, goal_handle, pub_fb):
@@ -2342,6 +2427,8 @@ class AngledInserter(Node):
         tilt_rad = math.radians(angle_deg)
         # Tip must end exactly in the center
         target_xyz = (cont_x, cont_y, container_top - d_m)
+        self._run_info("target", source=target_source, frame=self.get_parameter("world_frame").value,
+                       x=cont_x, y=cont_y, z=target_xyz[2], container_top=container_top)
 
         azimuth_mode = self.get_parameter("azimuth_mode").value or (
             "tangential" if self.get_parameter("auto_azimuth").value else "fixed")
@@ -2713,13 +2800,22 @@ class AngledInserter(Node):
                     return
 
         # ── Phase 5: Hold ──────────────────────────────────────────────────
+        self._run_log["insert_state"] = insert_state
         self.get_logger().info(f"\n--- [Phase 5] Hold at target ---")
         if insert_state != "done":
             self.get_logger().warn(f"  Insertion {insert_state} by the force guard -- skipping hold.")
         elif execute:
             try:
-                input(f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
-                      f"{target_xyz[2]:.3f}).  Press ENTER to reverse ...")
+                ans = input(f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
+                            f"{target_xyz[2]:.3f}).  Measured tip offset from the centre "
+                            "'dx dy' in mm (world X Y), or just ENTER, to reverse ... ")
+                try:
+                    dx, dy = (float(v) for v in ans.replace(",", " ").split())
+                    self._run_info("measured_offset", dx_mm=dx, dy_mm=dy)
+                    self.get_logger().info(f"  Recorded tip offset ({dx:+.1f}, {dy:+.1f}) mm.")
+                except ValueError:
+                    if ans.strip():
+                        self.get_logger().warn(f"  '{ans}' is not 'dx dy' -- no offset recorded.")
             except EOFError:
                 time.sleep(post_wait)
         else:
@@ -2832,6 +2928,7 @@ class AngledInserter(Node):
 
         
 
+        self._run_log["reached_end"] = True
         self.get_logger().info("=" * 62)
         self.get_logger().info("angled_insert complete.")
         
