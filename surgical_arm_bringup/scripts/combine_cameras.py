@@ -85,6 +85,7 @@ import sys
 import os
 import math
 import time
+import json
 import numpy as np
 import cv2
 
@@ -94,6 +95,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration as RclpyDuration
 from rclpy.callback_groups import ReentrantCallbackGroup
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped, PointStamped, PoseArray, Pose, TransformStamped
 
 # NOTE: cv_bridge is deliberately NOT imported.  Its compiled extension
@@ -510,6 +512,9 @@ class CombineCamerasNode(Node):
         self.corners_pub = self.create_publisher(
             PoseArray, "/fused_corners", 10
         )
+        # Raw per-camera detections before any fusion, one JSON message per
+        # image: pixel corners, PnP position in the camera and reference frames.
+        self.obs_pub = self.create_publisher(String, "/marker_observations", 10)
         
         # ----------------------------------------------------------------------
         # Initialize Subscribers Dynamically Based on Parameters
@@ -674,6 +679,7 @@ class CombineCamerasNode(Node):
                 return
                 
         # Parse detected markers
+        observations = []
         for idx, marker_id in enumerate(ids):
             if marker_id not in self.corner_ids:
                 continue # Skip markers that aren't designated corners of the container
@@ -708,6 +714,21 @@ class CombineCamerasNode(Node):
             self._store_measurement(marker_id, camera_name, global_pos,
                                     origin=origin, ray=ray,
                                     cam_range=float(np.linalg.norm(local_pos)))
+            observations.append({
+                "id": int(marker_id),
+                "corners_px": marker_corners.tolist(),
+                "pos_cam": local_pos.tolist(),
+                "pos_ref": np.asarray(global_pos).tolist(),
+            })
+
+        if observations:
+            self.obs_pub.publish(String(data=json.dumps({
+                "camera": camera_name,
+                "stamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                "frame": self.reference_frame,
+                "optical_frame": optical_frame,
+                "markers": observations,
+            })))
             
         if self.enable_visualization:
             self._cache_annotated_feed(camera_name, annotated_img)
