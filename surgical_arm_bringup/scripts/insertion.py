@@ -174,7 +174,7 @@ MAX_TILT_DEG = 25.0   # hard limit — beyond this hits the wall at shallow dept
 
 # ee_link (bracelet_link) → assembly_tip offset, expressed in the ee_link frame.
 # Mirrors surgical_arm_description/thesis_ee/urdf/thesis_ee_macro.xacro:
-#   <joint name="assembly_tip_joint"> <origin xyz="-0.027 0 -0.414"/>
+#   <joint name="assembly_tip_joint"> <origin xyz="0.108 -0.008 -0.411"/>
 # If you change the xacro, change this too.
 
 
@@ -894,7 +894,7 @@ class AngledInserter(Node):
                 }
             else:
                 self.get_logger().warn("Could not lookup tf ee_link -> tip_link, using default offset.")
-                self._assembly_tip_offset = {"x": -0.027, "y": 0.0, "z": -0.414}
+                self._assembly_tip_offset = {"x": 0.108, "y": -0.008, "z": -0.411}
         return self._assembly_tip_offset
 
     def _get_tf(self, parent, child, timeout=5.0):

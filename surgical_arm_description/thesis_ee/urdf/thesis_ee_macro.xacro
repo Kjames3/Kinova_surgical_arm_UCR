@@ -120,12 +120,20 @@
          Verify after rebuild:
            ros2 run tf2_ros tf2_echo world assembly_tip
          Touch tip to table — Z should read ≈ -0.030 m (table surface).
-         Touch tip to a marked XY point — XY should match. -->
+         Touch tip to a marked XY point — XY should match.
+
+         Re-measured 2026-10-09: the XY above was never measured and was wrong
+         by 135 mm (every insertion missed the marker centre by that much).
+         Two touches of the same marked point 1 mm above the board, joint_7
+         rotated 90 deg between them, solved from bracelet_link poses alone:
+           tip = (0.1081, -0.0082, -0.4110) m, the two poses agree to 1.5 mm.
+         Z was fixed from the touch height (board top -0.025 m + 1 mm).
+         Redo this two-touch test whenever the tool is remounted. -->
     <link name="${prefix}assembly_tip"/>
     <joint name="${prefix}assembly_tip_joint" type="fixed">
       <parent link="bracelet_link"/>
       <child  link="${prefix}assembly_tip"/>
-      <origin xyz="-0.027 0.000 -0.414" rpy="0 0 0"/>
+      <origin xyz="0.108 -0.008 -0.411" rpy="0 0 0"/>
     </joint>
 
   </xacro:macro>
