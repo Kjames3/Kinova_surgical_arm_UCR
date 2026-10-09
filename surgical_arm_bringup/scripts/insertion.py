@@ -111,7 +111,8 @@ except ImportError:
 
 import tf2_ros
 from geometry_msgs.msg import Pose, Quaternion, Point
-from sensor_msgs.msg import JointState, CompressedImage
+from sensor_msgs.msg import JointState, CompressedImage, Image
+from rclpy.serialization import deserialize_message
 from rclpy.qos import qos_profile_sensor_data
 from moveit_msgs.srv import GetMotionPlan, GetMotionSequence, GetPositionIK
 from std_msgs.msg import String
@@ -593,12 +594,15 @@ class AngledInserter(Node):
         self.declare_parameter("force_guard_filter_s",     0.02)
         self.declare_parameter("record_bag",               True)
         self.declare_parameter("bag_dir",                  "~/insertion_bags")
-        # Camera streams for the bag, relayed at bag_image_hz onto
-        # /insertion/throttled<topic> (`ros2 bag record` cannot throttle, and
-        # the wrist camera at full rate is ~1 GB per run).
-        self.declare_parameter("bag_image_topics",         ["/camera/color/image_raw/compressed"])
+        # Camera streams for the bag, relayed as JPEG at bag_image_hz onto
+        # /insertion/throttled<topic>/compressed (`ros2 bag record` cannot
+        # throttle, and our camera drivers publish raw images only). A topic
+        # that already ends in /compressed is passed through untouched.
+        self.declare_parameter("bag_image_topics",         ["/camera/color/image_raw",
+                                                            "/realsense/front_cam/color/image_raw"])
         self.declare_parameter("bag_image_hz",             5.0)
         self.declare_parameter("bag_extra_topics",         ["/camera/color/camera_info",
+                                                            "/realsense/front_cam/color/camera_info",
                                                             "/fused_corners",
                                                             "/marker_observations"])
         # Phase 4/6a travel the whole insertion axis from hover (~300 mm at 45 deg).
@@ -745,6 +749,8 @@ class AngledInserter(Node):
             if not topic:
                 continue
             out = "/insertion/throttled" + topic
+            if not out.endswith("/compressed"):
+                out += "/compressed"
             self._bag_image_topics.append(out)
             self._make_image_relay(topic, out)
         self._seq_cli = self.create_client(
@@ -802,8 +808,9 @@ class AngledInserter(Node):
 
 
     def _make_image_relay(self, topic, out):
-        """Relay a compressed image topic at bag_image_hz while a bag is recording."""
+        """Relay an image topic as JPEG at bag_image_hz while a bag is recording."""
         pub = self.create_publisher(CompressedImage, out, 5)
+        encode = not topic.endswith("/compressed")
         last = [0.0]
 
         def cb(raw):
@@ -811,12 +818,27 @@ class AngledInserter(Node):
                 return
             now = time.monotonic()
             hz = self.get_parameter("bag_image_hz").value
-            if hz > 0.0 and now - last[0] >= 1.0 / hz:
-                last[0] = now
+            if hz <= 0.0 or now - last[0] < 1.0 / hz:
+                return
+            last[0] = now
+            if not encode:
                 pub.publish(raw)
+                return
+            try:
+                import cv2
+                from combine_cameras import _imgmsg_to_bgr   # cv_bridge segfaults on REAL-1
+                msg = deserialize_message(raw, Image)
+                ok, jpg = cv2.imencode(".jpg", _imgmsg_to_bgr(msg), [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok:
+                    pub.publish(CompressedImage(header=msg.header, format="jpeg",
+                                                data=jpg.tobytes()))
+            except Exception as e:
+                self.get_logger().warn(f"  bag image relay {topic}: {e}",
+                                       throttle_duration_sec=30.0)
 
-        # raw: the JPEG bytes are passed through without being deserialised.
-        self.create_subscription(CompressedImage, topic, cb, qos_profile_sensor_data,
+        # raw: only the frames that are kept get deserialised.
+        self.create_subscription(Image if encode else CompressedImage, topic, cb,
+                                 qos_profile_sensor_data,
                                  callback_group=self._cb_group, raw=True)
 
     def _run_info(self, event, **data):
