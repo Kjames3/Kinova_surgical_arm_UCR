@@ -14,6 +14,9 @@ Usage
   # Terminal 3 — run AFTER launching the robot (Terminal 1):
   ros2 run surgical_arm_bringup setup_planning_scene.py
 
+  # Apply a bag-derived scene and verify its object IDs through MoveIt:
+  #   --ros-args -p scene_file:=/absolute/path/scene.json
+
   # Disable the container:
   ros2 run surgical_arm_bringup setup_planning_scene.py \\
     --ros-args -p container_enabled:=false
@@ -41,46 +44,44 @@ Parameters
                                                     (50 cm in front of robot base)
   container_y             (float, default 0.20)  : container centre Y in world frame
                                                     (20 cm to the left)
-  container_z_from_table  (float, default 0.0)   : offset of mesh SW origin from
-                                                    table surface (0 = origin at base)
+  container_z_from_table  (float, default 0.0)   : height of container bottom above
+                                                    table surface (0 = directly on table)
 """
 
 import os
-import struct
+import json
+import math
+
+from container_geometry import load_container_geometry, validate_scene_spec
 
 import rclpy
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
-from moveit_msgs.msg import PlanningScene, CollisionObject
+from moveit_msgs.msg import PlanningScene, CollisionObject, PlanningSceneComponents
+from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 from shape_msgs.msg import SolidPrimitive, Mesh, MeshTriangle
 from geometry_msgs.msg import Pose, Point
 
 
-def _load_stl_mesh(filepath: str, scale: float = 0.001) -> Mesh:
-    """
-    Load a binary SolidWorks-exported STL file and return a shape_msgs/Mesh.
-    scale converts mm -> m (SW exports in mm by convention).
-    """
+def _load_stl_mesh(filepath: str) -> Mesh:
+    """Load and orient the hollow container; origin is bottom centre in metres."""
+    vertices, triangles, _ = load_container_geometry(filepath)
     mesh = Mesh()
-    with open(filepath, "rb") as f:
-        f.read(80)  # skip 80-byte header
-        n_tris = struct.unpack("<I", f.read(4))[0]
-        for _ in range(n_tris):
-            f.read(12)  # skip normal vector
-            tri = MeshTriangle()
-            base_idx = len(mesh.vertices)
-            for j in range(3):
-                x, y, z = struct.unpack("<fff", f.read(12))
-                mesh.vertices.append(Point(x=x * scale, y=y * scale, z=z * scale))
-                tri.vertex_indices[j] = base_idx + j
-            f.read(2)  # skip attribute byte count
-            mesh.triangles.append(tri)
+    mesh.vertices = [Point(x=x, y=y, z=z) for x, y, z in vertices]
+    mesh.triangles = [MeshTriangle(vertex_indices=indices) for indices in triangles]
     return mesh
 
 
 class PlanningSceneSetup(Node):
     def __init__(self):
         super().__init__("planning_scene_setup")
+
+        self.declare_parameter("scene_file", "")
+        self._scene_spec = None
+        filename = self.get_parameter("scene_file").value
+        if filename:
+            with open(os.path.expanduser(filename)) as stream:
+                self._scene_spec = validate_scene_spec(json.load(stream))
 
         self.declare_parameter("table_x_size",    2.0)
         self.declare_parameter("table_y_size",    2.0)
@@ -95,21 +96,24 @@ class PlanningSceneSetup(Node):
         self.declare_parameter("pole_z_base",  0.0)
 
         # Glass container — mesh loaded from Glass_container.STL
+        self.declare_parameter("container_yaw_deg", 0.0)
         self.declare_parameter("container_enabled",      True)
         self.declare_parameter("container_x",            0.50)   # 50 cm in front
         self.declare_parameter("container_y",            -0.20)  # 20 cm to the left (from operator's perspective facing the robot)
         self.declare_parameter("container_z_from_table", 0.0)    # 0 = origin at table surface
 
-        self._scene_pub = self.create_publisher(
-            PlanningScene, "/planning_scene", 10
-        )
-        self.create_timer(1.5, self._publish_scene)
+        self._apply_cli = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
+        self._get_cli = self.create_client(GetPlanningScene, "/get_planning_scene")
+        self._pending = False
         self._published = False
+        self.create_timer(1.5, self._publish_scene)
 
     def _publish_scene(self):
-        if self._published:
+        if self._published or self._pending:
             return
-        self._published = True
+        if not self._apply_cli.service_is_ready() or not self._get_cli.service_is_ready():
+            self.get_logger().warn("Waiting for MoveIt apply/get planning-scene services.", throttle_duration_sec=5.0)
+            return
 
         x     = self.get_parameter("table_x_size").value
         y     = self.get_parameter("table_y_size").value
@@ -123,10 +127,21 @@ class PlanningSceneSetup(Node):
         pole_r       = self.get_parameter("pole_radius").value
         pole_z_base  = self.get_parameter("pole_z_base").value
 
+        container_yaw = math.radians(self.get_parameter("container_yaw_deg").value)
         container_enabled     = self.get_parameter("container_enabled").value
         container_x           = self.get_parameter("container_x").value
         container_y           = self.get_parameter("container_y").value
         container_z_from_table = self.get_parameter("container_z_from_table").value
+
+        if self._scene_spec:
+            spec = self._scene_spec
+            x, y, thick = spec["table_size_m"]
+            z_top = spec["table_surface_z_m"]
+            container_x, container_y, base_z = spec["container_center_base_m"]
+            container_z_from_table = base_z - z_top
+            container_yaw = spec["container_yaw_rad"]
+            container_enabled = True
+            pole_enabled = False  # No unmeasured pole in the reconstructed scene.
 
         # --- Table collision object ---
         table_co = CollisionObject()
@@ -193,7 +208,13 @@ class PlanningSceneSetup(Node):
                     get_package_share_directory("kortex_description"),
                     "grippers", "thesis_ee", "meshes", "Glass_container.STL",
                 )
-                mesh = _load_stl_mesh(mesh_path, scale=0.001)
+                if self._scene_spec and self._scene_spec.get("container_mesh_file"):
+                    mesh_path = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(
+                        self.get_parameter("scene_file").value))), self._scene_spec["container_mesh_file"])
+                _, _, metadata = load_container_geometry(mesh_path)
+                if self._scene_spec and metadata["source_sha256"] != self._scene_spec["container_mesh_sha256"]:
+                    raise ValueError("Container CAD hash differs from offline scene")
+                mesh = _load_stl_mesh(mesh_path)
 
                 container_co = CollisionObject()
                 container_co.header.frame_id = "world"
@@ -205,9 +226,10 @@ class PlanningSceneSetup(Node):
                 mesh_pose = Pose()
                 mesh_pose.position.x = container_x
                 mesh_pose.position.y = container_y
-                # Place mesh origin at table surface + any SW-origin offset
+                # Normalized mesh origin is its bottom centre.
                 mesh_pose.position.z = z_top + container_z_from_table
-                mesh_pose.orientation.w = 1.0
+                mesh_pose.orientation.w = math.cos(container_yaw / 2)
+                mesh_pose.orientation.z = math.sin(container_yaw / 2)
                 container_co.mesh_poses.append(mesh_pose)
 
                 scene.world.collision_objects.append(container_co)
@@ -224,14 +246,38 @@ class PlanningSceneSetup(Node):
                     "  Check that kortex_description is built and Glass_container.STL exists."
                 )
 
-        self._scene_pub.publish(scene)
+                return  # Never silently apply a table-only scene after a mesh error.
 
-        log_lines.append("  Objects are now visible in RViz — MoveIt will avoid them.")
-        self.get_logger().info("\n".join(log_lines))
-        self.get_logger().info(
-            "You can keep this node running to re-publish on reconnect, "
-            "or Ctrl-C once the scene is confirmed in RViz."
-        )
+        # Complete replacement for these object IDs, while preserving other world
+        # objects. Mark robot_state as a diff so existing attachments survive.
+        scene.robot_state.is_diff = True
+        self._expected_ids = {obj.id for obj in scene.world.collision_objects}
+        self._pending = True
+        self._apply_cli.call_async(ApplyPlanningScene.Request(scene=scene)).add_done_callback(self._applied)
+
+        self.get_logger().info("\n".join(log_lines).replace("Planning scene updated:", "Requesting planning scene:"))
+
+    def _applied(self, future):
+        try:
+            if not future.result().success:
+                raise RuntimeError("MoveIt rejected scene")
+            request = GetPlanningScene.Request()
+            request.components.components = PlanningSceneComponents.WORLD_OBJECT_NAMES
+            self._get_cli.call_async(request).add_done_callback(self._verified)
+        except Exception as exc:
+            self._pending = False
+            self.get_logger().error(f"Scene application failed: {exc}")
+
+    def _verified(self, future):
+        self._pending = False
+        try:
+            ids = {obj.id for obj in future.result().scene.world.collision_objects}
+            if not self._expected_ids.issubset(ids):
+                raise RuntimeError(f"Readback missing {self._expected_ids - ids}")
+            self._published = True
+            self.get_logger().info(f"Verified MoveIt scene objects: {sorted(ids)}")
+        except Exception as exc:
+            self.get_logger().error(f"Scene verification failed: {exc}")
 
 
 def main(args=None):

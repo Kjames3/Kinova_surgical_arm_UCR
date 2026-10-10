@@ -1,0 +1,61 @@
+{
+  "base_link": {
+    "triangles": 5759,
+    "spheres": 60,
+    "minimum_surface_margin_m": 9.999708431856699e-05,
+    "spacing_m": 0.035
+  },
+  "shoulder_link": {
+    "triangles": 8379,
+    "spheres": 62,
+    "minimum_surface_margin_m": 9.999428202394842e-05,
+    "spacing_m": 0.035
+  },
+  "half_arm_1_link": {
+    "triangles": 9776,
+    "spheres": 81,
+    "minimum_surface_margin_m": 9.99957286774919e-05,
+    "spacing_m": 0.035
+  },
+  "half_arm_2_link": {
+    "triangles": 8426,
+    "spheres": 80,
+    "minimum_surface_margin_m": 9.999502180261036e-05,
+    "spacing_m": 0.035
+  },
+  "forearm_link": {
+    "triangles": 8638,
+    "spheres": 54,
+    "minimum_surface_margin_m": 9.999675614374981e-05,
+    "spacing_m": 0.035
+  },
+  "spherical_wrist_1_link": {
+    "triangles": 9679,
+    "spheres": 28,
+    "minimum_surface_margin_m": 9.999949873209374e-05,
+    "spacing_m": 0.035
+  },
+  "spherical_wrist_2_link": {
+    "triangles": 10344,
+    "spheres": 105,
+    "minimum_surface_margin_m": 9.999713859552839e-05,
+    "spacing_m": 0.02
+  },
+  "bracelet_link": {
+    "triangles": 23865,
+    "spheres": 30,
+    "minimum_surface_margin_m": 9.999529171318862e-05,
+    "spacing_m": 0.035
+  },
+  "thesis_ee": {
+    "triangles": 939029,
+    "spheres": 717,
+    "minimum_surface_margin_m": 9.99939499622543e-05,
+    "spacing_m": 0.02
+  },
+  "tcp_extension": {
+    "cad_to_tcp_m": 0.020670191369488257,
+    "spheres": 5,
+    "status": "provisional; requires physical geometry validation"
+  }
+}

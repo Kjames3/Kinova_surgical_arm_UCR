@@ -11,6 +11,12 @@ Usage:
     python validate_ik.py
 """
 import os
+import json
+from pathlib import Path
+
+import numpy as np
+from trimesh.transformations import quaternion_matrix
+from validate_fk_vs_urdf import parse_joints, urdf_transform
 
 import torch
 import yaml
@@ -33,7 +39,8 @@ def main():
     jn = kin.joint_names
     ai = kin.tool_frames.index("assembly_tip")
     torch.manual_seed(1)
-    q0 = torch.tensor([HOME], device="cuda", dtype=torch.float32)
+    home_by_joint = dict(zip(JOINTS, HOME))
+    q0 = torch.tensor([[home_by_joint[j] for j in jn]], device="cuda", dtype=torch.float32)
     # small perturbations around home stay reachable and self-collision-free
     perturb = 0.3 * (torch.rand(3, len(jn), device="cuda") - 0.5)
     qs = torch.cat([q0, q0 + perturb], dim=0)
@@ -58,7 +65,28 @@ def main():
     n_ok = int(succ.sum().item())
     print(f"IK goals={n}  success={n_ok}/{n}  "
           f"max_pos_err={float(perr[succ].max()) if n_ok else float('nan'):.3f} mm")
-    ok = n_ok == n and (n_ok == 0 or float(perr[succ].max()) < 1.0)
+    # Independently verify returned joints, rather than trusting solver metrics.
+    solved = res.js_solution.position.detach().cpu().numpy().reshape(-1, len(jn))
+    joints = parse_joints(os.path.join(HERE, "gen3_surgical.urdf"))
+    position_errors, angle_errors = [], []
+    for index, q in enumerate(solved):
+        ref = urdf_transform(joints, "base_link", "assembly_tip", dict(zip(jn, q)))
+        target_position = pos[index].cpu().numpy()
+        target_rotation = quaternion_matrix(quat[index].cpu().numpy())[:3, :3]
+        position_errors.append(float(np.linalg.norm(ref[:3, 3] - target_position) * 1000))
+        angle_errors.append(float(np.degrees(np.arccos(np.clip(
+            (np.trace(ref[:3, :3].T @ target_rotation) - 1) / 2, -1, 1)))))
+    ok = n_ok == n and max(position_errors) < 1.0 and max(angle_errors) < 0.5
+    print(f"Independent IK verification: max {max(position_errors):.6f} mm / "
+          f"{max(angle_errors):.6f} deg")
+    if os.environ.get("CUROBO_OFFLINE_OUTPUT"):
+        fixture = {"joint_names": jn, "frame": "base_link", "tool_frame": "assembly_tip",
+                   "quaternion_order": "wxyz", "seed": 1,
+                   "reference_joints": qs.cpu().tolist(), "target_positions": pos.cpu().tolist(),
+                   "target_quaternions": quat.cpu().tolist(), "solution_joints": solved.tolist(),
+                   "success": succ.cpu().tolist(), "position_error_mm": position_errors,
+                   "orientation_error_deg": angle_errors}
+        (Path(os.environ["CUROBO_OFFLINE_OUTPUT"]) / "ik_fixtures.json").write_text(json.dumps(fixture, indent=2) + "\n")
     print("=== M1 IK REACHABILITY:", "PASS" if ok else "FAIL", "===")
     return 0 if ok else 1
 

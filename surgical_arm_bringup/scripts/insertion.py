@@ -82,6 +82,7 @@ Usage
 
 import math
 from robot_model_parser import get_robot_info
+from container_geometry import container_top_z
 from kortex_utils import *
 import os
 import signal
@@ -507,6 +508,9 @@ class AngledInserter(Node):
         self.declare_parameter("target_x",             0.260)  # m, world frame — container centre X
         self.declare_parameter("target_y",             0.000)  # m, world frame — container centre Y
         self.declare_parameter("table_z",             -0.030)  # m
+        # Current container support is the measured 5 mm marker board.
+        # Set to 0.0 when the container sits directly on the table.
+        self.declare_parameter("container_base_offset", 0.005)  # m above table
         self.declare_parameter("container_height",     0.086)  # m — 86 mm
         self.declare_parameter("hover_above_top",      0.030)  # m above container top
 
@@ -616,6 +620,10 @@ class AngledInserter(Node):
         # separate phases if sequence planning fails.
         self.declare_parameter("blend_transit",            True)
         self.declare_parameter("blend_radius",             0.05)  # m, at ee_link
+        self.declare_parameter("planner_backend", "pilz")
+        self.declare_parameter("curobo_max_tilt_deg", 15.0)
+        self.declare_parameter("curobo_socket", "/tmp/curobo_planner.sock")
+        self.declare_parameter("curobo_result_dir", "~/curobo_planning_runs")
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
         # True = action server (wait for goals on /insert_container).
@@ -689,7 +697,14 @@ class AngledInserter(Node):
         self._kortex_session = None
         self._kortex_base = None
         
-        if _HAS_KORTEX_API and self.get_parameter("real_robot").value:
+        self._planner_backend = self.get_parameter("planner_backend").value.lower()
+        if self._planner_backend not in ("pilz", "curobo"):
+            raise ValueError("planner_backend must be pilz or curobo")
+        if self._planner_backend == "curobo":
+            from curobo_planning_preview import check_preview_parameters
+            check_preview_parameters({n: p.value for n, p in self._parameters.items()})
+        if (_HAS_KORTEX_API and self.get_parameter("real_robot").value
+                and self._planner_backend == "pilz"):
             try:
                 ip = self.get_parameter("robot_ip").value
                 usr = self.get_parameter("robot_user").value
@@ -845,7 +860,7 @@ class AngledInserter(Node):
     def _parameter_callback(self, params):
         from rcl_interfaces.msg import SetParametersResult
         for p in params:
-            if p.name in ["container_height", "insert_depth_from_top", "target_x", "target_y", "hover_above_top", "approach_clearance"]:
+            if p.name in ["container_height", "container_base_offset", "insert_depth_from_top", "target_x", "target_y", "hover_above_top", "approach_clearance"]:
                 self.get_logger().info(f"Dynamically updated parameter {p.name} to {p.value}")
         return SetParametersResult(successful=True)
 
@@ -854,6 +869,9 @@ class AngledInserter(Node):
         # anchor to where the arm physically is, even while _start_joints is frozen.
         for name, pos in zip(msg.name, msg.position):
             self._live_joints[name] = pos
+        sample = dict(zip(msg.name, msg.position))
+        if all(n in sample for n in self.arm_joint_names):
+            self._preview_joint_sample = (time.monotonic(), {n: sample[n] for n in self.arm_joint_names})
         guard = self._guard
         if guard is not None and len(msg.effort) == len(msg.name):
             try:
@@ -2304,6 +2322,11 @@ class AngledInserter(Node):
         self.get_logger().info("Bag recording stopped.")
 
     def _run_impl(self, goal_handle, pub_fb):
+        if self._planner_backend == "curobo":
+            from curobo_planning_preview import run_preview
+            if not goal_handle.request.dry_run:
+                raise ValueError("cuRobo is planning-only; motion requests are rejected")
+            return run_preview(self)
         record = (self.get_parameter("record_bag").value
                   and not goal_handle.request.dry_run)
         bag = self._start_bag() if record else None
@@ -2390,7 +2413,8 @@ class AngledInserter(Node):
         if real_robot:
             self.get_logger().info("Arm is ready.")
 
-        container_top = table_z + cont_h
+        container_top = container_top_z(
+            table_z, cont_h, self.get_parameter("container_base_offset").value)
         hover_z  = container_top + hover_top
         ready_z  = container_top + approach
 
@@ -2988,6 +3012,7 @@ def main(args=None):
     executor = MultiThreadedExecutor()
     executor.add_node(node)
 
+    exit_code = 0
     _interrupted = threading.Event()
 
     def _sigint(sig, frame):
@@ -3025,15 +3050,17 @@ def main(args=None):
 
         try:
             node._run_impl(gh, _pub_fb)
-            node.get_logger().info("Standalone insertion finished.")
+            node.get_logger().info("Planning preview finished." if node._planner_backend == "curobo"
+                                   else "Standalone insertion finished.")
         except Exception as e:
             node.get_logger().error(f"Standalone insertion error: {e}")
+            exit_code = 1
         node._run_done.set()
 
     executor.shutdown(timeout_sec=2.0)
     spin_thread.join(timeout=3.0)
 
-    if _interrupted.is_set():
+    if _interrupted.is_set() and node._planner_backend == "pilz":
         print("\n[Ctrl+C] Stopping arm...")
         try:
             node._recovery_return(dict(
@@ -3051,5 +3078,8 @@ def main(args=None):
         pass
 
 
+    return exit_code
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

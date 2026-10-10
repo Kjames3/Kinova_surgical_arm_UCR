@@ -14,6 +14,8 @@ Usage:
     python validate_fk_vs_urdf.py
 """
 import os
+import json
+from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -69,7 +71,7 @@ def parse_joints(urdf):
     return joints
 
 
-def urdf_fk(joints, base, target, q):
+def urdf_transform(joints, base, target, q):
     # walk child->parent from target up to base, then apply in order
     chain, link = [], target
     child_of = {jd["child"]: (jn, jd) for jn, jd in joints.items()}
@@ -87,7 +89,11 @@ def urdf_fk(joints, base, target, q):
                 M = M @ T(np.eye(3), np.array(jd["axis"]) * a)
             else:
                 M = M @ T(axis_angle(jd["axis"], a), [0, 0, 0])
-    return M[:3, 3]
+    return M
+
+
+def urdf_fk(joints, base, target, q):
+    return urdf_transform(joints, base, target, q)[:3, 3]
 
 
 def main():
@@ -95,21 +101,35 @@ def main():
     cfg = KinematicsCfg.from_basic_urdf(URDF, base_link="base_link", tool_frames=TARGETS)
     kin = Kinematics(cfg)
     jn = kin.joint_names
-    q = torch.tensor([[HOME[j] for j in jn]], device="cuda", dtype=torch.float32)
-    st = kin.compute_kinematics(JointState.from_position(q, joint_names=jn))
-
-    worst = 0.0
-    for name in TARGETS:
-        ref = urdf_fk(joints, "base_link", name, HOME)             # independent numpy FK
-        i = kin.tool_frames.index(name)
-        cur = st.tool_poses.position[0, 0, i].cpu().numpy()        # cuRobo FK
-        err = np.linalg.norm(ref - cur) * 1000.0
-        worst = max(worst, err)
-        print(f"  {name:14s} urdf=({ref[0]:.4f},{ref[1]:.4f},{ref[2]:.4f})  "
-              f"cuRobo=({cur[0]:.4f},{cur[1]:.4f},{cur[2]:.4f})  |diff|={err:.4f} mm")
-    print(f"=== M1 FK vs URDF (== robot_state_publisher TF): "
-          f"{'PASS' if worst < 0.5 else 'FAIL'} (worst {worst:.4f} mm) ===")
-    return 0 if worst < 0.5 else 1
+    from trimesh.transformations import quaternion_matrix
+    rng = np.random.default_rng(42)
+    configs = [HOME, dict.fromkeys(JOINTS, 0.0)]
+    configs += [dict(zip(JOINTS, rng.uniform(-2, 2, 7))) for _ in range(32)]
+    worst_pos, worst_angle = 0.0, 0.0
+    fixtures = []
+    for config in configs:
+        fixture = {"joints": config, "transforms_base_to_link": {}}
+        q = torch.tensor([[config[j] for j in jn]], device="cuda", dtype=torch.float32)
+        st = kin.compute_kinematics(JointState.from_position(q, joint_names=jn))
+        for name in TARGETS:
+            ref = urdf_transform(joints, "base_link", name, config)
+            fixture["transforms_base_to_link"][name] = ref.tolist()
+            i = kin.tool_frames.index(name)
+            position = st.tool_poses.position[0, 0, i].cpu().numpy()
+            quat = st.tool_poses.quaternion[0, 0, i].cpu().numpy()
+            rotation = quaternion_matrix(quat)[:3, :3]  # cuRobo wxyz
+            pos_error = np.linalg.norm(ref[:3, 3] - position) * 1000
+            angle = np.degrees(np.arccos(np.clip((np.trace(ref[:3, :3].T @ rotation) - 1) / 2, -1, 1)))
+            worst_pos = max(worst_pos, pos_error)
+            worst_angle = max(worst_angle, angle)
+        fixtures.append(fixture)
+    if os.environ.get("CUROBO_OFFLINE_OUTPUT"):
+        (Path(os.environ["CUROBO_OFFLINE_OUTPUT"]) / "fk_fixtures.json").write_text(json.dumps(fixtures, indent=2) + "\n")
+    ok = worst_pos < 0.05 and worst_angle < 0.01
+    print(f"Independent FK: {len(configs)} configurations, {len(TARGETS)} frames; "
+          f"max position={worst_pos:.6f} mm, angle={worst_angle:.6f} deg; "
+          f"{'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

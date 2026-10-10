@@ -4,7 +4,7 @@
 Runs in the conda 'curobo' env (source ~/activate_curobo.sh). Loads the generated
 gen3_surgical.urdf, tracks both assembly_tip and bracelet_link, and verifies the
 fixed link between them is honored: ||assembly_tip - bracelet_link|| must equal
-|offset| = sqrt(0.027^2 + 0.414^2) = 414.8795 mm at EVERY joint configuration.
+|offset| for the measured (0.108, -0.008, -0.411) m calibration.
 This is rotation-invariant, so it validates FK without needing the live robot.
 
 Usage:
@@ -21,7 +21,7 @@ from curobo.types import JointState
 URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen3_surgical.urdf")
 
 # assembly_tip fixed-joint origin in bracelet_link, from thesis_ee_macro.xacro
-TIP_OFFSET = (-0.027, 0.000, -0.414)
+TIP_OFFSET = (0.108, -0.008, -0.411)
 EXPECTED_MM = math.sqrt(sum(v * v for v in TIP_OFFSET)) * 1000.0
 
 HOME = {"joint_1": 0.0, "joint_2": -0.3049, "joint_3": -3.1416, "joint_4": -1.6607,
@@ -29,6 +29,7 @@ HOME = {"joint_1": 0.0, "joint_2": -0.3049, "joint_3": -3.1416, "joint_4": -1.66
 
 
 def main():
+    torch.manual_seed(42)
     cfg = KinematicsCfg.from_basic_urdf(
         URDF, base_link="base_link", tool_frames=["assembly_tip", "bracelet_link"])
     kin = Kinematics(cfg)

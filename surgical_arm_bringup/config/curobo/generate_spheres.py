@@ -1,175 +1,114 @@
 #!/usr/bin/env python3
-"""generate_spheres.py — M1: fit cuRobo collision spheres to the surgical arm.
+"""Deterministic conservative surface spheres, including thin CAD shells.
 
-Runs in the conda 'curobo' env (source ~/activate_curobo.sh). Parses
-gen3_surgical.urdf, and for every link that has collision geometry, fits a set of
-spheres (in the LINK frame) using cuRobo's sphere_fit. Writes the result as a
-cuRobo-style collision_spheres YAML.
-
-The thesis_ee assembly/tool (the long ~0.414 m insertion body ending at
-assembly_tip) is the collision-critical part, so it gets a denser budget.
-
-Usage:
-    source ~/activate_curobo.sh
-    python generate_spheres.py                 # writes gen3_surgical_spheres.yml
+Every triangle is assigned to a grid cell. Its cell's sphere encloses all three
+vertices, hence the entire triangle. This avoids the old volumetric fit's holes.
+These cover mesh surfaces, not certified solid interiors or swept trajectories.
 """
-import argparse
-import os
-import re
+import json
+from pathlib import Path
+import xml.etree.ElementTree as ET
 
+import numpy as np
 import trimesh
 import yaml
-
 from curobo.robot_parser import UrdfRobotParser
-from curobo.sphere_fit import SphereFitType, estimate_sphere_count, fit_spheres_to_mesh
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-URDF = os.path.join(HERE, "gen3_surgical.urdf")
-# Workspace root = 5 dirs above config/curobo/ (…/ws/src/<repo>/<pkg>/config/curobo).
-WS = os.path.abspath(os.path.join(HERE, *([os.pardir] * 5)))
-INSTALL = os.path.join(WS, "install")
+HERE = Path(__file__).resolve().parent
+WS = HERE.parents[4]
+URDF = HERE / "gen3_surgical.urdf"
+# The coarse wrist fit intrudes into the tool's clearance during the recorded
+# approach. Refine its surface coverage instead of reducing collision padding
+# or excluding the wrist/tool pair.
+LINK_SPACING = {"thesis_ee": 0.020, "spherical_wrist_2_link": 0.020}
 
 
 def resolve_urdf_meshes(src, dst):
-    """Rewrite every mesh filename to an absolute filesystem path.
-
-    cuRobo's join_path only skips its asset-root when the path is absolute, so
-    'file://…' URIs (arm meshes) and package-relative paths (thesis_ee tool) both
-    get mangled. Strip file://, and resolve 'pkg/…' -> install/pkg/share/pkg/….
-    """
-    txt = open(src).read()
-
-    def repl(m):
-        fn = m.group(1)
-        if fn.startswith("file://"):
-            fn = fn[len("file://"):]
-        elif fn.startswith("package://"):
-            fn = fn[len("package://"):]                 # -> pkg/rest…
-        if not fn.startswith("/"):
-            pkg = fn.split("/", 1)[0]                    # install/pkg/share/pkg/rest…
-            fn = os.path.join(INSTALL, pkg, "share", fn)
-        return f'filename="{fn}"'
-
-    open(dst, "w").write(re.sub(r'filename="([^"]+)"', repl, txt))
-    return dst
-
-# Per-link sphere budget: clamp the density-estimated count into a sane range so
-# self-collision stays cheap on 6 GB VRAM. Links matching a key get that range.
-BUDGET = {
-    "default": (4, 10),
-    # long thin tool body needs more spheres to be represented without
-    # over-inflating; tune after visual inspection.
-    "assembly": (8, 16),
-    "bracelet": (4, 8),
-    "base_link": (4, 8),
-}
-
-
-def _budget_for(link):
-    for key, rng in BUDGET.items():
-        if key != "default" and key in link:
-            return rng
-    return BUDGET["default"]
-
-
-# The thesis_ee assembly is a thin-shell STL that defeats volumetric sphere
-# fitting (yields a few 5 mm specks). Since the whole tool is rigid w.r.t.
-# bracelet_link and assembly_tip sits at (-0.027, 0, -0.414) in that frame, we
-# hand-author a sphere chain there instead — far more reliable for a thin tool.
-# Radius tapers from the assembly body near the wrist to the thin tip.
-TOOL_CHAIN = dict(
-    link="bracelet_link",
-    start=(0.0, 0.0, -0.065),     # just past end_effector_link (z=-0.0615)
-    end=(-0.027, 0.0, -0.414),    # assembly_tip
-    n=12,
-    r_start=0.018,                # assembly body
-    r_end=0.008,                  # thin tip
-)
-SKIP_MESH_LINKS = {"thesis_ee"}   # covered by TOOL_CHAIN instead
-
-
-def tool_chain_spheres():
-    a, b = TOOL_CHAIN["start"], TOOL_CHAIN["end"]
-    n, r0, r1 = TOOL_CHAIN["n"], TOOL_CHAIN["r_start"], TOOL_CHAIN["r_end"]
-    out = []
-    for i in range(n):
-        t = i / (n - 1)
-        c = [round(a[k] + t * (b[k] - a[k]), 5) for k in range(3)]
-        out.append({"center": c, "radius": round(r0 + t * (r1 - r0), 5)})
-    return out
+    root = ET.parse(src).getroot()
+    for mesh in root.findall('.//mesh'):
+        uri = mesh.get('filename')
+        if not uri.startswith('package://kortex_description/'):
+            raise ValueError(f'Expected source package URI, got {uri}')
+        path = WS / 'src/ros2_kortex' / uri.removeprefix('package://')
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        mesh.set('filename', str(path))
+    ET.indent(root)
+    ET.ElementTree(root).write(dst, encoding='unicode')
+    return str(dst)
 
 
 def link_mesh(parser, link):
-    geoms = parser.get_link_geometry(link, use_collision_mesh=True)
-    meshes = []
-    for g in geoms:
-        m = g.get_trimesh_mesh(transform_with_pose=True)  # -> link frame
-        if m is not None and len(m.vertices):
-            m.fill_holes()
-            trimesh.repair.fix_normals(m)
-            meshes.append(m)
-    if not meshes:
-        return None
-    return meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+    meshes = [g.get_trimesh_mesh(transform_with_pose=True)
+              for g in parser.get_link_geometry(link, use_collision_mesh=True)]
+    meshes = [trimesh.Trimesh(vertices=m.vertices, faces=m.faces, process=False)
+              for m in meshes if m is not None and len(m.vertices)]
+    return trimesh.util.concatenate(meshes) if meshes else None
+
+
+def surface_spheres(mesh, spacing=0.035):
+    # Subdivide large triangles to avoid huge bounding spheres. Deterministic.
+    vertices, faces = trimesh.remesh.subdivide_to_size(
+        mesh.vertices, mesh.faces, max_edge=spacing, max_iter=12)
+    triangles = vertices[faces]
+    keys = np.floor(triangles.mean(axis=1) / spacing).astype(np.int64)
+    cells, assignments = np.unique(keys, axis=0, return_inverse=True)
+    lower = np.full((len(cells), 3), np.inf)
+    upper = np.full((len(cells), 3), -np.inf)
+    np.minimum.at(lower, assignments, triangles.min(axis=1))
+    np.maximum.at(upper, assignments, triangles.max(axis=1))
+    centers = (lower + upper) / 2
+    distances = np.linalg.norm(triangles - centers[assignments, None, :], axis=-1)
+    radii = np.zeros(len(cells))
+    np.maximum.at(radii, assignments, distances.max(axis=1))
+    # Outward rounding and 0.1 mm margin preserve coverage in exported YAML.
+    centers = np.round(centers, 8)
+    radii = np.ceil((radii + 0.0001) * 1e8) / 1e8
+    margin = float(np.min(radii[assignments, None] - np.linalg.norm(
+        triangles - centers[assignments, None, :], axis=-1)))
+    if margin < 0:
+        raise ValueError(f'Uncovered triangles: {margin}')
+    spheres = [{'center': c.tolist(), 'radius': float(r)} for c, r in zip(centers, radii)]
+    return spheres, {'triangles': len(triangles), 'spheres': len(spheres),
+                     'minimum_surface_margin_m': margin}
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=os.path.join(HERE, "gen3_surgical_spheres.yml"))
-    ap.add_argument("--density", type=float, default=1.0)
-    ap.add_argument("--surface-radius", type=float, default=0.005)
-    ap.add_argument("--fit", default="morphit", choices=[t.value for t in SphereFitType])
-    args = ap.parse_args()
-
-    fit_type = SphereFitType(args.fit)
-    resolved = resolve_urdf_meshes(URDF, os.path.join(HERE, "gen3_surgical_resolved.urdf"))
-    parser = UrdfRobotParser(resolved, load_meshes=True, mesh_root="",
-                             build_scene_graph=True)
+    resolved = resolve_urdf_meshes(URDF, HERE / 'gen3_surgical_resolved.urdf')
+    parser = UrdfRobotParser(resolved, load_meshes=True, mesh_root='', build_scene_graph=True)
     parser.build_link_parent()
-    links = [ln for ln in parser.get_link_names_from_urdf()
-             if parser.get_link_geometry(ln, use_collision_mesh=True)]
-    print(f"links with collision geometry ({len(links)}): {links}")
-
-    collision_spheres = {}
-    total = 0
-    for link in links:
-        if link in SKIP_MESH_LINKS:
-            print(f"  {link:28s} skipped mesh-fit (hand-authored tool chain)")
-            continue
+    spheres, report = {}, {}
+    for link in parser.get_link_names_from_urdf():
         mesh = link_mesh(parser, link)
         if mesh is None:
-            print(f"  {link:28s} no usable mesh, skipped")
             continue
-        lo, hi = _budget_for(link)
-        n = max(lo, min(hi, estimate_sphere_count(mesh, sphere_density=args.density)))
-        res = fit_spheres_to_mesh(
-            mesh, num_spheres=n, surface_radius=args.surface_radius, fit_type=fit_type)
-        centers = res.centers if hasattr(res, "centers") else res.center
-        radii = res.radii if hasattr(res, "radii") else res.radius
-        spheres = []
-        for c, r in zip(centers, radii):
-            if float(r) <= 0:
-                continue
-            spheres.append({"center": [round(float(x), 5) for x in c],
-                            "radius": round(float(r), 5)})
-        collision_spheres[link] = spheres
-        total += len(spheres)
-        print(f"  {link:28s} {len(spheres):2d} spheres  (r: "
-              f"{min(s['radius'] for s in spheres):.3f}-{max(s['radius'] for s in spheres):.3f} m)")
+        spacing = LINK_SPACING.get(link, 0.035)
+        spheres[link], report[link] = surface_spheres(mesh, spacing)
+        report[link]['spacing_m'] = spacing
+        print(f'{link}: {report[link]}')
 
-    # Append the hand-authored tool chain to its carrier link.
-    chain = tool_chain_spheres()
-    collision_spheres.setdefault(TOOL_CHAIN["link"], []).extend(chain)
-    total += len(chain)
-    print(f"  {TOOL_CHAIN['link']+' (+tool chain)':28s} {len(chain):2d} spheres  (r: "
-          f"{TOOL_CHAIN['r_end']:.3f}-{TOOL_CHAIN['r_start']:.3f} m)")
-
-    with open(args.out, "w") as f:
-        yaml.safe_dump({"collision_spheres": collision_spheres}, f,
-                       default_flow_style=None, sort_keys=False)
-    print(f"\nTotal spheres: {total} across {len(collision_spheres)} links")
-    print(f"Wrote {args.out}")
+    # Cover the short discrepancy between visual CAD endpoint and measured TCP.
+    # The bulk tool is covered by thesis_ee spheres, not a fictitious wrist-tip rod.
+    from validate_fk_vs_urdf import parse_joints, urdf_transform
+    joints = parse_joints(str(URDF))
+    tool_transform = urdf_transform(joints, 'bracelet_link', 'thesis_ee', {})
+    mesh = link_mesh(parser, 'thesis_ee')
+    vertices = trimesh.transform_points(mesh.vertices, tool_transform)
+    tip = urdf_transform(joints, 'bracelet_link', 'assembly_tip', {})[:3, 3]
+    closest = vertices[np.argmin(np.linalg.norm(vertices - tip, axis=1))]
+    gap = float(np.linalg.norm(closest - tip))
+    if gap > 0.030:
+        raise ValueError(f'CAD/TCP discrepancy {gap:.3f} m exceeds provisional 30 mm limit')
+    count = max(2, int(np.ceil(gap / 0.006)) + 1)
+    extension = [{'center': p.tolist(), 'radius': 0.008} for p in np.linspace(closest, tip, count)]
+    spheres.setdefault('bracelet_link', []).extend(extension)
+    report['tcp_extension'] = {'cad_to_tcp_m': gap, 'spheres': count,
+                               'status': 'provisional; requires physical geometry validation'}
+    (HERE / 'gen3_surgical_spheres.yml').write_text(yaml.safe_dump(
+        {'collision_spheres': spheres}, sort_keys=False, default_flow_style=None))
+    (HERE / 'sphere_coverage.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(f'Total spheres: {sum(map(len, spheres.values()))}; CAD/TCP gap {gap*1000:.2f} mm')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -28,7 +28,7 @@ OUT_YML = os.path.join(HERE, "gen3_surgical.yml")
 # Kinova Gen3 7-DOF collision chain, base -> tool, in kinematic order.
 CHAIN = ["base_link", "shoulder_link", "half_arm_1_link", "half_arm_2_link",
          "forearm_link", "spherical_wrist_1_link", "spherical_wrist_2_link",
-         "bracelet_link"]
+         "bracelet_link", "thesis_ee"]
 JOINTS = [f"joint_{i}" for i in range(1, 8)]
 HOME = {"joint_1": 0.0, "joint_2": -0.3049, "joint_3": -3.1416, "joint_4": -1.6607,
         "joint_5": 0.0, "joint_6": -1.7928, "joint_7": -0.0006}

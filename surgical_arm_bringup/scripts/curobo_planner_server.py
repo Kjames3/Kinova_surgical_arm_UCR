@@ -6,15 +6,12 @@ Unix-domain socket and answers plan requests from the ROS-side client
 (curobo_planner_client.py), which runs under system Python. See
 curobo_planner_protocol.py for the wire contract and the rationale for the split.
 
-M0 scope
+Backends
 --------
-Only the STUB backend is implemented. It proves the ROS<->conda wiring end to end
-by returning a well-formed, SAFE hold-in-place trajectory (every waypoint equals
-the start joint state) — enough for a dry-run round-trip without touching cuRobo.
-
-The real CUROBO backend (M1+) drops in behind the same Planner interface: build
-the robot config + collision world once at startup (warm the JIT kernels), then
-translate each request into a cuRobo plan and emit the same waypoint list.
+STUB exercises transport only. CUROBO accepts preview-only free-space approach
+requests with a full MoveIt scene and URDF and independently validates the result.
+Neither backend sends robot commands. The ROS insertion client rejects stub
+responses for cuRobo previews.
 
 Run (normally launched by the client/test via `conda run -n curobo`):
     python curobo_planner_server.py --socket /tmp/curobo_planner.sock --backend stub
@@ -77,19 +74,18 @@ class StubPlanner:
 
 
 class CuroboPlanner:
-    """Real backend — implemented in M1. Placeholder so the CLI/interface exist."""
+    """Planning-only free-space approach using the qualified offline settings."""
 
     name = "curobo"
 
     def __init__(self, **kw):
-        # M1: build RobotConfig + Scene here and warm the solver with a throwaway
-        # plan so the first real request doesn't pay JIT-compile latency.
-        raise NotImplementedError(
-            "CUROBO backend lands in M1 (robot config + collision world). "
-            "Use --backend stub for M0 wiring.")
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'config'/'curobo'))
+        from preview_backend import PreviewPlanner
+        self.backend = PreviewPlanner()
 
-    def plan(self, req):  # pragma: no cover - not reachable in M0
-        raise NotImplementedError
+    def plan(self, req):
+        return self.backend.plan(req)
 
 
 def make_planner(backend, **kw):
@@ -130,14 +126,16 @@ def serve(socket_path, backend, n_points, duration):
         print(f"[curobo_planner_server] {msg}", flush=True)
 
     if os.path.exists(socket_path):
-        os.unlink(socket_path)
+        raise RuntimeError(f"Socket already exists: {socket_path}; refusing to replace it")
 
     planner = make_planner(backend, n_points=n_points, duration=duration)
     log(f"backend={planner.name} python={sys.executable}")
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(socket_path)
+    os.chmod(socket_path, 0o600)
     srv.listen(8)
+    srv.settimeout(1.0)
     log(f"listening on {socket_path}")
 
     stopping = {"flag": False}
@@ -156,6 +154,8 @@ def serve(socket_path, backend, n_points, duration):
         while not stopping["flag"]:
             try:
                 conn, _ = srv.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 break  # socket closed by signal handler
             _handle_conn(conn, planner, log)

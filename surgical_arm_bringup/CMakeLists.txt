@@ -27,6 +27,10 @@ install(PROGRAMS
   scripts/handeye_calibration.py
   scripts/handeye_calibration_eye_in_hand.py
   scripts/robot_keepalive.py
+  scripts/export_bag_scene.py
+  scripts/extract_approach_fixture.py
+  scripts/view_approach_benchmark.py
+  scripts/container_geometry.py
   scripts/setup_planning_scene.py
   scripts/test_pen_tip_offset.py
   scripts/calibrate_camera_offsets.py
@@ -34,6 +38,7 @@ install(PROGRAMS
   scripts/impedance.py
   scripts/curobo_planner_protocol.py
   scripts/curobo_planner_server.py
+  scripts/curobo_planning_preview.py
   scripts/curobo_planner_client.py
   scripts/test_curobo_wiring.py
   scripts/gamepad_teleop.py
