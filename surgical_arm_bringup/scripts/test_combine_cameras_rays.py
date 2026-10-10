@@ -84,5 +84,24 @@ print(f"      xy RMS: position average {rms(err_pos):.1f} mm | front ray on plan
 check("ray fusion beats position averaging", rms(err_ray) < 0.5 * rms(err_pos))
 check("the side camera improves on the front camera alone", rms(err_ray) < rms(err_front))
 
+# --- remembered board shape: the centre from two adjacent corners -------------
+board = {0: (-0.12, -0.11), 1: (0.12, -0.11), 2: (0.12, 0.11), 3: (-0.12, 0.11)}   # centred
+ang, shift = np.radians(37.0), np.array([0.41, -0.07])
+Rz = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+moved = {i: Rz @ np.array(xy) + shift for i, xy in board.items()}
+for pair in ((0, 1), (1, 2), (2, 3), (3, 0)):
+    fit = cc.fit_board_template(board, {i: moved[i] for i in pair})
+    err = 1000 * np.linalg.norm(fit[0] - shift)
+    hid = max(1000 * np.linalg.norm(fit[1][i] - moved[i]) for i in board)
+    check(f"board centre from adjacent corners {pair}", err < 1e-6 and hid < 1e-6,
+          f"centre {err:.2e} mm, hidden corners {hid:.2e} mm")
+noisy = {i: moved[i] + 0.001 * rng.standard_normal(2) for i in (0, 1)}
+fit = cc.fit_board_template(board, noisy)
+check("1 mm corner noise moves the centre by about as much",
+      1000 * np.linalg.norm(fit[0] - shift) < 3.0, f"{1000 * np.linalg.norm(fit[0] - shift):.2f} mm")
+check("corners the wrong distance apart are refused",
+      cc.fit_board_template(board, {0: moved[0], 1: moved[0] + 1.2 * (moved[1] - moved[0])}) is None)
+check("one corner is not enough", cc.fit_board_template(board, {0: moved[0]}) is None)
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)

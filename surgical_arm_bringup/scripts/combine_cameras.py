@@ -208,6 +208,36 @@ def marker_centre_ray(corners: np.ndarray, K: np.ndarray, D: np.ndarray):
     return ray / np.linalg.norm(ray)
 
 
+def fit_board_template(template, observed, max_scale_error=0.015):
+    """Place a remembered board shape on the corners that are visible now.
+
+    template: {marker_id: (x, y)} relative to the board centre, in whatever
+    orientation the board had when it was learned.  observed: {marker_id:
+    (x, y)} in the reference frame, at least two of them.  The board is rigid,
+    so a 2-D rotation + translation of the template onto the visible corners
+    gives the centre and the hidden corners.  Returns (centre_xy, {id: xy for
+    every template corner}), or None when fewer than two corners match or the
+    visible corners are not the remembered distance apart (max_scale_error, m)
+    -- i.e. this is not the board that was learned.
+    """
+    ids = [i for i in observed if i in template]
+    if len(ids) < 2:
+        return None
+    a = np.array([template[i] for i in ids], dtype=np.float64)
+    b = np.array([observed[i][:2] for i in ids], dtype=np.float64)
+    ac, bc = a - a.mean(0), b - b.mean(0)
+    spread_a = float(np.sqrt((ac ** 2).sum()))
+    spread_b = float(np.sqrt((bc ** 2).sum()))
+    if spread_a < 1e-6 or abs(spread_a - spread_b) > max_scale_error:
+        return None
+    angle = math.atan2(float((ac[:, 0] * bc[:, 1] - ac[:, 1] * bc[:, 0]).sum()),
+                       float((ac * bc).sum()))
+    c, sn = math.cos(angle), math.sin(angle)
+    R = np.array([[c, -sn], [sn, c]])
+    t = b.mean(0) - R @ a.mean(0)          # the template's origin is the centre
+    return t, {i: R @ np.asarray(xy, dtype=np.float64) + t for i, xy in template.items()}
+
+
 def solve_rays(origins, directions, weights=None, plane_z=None):
     """
     Weighted least-squares point closest to a set of rays, optionally
@@ -429,6 +459,10 @@ class CombineCamerasNode(Node):
         # raw video onto every interface, including the arm's Ethernet link
         # (57 MB/s measured 2026-10-09; the Kortex driver's cyclic I/O timed out).
         self.declare_parameter("bag_image_hz", 5.0)
+        # The board's shape, remembered from the last time all four corners
+        # were seen by the same camera(s) and kept across restarts, so the
+        # centre can still be placed when only two adjacent corners are visible.
+        self.declare_parameter("board_template_file", "~/.ros/marker_board_template.json")
         # Below this conditioning the ray solve is rejected and the marker falls
         # back to "positions" (0.02 ~ a lone ray 82 deg off vertical).
         self.declare_parameter("ray_min_conditioning", 0.02)
@@ -508,6 +542,16 @@ class CombineCamerasNode(Node):
         self._jpeg_last = {}
         # Cache of the latest calculated center for live visual diagnostics
         self.latest_center = None
+        self._board_template = None
+        self._board_template_saved = 0.0
+        self._board_template_path = os.path.expanduser(
+            self.get_parameter("board_template_file").value)
+        try:
+            with open(self._board_template_path) as f:
+                self._board_template = {int(k): v for k, v in json.load(f).items()}
+            self.get_logger().info(f"Loaded board shape from {self._board_template_path}")
+        except (OSError, ValueError):
+            pass
         
         # ----------------------------------------------------------------------
         # Publishers
@@ -1110,6 +1154,7 @@ class CombineCamerasNode(Node):
         #   • 3+ cameras: median-of-means to suppress gross outliers from any single
         #                 camera that has a bad view angle or lighting artifact
         fused_corners = {}
+        corner_cams = {}
         for m_id in self.corner_ids:
             if m_id not in self.measurements:
                 continue
@@ -1124,6 +1169,7 @@ class CombineCamerasNode(Node):
             n = len(valid_positions)
             if n == 0:
                 continue
+            corner_cams[m_id] = frozenset(self.measurements[m_id])
 
             ray_pos = (self._fuse_marker_rays(m_id, self.measurements[m_id])
                        if self.fusion_mode == "rays" else None)
@@ -1169,6 +1215,20 @@ class CombineCamerasNode(Node):
         # ----------------------------------------------------------------------
         if num_detected == 4:
             center = (tl + tr + br + bl) / 4.0
+            # Learn the board's shape, but only from a consistent view: a
+            # corner that one extra camera also sees is pulled by that
+            # camera's calibration error and would bend the remembered shape.
+            if len(set(corner_cams.values())) == 1:
+                self._board_template = {int(i): (fused_corners[i][:2] - center[:2]).tolist()
+                                        for i in fused_corners}
+                if now - self._board_template_saved > 30.0:
+                    self._board_template_saved = now
+                    try:
+                        with open(self._board_template_path, "w") as f:
+                            json.dump(self._board_template, f)
+                    except OSError as e:
+                        self.get_logger().warn(f"Could not save the board shape: {e}",
+                                               throttle_duration_sec=60.0)
             
         # ----------------------------------------------------------------------
         # Case B: Partial Occlusion Fallback (3 Corners Visible)
@@ -1201,11 +1261,23 @@ class CombineCamerasNode(Node):
                 center = (tr + bl) / 2.0
                 self.get_logger().info("Partial fusion: Midpoint computed from TR & BL.", throttle_duration_sec=10.0)
             else:
-                self.get_logger().warn(
-                    "Only adjacent corners visible. Midpoint cannot resolve center without orientation context.",
-                    throttle_duration_sec=10.0
-                )
-                return
+                fit = (fit_board_template(self._board_template, fused_corners)
+                       if self._board_template else None)
+                if fit is None:
+                    self.get_logger().warn(
+                        "Only adjacent corners visible and no remembered board shape fits "
+                        "them. Show all four markers to one camera once.",
+                        throttle_duration_sec=10.0
+                    )
+                    return
+                z = float(np.mean([p[2] for p in fused_corners.values()]))
+                center = np.array([fit[0][0], fit[0][1], z])
+                placed = {i: np.array([xy[0], xy[1], z]) for i, xy in fit[1].items()}
+                tl, tr = placed.get(self.marker_id_tl), placed.get(self.marker_id_tr)
+                br, bl = placed.get(self.marker_id_br), placed.get(self.marker_id_bl)
+                self.get_logger().info(
+                    "Partial fusion: remembered board shape fitted to 2 adjacent corners.",
+                    throttle_duration_sec=10.0)
 
         if center is None:
             return
