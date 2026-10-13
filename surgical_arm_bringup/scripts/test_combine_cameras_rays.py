@@ -103,5 +103,15 @@ check("corners the wrong distance apart are refused",
       cc.fit_board_template(board, {0: moved[0], 1: moved[0] + 1.2 * (moved[1] - moved[0])}) is None)
 check("one corner is not enough", cc.fit_board_template(board, {0: moved[0]}) is None)
 
+# False-detection gate, with the numbers recorded in bag insertion_20261013_144158
+# (table plane z = -0.025): real markers read 0.012 and 0.026, the false one -1.243.
+PLANE = -0.025
+check("real markers 37-51 mm off the plane are kept",
+      not cc.off_table_plane(0.012, PLANE, 0.25) and not cc.off_table_plane(0.026, PLANE, 0.25))
+check("the 2026-10-13 false marker 1.2 m below the table is dropped",
+      cc.off_table_plane(-1.243, PLANE, 0.25))
+check("a marker far above the table is dropped too", cc.off_table_plane(0.40, PLANE, 0.25))
+check("max error 0 disables the gate", not cc.off_table_plane(-1.243, PLANE, 0.0))
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)

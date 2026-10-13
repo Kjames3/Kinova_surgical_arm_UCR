@@ -208,6 +208,18 @@ def marker_centre_ray(corners: np.ndarray, K: np.ndarray, D: np.ndarray):
     return ray / np.linalg.norm(ray)
 
 
+def off_table_plane(pos_z, plane_z, max_error):
+    """True when a single-marker PnP position is too far from the table plane
+    to be one of the board's markers.
+
+    A false ArUco decode of a small patch of background has the wrong apparent
+    size, so PnP puts it far in front of or behind the table: on 2026-10-13 a
+    34 px "marker 1" landed 1.2 m below it and, held for measurement_timeout,
+    moved the fused centre 424 mm for a second.  max_error <= 0 disables.
+    """
+    return max_error > 0 and abs(float(pos_z) - float(plane_z)) > max_error
+
+
 def fit_board_template(template, observed, max_scale_error=0.015):
     """Place a remembered board shape on the corners that are visible now.
 
@@ -377,6 +389,10 @@ class CombineCamerasNode(Node):
         self.declare_parameter("table_z", -0.055)               # meters — see above
         self.declare_parameter("constrain_to_table", True)      # project coordinates to flat table plane
         self.declare_parameter("marker_height_above_table", 0.005) # meters (board/marker thickness height, e.g. 5mm)
+        # With constrain_to_table, a marker whose own PnP height is further than
+        # this from the table plane is a false detection and is dropped (0 = keep all).
+        # Real markers have read up to 55 mm off, see off_table_plane().
+        self.declare_parameter("max_marker_plane_error", 0.25)   # meters
 
         # Axis sign corrections — set to -1.0 to flip an axis if the output
         # coordinate has the wrong sign in the robot world frame after the
@@ -482,6 +498,7 @@ class CombineCamerasNode(Node):
         self.table_z = self.get_parameter("table_z").value
         self.constrain_to_table = self.get_parameter("constrain_to_table").value
         self.marker_height_above_table = self.get_parameter("marker_height_above_table").value
+        self.max_marker_plane_error = float(self.get_parameter("max_marker_plane_error").value)
 
         # Axis sign corrections (±1.0 each)
         self.x_sign = float(self.get_parameter("x_sign").value)
@@ -764,6 +781,14 @@ class CombineCamerasNode(Node):
             
             # Transform local position (camera lens coordinates) to global reference coordinates
             global_pos = transform_point(local_pos, transform)
+            if self.constrain_to_table and off_table_plane(
+                    global_pos[2], self.z_sign * (self.table_z + self.marker_height_above_table),
+                    self.max_marker_plane_error):
+                self.get_logger().warn(
+                    f"[{camera_name}] marker {int(marker_id)} dropped: PnP puts it at "
+                    f"z={float(global_pos[2]):+.2f} m, not on the table -- false detection.",
+                    throttle_duration_sec=5.0)
+                continue
 
             # Viewing ray through the marker centre, in the reference frame
             ray = marker_centre_ray(marker_corners, K, D)
