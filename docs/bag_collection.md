@@ -195,6 +195,7 @@ reboot, but copy them off the same day anyway.
 | `No marker centre available -- refusing to insert` | Markers not in view, or terminal 5 not running |
 | Prompts return instantly / phases skipped | Terminal has no real stdin (tmux quirk) — run terminal 6 in a plain terminal |
 | `guard_trip` / motion STOPPED during insert | Force guard saw contact; the arm extracts along the axis. Note it in the log |
+| `guard_trip ... joint_6` in `Phase4a_axis_approach`, before the tip is near the container | The wrist is already loaded: on 2026-10-13 every approach with joint_7 past about −126° did this. Do not raise the limit; rerun with `-p "azimuth_search_joint7_keepout_deg:=[-180.0, -120.0]"` and look at what touches or pulls tight at the wrist |
 | Planning failed (code −31 / −1) | Square is out of reach at this angle; move it closer and rerun |
 | `FJT error -5 ... it did not get there`, arm never moved | Arm driver stopped itself after cyclic timeouts — see the raw-camera warning above; restart terminal 1 |
 | Arm does anything unexpected | E-stop. Do not rerun until someone has looked at it |
