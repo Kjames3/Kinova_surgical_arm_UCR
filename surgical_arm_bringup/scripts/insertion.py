@@ -325,6 +325,26 @@ def rank_azimuth_candidates(start, solved, joint_names, continuous_joints,
     return ranked
 
 
+def chain_in_keepout(chain, joint_names, joint_name, lo, hi):
+    """True if any waypoint of an IK chain has joint_name inside [lo, hi] rad.
+
+    Angles are compared modulo 2*pi (wrapped to -pi..pi), so the answer is the
+    same whichever turn a continuous joint was unwrapped to.  lo >= hi means
+    no keep-out.  Used to steer the azimuth search away from wrist postures
+    that are reachable on paper but load the arm in practice: on 2026-10-13
+    every approach that took joint_7 past about -126 deg put 6-10 Nm of
+    external torque on joint_6 and tripped the guard in Phase 4a.
+    """
+    if lo >= hi or joint_name not in joint_names:
+        return False
+    i = joint_names.index(joint_name)
+    for q in chain:
+        wrapped = math.atan2(math.sin(q[i]), math.cos(q[i]))
+        if lo <= wrapped <= hi:
+            return True
+    return False
+
+
 def robust_centre(samples, max_spread_m):
     """Median of repeated (x, y) centre measurements, or None if they disagree.
 
@@ -557,6 +577,9 @@ class AngledInserter(Node):
         self.declare_parameter("azimuth_search_limit_margin_deg", 5.7)
         # Extra random IK seeds tried for the vertical pose above the target.
         self.declare_parameter("azimuth_search_ready_seeds", 6)
+        # Reject directions whose waypoints put joint_7 inside [lo, hi] deg
+        # (wrapped to -180..180).  lo == hi disables.  See chain_in_keepout().
+        self.declare_parameter("azimuth_search_joint7_keepout_deg", [0.0, 0.0])
         # Hard cap on tilt angle (deg). The geometric wall-clearance check still
         # runs regardless; this just rejects obviously-too-steep angles early.
         self.declare_parameter("max_tilt_deg",         45.0)
@@ -1986,6 +2009,15 @@ class AngledInserter(Node):
         with_ik = rank_azimuth_candidates(start, solved, self.arm_joint_names,
                                           self.continuous_joints, limit_margin=-math.inf)
         ranked = [c for c in with_ik if c["limit_margin"] >= margin]
+        keep_lo, keep_hi = (math.radians(float(v)) for v in self.get_parameter(
+            "azimuth_search_joint7_keepout_deg").value)
+        for c in list(ranked):
+            if chain_in_keepout(solved[c["azimuth_deg"]], self.arm_joint_names,
+                                "joint_7", keep_lo, keep_hi):
+                ranked.remove(c)
+                dropped["joint_7 in the keep-out"] += 1
+                log.info(f"  az {c['azimuth_deg']:+7.1f} deg rejected: joint_7 enters the "
+                         f"keep-out [{math.degrees(keep_lo):.0f}, {math.degrees(keep_hi):.0f}] deg")
         for c in with_ik:
             if c["limit_margin"] < margin:
                 dropped["joint near its limit"] += 1

@@ -73,5 +73,21 @@ check("no samples -> None", ins.robust_centre([], 0.005) is None)
 check("even sample count averages the middle pair",
       abs(ins.robust_centre([(0.0, 0.0), (0.002, 0.0)], 0.005)[0] - 0.001) < 1e-12)
 
+# joint_7 keep-out, with the tilted postures recorded on 2026-10-13: the three
+# that loaded the wrist and tripped the guard, and two that inserted cleanly.
+rad = lambda deg: [math.radians(v) for v in deg]
+LOADED = [[-65, 44, 144, -66, 42, -120, -156], [-62, 27, 126, -103, 42, -105, -156],
+          [-90, 36, 169, -74, 40, -103, -134]]
+CLEAN = [[57, 20, -135, -106, -45, -97, 144], [83, 52, 176, -42, -36, -111, 119]]
+LO, HI = math.radians(-180), math.radians(-120)
+check("every loaded 2026-10-13 posture is inside the keep-out",
+      all(ins.chain_in_keepout([start, rad(q)], J, "joint_7", LO, HI) for q in LOADED))
+check("the clean postures are outside it",
+      not any(ins.chain_in_keepout([start, rad(q)], J, "joint_7", LO, HI) for q in CLEAN))
+check("keep-out is modulo 2*pi (joint_7 at +204 deg is -156 deg)",
+      ins.chain_in_keepout([rad([0, 0, 0, 0, 0, 0, 204])], J, "joint_7", LO, HI))
+check("lo == hi disables the keep-out",
+      not ins.chain_in_keepout([rad(LOADED[0])], J, "joint_7", 0.0, 0.0))
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
