@@ -687,6 +687,15 @@ YIELD_TIMEOUT = 8.0           # s of continuous yielding -> force full stiffness
 # anti-windup as the joint-mode --ki-scale trim, reused here for cartesian mode.
 GRAVITY_TRIM_SCALE = 0.6      # default --gravity-trim (0 = off, legacy)
 TRIM_FREEZE_THRESH = 0.12     # rad/s -- above this, freeze accumulation
+# What the trim integrates (--trim-error). 'joint' is (q_ref - q) above, which
+# is only meaningful while q_ref is where the arm SHOULD be. In 'track' nothing
+# moves q_ref off q0, so every millimetre of commanded sweep reads as droop: on
+# hardware (2026-08-05/06) joint 2's trim sat pinned at its 15.6 Nm cap for
+# ~50% of every trim-on track run, and the no-trim runs scored better. 'task'
+# integrates the EE pose error mapped to joints by a damped pseudo-inverse,
+# so a moving setpoint is never mistaken for droop. 'auto' = task in track,
+# joint elsewhere (hold-ee/render keep the hardware-validated behaviour).
+TRIM_TASK_DAMPING = 0.01      # damped pseudo-inverse lambda for --trim-error task
 
 # Slow-collapse guard: MAX_JOINT_SPEED only catches a RUNAWAY. A soft-mode droop
 # creeps below it (the collapse above peaked at ~0.7 rad/s but averaged far less)
@@ -1573,6 +1582,41 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     return tau, manip, sigma_min, lam_damp
 
 
+def trim_error(source, q, q_ref, task=None):
+    """Joint-space error the gravity trim integrates (see TRIM_TASK_DAMPING).
+
+    ``source`` 'joint' returns ``q_ref - q``. 'task' needs
+    ``task = (J, p_cur, quat_cur, p_des, quat_des)`` and returns
+    ``Jᵀ (J Jᵀ + λ²I)⁻¹ e`` for the 6-D pose error ``e`` -- the least-squares
+    joint motion that would close the EE error, with no null-space component,
+    so redundancy drift is left to the posture spring.
+    """
+    if source == "joint" or task is None:
+        return _wrap_rad(q_ref - q)
+    J, p_cur, quat_cur, p_des, quat_des = task
+    e = np.concatenate([p_des - p_cur, orientation_error(quat_des, quat_cur)])
+    JJt = J @ J.T + TRIM_TASK_DAMPING ** 2 * np.eye(6)
+    return J.T @ np.linalg.solve(JJt, e)
+
+
+def follow_q_ref(model, q_ref, p_des, quat_des):
+    """One damped Newton IK step of ``q_ref`` toward the EE setpoint.
+
+    Track mode moves p_des but nothing used to move q_ref, so the posture
+    spring, the un-projected wrist anchor and a joint-space trim all pulled
+    toward q0 -- against the commanded sweep. In sim (sim_track_trim.py, 20 s
+    sweep, thesis_ee tip) the stale anchor alone cost 3.0 -> 12.2 mm. Called once
+    per cycle, this keeps q_ref on the joint path that realises the setpoint;
+    the step is self-correcting (it closes the residual, not just the increment)
+    and has no null-space component, so the redundancy stays where q0 put it.
+    """
+    p, quat = model.fk(q_ref)
+    J = model.jacobian(q_ref)
+    e = np.concatenate([p_des - p, orientation_error(quat_des, quat)])
+    JJt = J @ J.T + TRIM_TASK_DAMPING ** 2 * np.eye(6)
+    return q_ref + J.T @ np.linalg.solve(JJt, e)
+
+
 def free_drive_torque(q, tau_g, tau_collide, k_limit):
     """Interaction mode 'free': weightless hand-guiding -- gravity comp only.
 
@@ -1990,6 +2034,12 @@ def run_impedance(args):
         # same anti-windup cap, but is applied unscaled by the yield (weight
         # support, not stiffness). See GRAVITY_TRIM_SCALE.
         k_trim = KI_JOINT[:n] * args.gravity_trim
+        # 'free' has no EE setpoint, so it can only use the joint form.
+        trim_src = args.trim_error
+        if trim_src == "auto":
+            trim_src = "task" if args.interaction_mode == "track" else "joint"
+        if args.interaction_mode == "free":
+            trim_src = "joint"
         tau_trim = np.zeros(n)
         # Direct wrist/continuous-joint anchor toward q0 (cartesian, non-free):
         # a small UN-projected joint spring on joints 1,3,5,7, applied to the
@@ -2190,6 +2240,7 @@ def run_impedance(args):
         print(f"  gravity FF: {args.gravity} x{args.gravity_scale} "
               f"{np.round(tau_g0, 2)}")
         if args.mode == "cartesian" and args.gravity_trim > 0.0:
+            print(f"  trim error: {trim_src}")
             print(f"  grav trim : Ki={np.round(k_trim, 1)} cap "
                   f"{np.round(i_cap, 1)} Nm, full authority (unscaled by yield), "
                   f"freezes above {args.trim_freeze_thresh} rad/s")
@@ -2556,6 +2607,9 @@ def run_impedance(args):
                                 p_des = track_setpoint(
                                     p_a, p_b, step_start - t_start,
                                     args.track_period)
+                                if args.track_q_ref:
+                                    q_ref = follow_q_ref(model, q_ref, p_des,
+                                                         quat_des)
                             task_kp, task_kd = kp_cart * engage, kd_cart * engage_d
                             f_extra = None
 
@@ -2628,8 +2682,11 @@ def run_impedance(args):
                 if args.mode == "cartesian" and args.gravity_trim > 0.0:
                     if (engage >= 1.0
                             and np.max(np.abs(dq)) < args.trim_freeze_thresh):
+                        task = ((J, p_cur, quat_cur, p_des, quat_des)
+                                if trim_src == "task" else None)
                         tau_trim = np.clip(
-                            tau_trim + k_trim * _wrap_rad(q_ref - q) * dt_meas,
+                            tau_trim + k_trim * trim_error(trim_src, q, q_ref,
+                                                           task) * dt_meas,
                             -i_cap, i_cap)
                     tau = tau + tau_trim
 
@@ -3022,6 +3079,18 @@ def main():
                         "its position without getting stiffer' -- raise it if the "
                         "arm still droops, lower it if you feel slow bobbing. "
                         "0 = off (legacy).")
+    p.add_argument("--no-track-q-ref", dest="track_q_ref",
+                   action="store_false",
+                   help="[track] Leave q_ref at q0 instead of moving it with the "
+                        "setpoint (pre-2026-10-23 behaviour: the wrist anchor and "
+                        "posture spring then pull against the sweep).")
+    p.add_argument("--trim-error", choices=["auto", "task", "joint"],
+                   default="auto",
+                   help="[cartesian] What --gravity-trim integrates: 'joint' = "
+                        "q_ref - q (winds up in track, where q_ref stays q0); "
+                        "'task' = EE pose error mapped through a damped "
+                        "pseudo-inverse. 'auto' = task in track, joint "
+                        "elsewhere.")
     p.add_argument("--trim-freeze-thresh", type=float, default=TRIM_FREEZE_THRESH,
                    help="[cartesian] Joint speed (rad/s) above which the gravity "
                         "trim stops accumulating, so it never winds up against "
