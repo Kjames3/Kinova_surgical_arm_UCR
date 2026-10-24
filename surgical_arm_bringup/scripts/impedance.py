@@ -1469,7 +1469,7 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
                                kp_cart, kd_cart, kp_null, kd_null, tau_g,
                                tau_collide, k_limit, f_task_extra=None,
                                state=None, dyn=None, tau_sing=0.0,
-                               acc_max=None, wrench_max=None):
+                               acc_max=None, wrench_max=None, xdot_des=None):
     """Operational-space impedance torque (ported from Kuka opspace).
 
     Task spring-damper on the EE pose, mapped through Lambda and Jᵀ, with a
@@ -1524,7 +1524,11 @@ def cartesian_impedance_torque(model, q, dq, p_des, quat_des, q0,
     # MAX_IMP_ACC_* block.
     acc_lin, acc_ang = (MAX_IMP_ACC_LIN, MAX_IMP_ACC_ANG) if acc_max is None \
         else acc_max
-    F = kp_cart * x_err - kd_cart * xdot
+    # Damping acts on the velocity RELATIVE to a moving setpoint when the caller
+    # supplies one. Damping absolute xdot instead builds in a lag of
+    # (kd/kp)*v -- 0.14 s x sweep speed at cart-scale 1 -- on any moving target.
+    xdot_rel = xdot if xdot_des is None else xdot - xdot_des
+    F = kp_cart * x_err - kd_cart * xdot_rel
     F[:3] = np.clip(F[:3], -acc_lin, acc_lin)
     F[3:] = np.clip(F[3:], -acc_ang, acc_ang)
 
@@ -1626,6 +1630,12 @@ def free_drive_torque(q, tau_g, tau_collide, k_limit):
     still cannot drive the arm into itself or a hard stop.
     """
     return tau_g + joint_limit_torque(q, k_limit) + tau_collide
+
+
+def track_velocity(p_a, p_b, t, period):
+    """Time derivative of track_setpoint, as a 6-D twist (angular part 0)."""
+    ds = 0.5 * (2.0 * np.pi / period) * np.sin(2.0 * np.pi * t / period)
+    return np.concatenate([ds * (p_b - p_a), np.zeros(3)])
 
 
 def track_setpoint(p_a, p_b, t, period):
@@ -2160,6 +2170,7 @@ def run_impedance(args):
         # every re-anchor, so the redundant DOF is left where the operator put it
         # instead of being pulled back to the startup configuration.
         q_ref = q0.copy()
+        xdot_des = None                        # track-mode setpoint twist
         reanchor = None
         if args.mode == "cartesian":
             p_des, quat_des = model.fk(q0)     # startup EE pose (held)
@@ -2610,8 +2621,14 @@ def run_impedance(args):
                                 if args.track_q_ref:
                                     q_ref = follow_q_ref(model, q_ref, p_des,
                                                          quat_des)
+                                if args.track_vel_ff:
+                                    xdot_des = track_velocity(
+                                        p_a, p_b, step_start - t_start,
+                                        args.track_period)
                             task_kp, task_kd = kp_cart * engage, kd_cart * engage_d
                             f_extra = None
+                            if args.interaction_mode != "track":
+                                xdot_des = None
 
                         M_cyc = model.mass(q)
                         Minv_cyc = np.linalg.inv(M_cyc)
@@ -2621,7 +2638,8 @@ def run_impedance(args):
                             tau_collide, K_LIMIT, f_task_extra=f_extra,
                             state=(p_cur, quat_cur, J),
                             dyn=(M_cyc, Minv_cyc), tau_sing=tau_sing,
-                            acc_max=acc_max, wrench_max=wrench_max)
+                            acc_max=acc_max, wrench_max=wrench_max,
+                            xdot_des=xdot_des)
 
                         # Null-space singularity escape: advance ONE column of
                         # the d(sigma_min)/dq finite difference per cycle and
@@ -3079,6 +3097,11 @@ def main():
                         "its position without getting stiffer' -- raise it if the "
                         "arm still droops, lower it if you feel slow bobbing. "
                         "0 = off (legacy).")
+    p.add_argument("--no-track-vel-ff", dest="track_vel_ff",
+                   action="store_false",
+                   help="[track] Damp absolute EE velocity instead of velocity "
+                        "relative to the moving setpoint (pre-2026-10-23: a "
+                        "built-in (kd/kp)*v lag).")
     p.add_argument("--no-track-q-ref", dest="track_q_ref",
                    action="store_false",
                    help="[track] Leave q_ref at q0 instead of moving it with the "

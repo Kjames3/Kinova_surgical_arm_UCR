@@ -82,7 +82,7 @@ def plant_gravity(m, d, q, qposadr, dofadr):
     return np.array(d.qfrc_bias[dofadr], dtype=float)
 
 
-def simulate(args, trim_error, track_q_ref=True):
+def simulate(args, trim_error, track_q_ref=True, vel_ff=True):
     kin = imp.KinDynModel(args.urdf, args.base_link, args.tip_link)
     m, d, dofadr, qposadr = load_plant_with_payload(
         args, 1.0 / (args.rate * args.substeps))
@@ -135,7 +135,9 @@ def simulate(args, trim_error, track_q_ref=True):
             kin, q, dq, p_des, quat_des, q_ref, kp_cart, kd_cart, kp_null,
             kd_null, tau_g, np.zeros(n), imp.K_LIMIT,
             state=(p_cur, quat_cur, J), dyn=(M, np.linalg.inv(M)),
-            acc_max=acc_max, wrench_max=wrench_max)
+            acc_max=acc_max, wrench_max=wrench_max,
+            xdot_des=(imp.track_velocity(p_a, p_b, t, args.track_period)
+                      if vel_ff else None))
 
         if trim_error != "off" and np.max(np.abs(dq)) < args.trim_freeze_thresh:
             task = ((J, p_cur, quat_cur, p_des, quat_des)
@@ -198,6 +200,9 @@ def main():
                    default="task")
     p.add_argument("--compare", action="store_true",
                    help="Run legacy, off, joint and task and print a verdict.")
+    p.add_argument("--no-track-vel-ff", dest="track_vel_ff",
+                   action="store_false",
+                   help="Damp absolute EE velocity (the pre-fix behaviour).")
     p.add_argument("--no-track-q-ref", dest="track_q_ref",
                    action="store_false",
                    help="Leave q_ref at q0 (the pre-fix behaviour).")
@@ -236,20 +241,22 @@ def main():
           f"payload {args.payload_mass} kg, scored t >= {args.settle}s")
     # (label, trim, q_ref follows the setpoint). 'legacy' is the hardware
     # behaviour through 2026-10-23: joint trim against a q_ref stuck at q0.
-    runs = ([("legacy", "joint", False), ("off", "off", True),
-             ("joint", "joint", True), ("task", "task", True)]
+    runs = ([("legacy", "joint", False, False), ("off", "off", True, True),
+             ("joint", "joint", True, True), ("task", "task", True, True),
+             ("no-ff", "task", True, False)]
             if args.compare else
-            [(args.trim_error, args.trim_error, args.track_q_ref)])
+            [(args.trim_error, args.trim_error, args.track_q_ref,
+              args.track_vel_ff)])
     res = {}
-    for label, mode, follow in runs:
-        rows = simulate(args, mode, follow)
+    for label, mode, follow, ff in runs:
+        rows = simulate(args, mode, follow, ff)
         if rows is None:
             print(f"  {label:6s} DIVERGED")
             continue
         res[label] = score(rows, args.settle)
         report(label, res[label])
 
-    if args.compare and len(res) == 4:
+    if args.compare and len(res) == 5:
         best = min(("off", "joint", "task"), key=lambda k: res[k]["p95"])
         ok = (res["task"]["p95"] < res["legacy"]["p95"]
               and res["task"]["pin_frac"] == 0.0)
