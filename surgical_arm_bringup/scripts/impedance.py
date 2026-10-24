@@ -408,6 +408,44 @@ DEFAULT_URDF = os.path.join(_PKG_DIR, "config", "gen3_2f85.urdf")
 DEFAULT_BASE_LINK = "gen3_base_link"
 DEFAULT_TIP_LINK = "gen3_end_effector_link"
 
+# --- Tool payload (lumped onto the chain) ------------------------------------
+# KDL's getChain() keeps only links ON the base->tip path. Everything the URDF
+# hangs off the side -- the bundled 2F-85, the vision-module bracket -- is
+# silently dropped, so the bare chain models NO tool at all, and the real
+# 1.567 kg thesis_ee was ~6 Nm of unmodelled wrist moment. --tool lumps the
+# mounted tool's rigid-body inertia into the end_effector_link segment.
+#
+# Each preset is (mass kg, CoM xyz m, inertia-at-CoM 3x3 kg m^2), all in the
+# end_effector_link frame (+Z out of the flange).
+#   2f140     -- Robotiq 2F-140 as configured ON THE ARM (Base > ControlConfig >
+#                GetToolConfiguration: 1.025 kg, CoM z = 0.073; read 2026-10-23).
+#                The kortex URDF's 0.364 kg sum of 2F-140 links is wrong. Inertia
+#                is the URDF's tensor scaled to the real mass.
+#   thesis_ee -- SolidWorks "Mass Properties.pdf" (1.567 kg, CoM (107.70,
+#                120.07, 145.15) mm, L tensor at CoM), all in the Full_Assembly
+#                STL frame, mapped through the VISUAL mesh origin -- the one
+#                validated by the measured assembly_tip (2026-10-09). The
+#                xacro's <inertial> used the pen-era collision mapping, which
+#                put the CoM 46 mm behind the flange; this puts it 95 mm to the
+#                side of it, level with the flange.
+TOOL_PAYLOADS = {
+    "2f140": (1.025, (0.0, 0.0, 0.073),
+              np.diag([0.002029, 0.003742, 0.002079])),
+    "thesis_ee": (1.567, (0.09507, 0.00230, -0.05685),
+                  np.array([[0.021982, 0.0000105, 0.0001843],
+                            [0.0000105, 0.021976, 0.0001164],
+                            [0.0001843, 0.0001164, 0.005741]])),
+    "none": None,
+}
+# The bundled URDF carries the NON-vision bracelet (0.364 kg) and models the
+# vision module as an off-path 0.5 kg bracket -- which the chain drops. The arm
+# has the vision module; Kinova's own description (gen3.xacro vision:=true)
+# replaces the bracelet inertia with this. Applied whenever --tool is given.
+VISION_BRACELET = (0.5, (0.000281, 0.011402, -0.029798),
+                   np.array([[0.000587, 3e-6, 3e-6],
+                             [3e-6, 0.000369, -0.000118],
+                             [3e-6, -0.000118, 0.000609]]))
+
 # Links guarded by the table-avoidance barrier. The distal links do the real
 # work (they are what reaches down), but the forearm and half_arm_2 are
 # included because an elbow-down posture can swing them at the table while the
@@ -680,7 +718,7 @@ class KinDynModel:
     CAPSULE_RADIUS = 0.055      # m, uniform link "thickness"
     COLLISION_MARGIN = 0.08     # m, potential switches on below this clearance
 
-    def __init__(self, urdf_path, base_link, tip_link):
+    def __init__(self, urdf_path, base_link, tip_link, tool=None):
         import PyKDL as kdl
         from urdf_parser_py.urdf import URDF
         self.kdl = kdl
@@ -689,6 +727,11 @@ class KinDynModel:
         tree = self._tree_from_urdf(robot, kdl)
         self.chain = tree.getChain(base_link, tip_link)
         self.n = self.chain.getNrOfJoints()
+        # tool=None keeps the bare URDF chain (pre-2026-10-23 behaviour, and
+        # what the offline validators were tuned against).
+        self.tool = tool
+        if tool is not None:
+            self.chain = self._with_tool(self.chain, tool)
 
         self._fk = kdl.ChainFkSolverPos_recursive(self.chain)
         self._jac = kdl.ChainJntToJacSolver(self.chain)
@@ -711,6 +754,46 @@ class KinDynModel:
         self._scratch_jnt = (kdl.JntArray(self.n), kdl.JntArray(self.n))
         # Non-adjacent capsule pair indices, keyed by capsule count.
         self._pair_cache = {}
+
+    def _with_tool(self, chain, tool):
+        """Return a copy of `chain` with the vision bracelet and `tool` lumped in.
+
+        Only segment inertias change; joints and frames are copied as-is, so
+        FK and Jacobians are bit-identical to the bare chain.
+        """
+        kdl = self.kdl
+
+        def rbi(mass, com, i_com):
+            i = np.asarray(i_com, dtype=float)
+            return kdl.RigidBodyInertia(
+                mass, kdl.Vector(*com),
+                kdl.RotationalInertia(i[0, 0], i[1, 1], i[2, 2],
+                                      i[0, 1], i[0, 2], i[1, 2]))
+
+        payload = TOOL_PAYLOADS[tool]
+        names = [chain.getSegment(s).getName()
+                 for s in range(chain.getNrOfSegments())]
+        flange = [nm for nm in names if nm.endswith("end_effector_link")]
+        bracelet = [nm for nm in names if nm.endswith("bracelet_link")]
+        if payload is not None and not flange:
+            raise ValueError("--tool needs end_effector_link on the chain "
+                             f"(tip is {names[-1]})")
+
+        out = kdl.Chain()
+        for s in range(chain.getNrOfSegments()):
+            seg = chain.getSegment(s)
+            inertia = seg.getInertia()
+            if bracelet and seg.getName() == bracelet[0]:
+                inertia = rbi(*VISION_BRACELET)
+            if payload is not None and seg.getName() == flange[0]:
+                inertia = inertia + rbi(*payload)
+            out.addSegment(kdl.Segment(seg.getName(), seg.getJoint(),
+                                       seg.getFrameToTip(), inertia))
+        return out
+
+    def total_mass(self):
+        return sum(self.chain.getSegment(s).getInertia().getMass()
+                   for s in range(self.chain.getNrOfSegments()))
 
     # -- vendored from kdl_parser_py (treeFromUrdfModel), rotation of the
     #    inertial origin dropped (URDF inertials here are axis-aligned) --------
@@ -1837,13 +1920,19 @@ def display_csv_data(filepath: str = None, show_plot: bool = True):
 # =============================================================================
 # Main control loop
 # =============================================================================
+def _model_tool(args):
+    """--tool as KinDynModel wants it: None for the legacy bare chain."""
+    return None if args.tool == "legacy" else args.tool
+
+
 def run_impedance(args):
     # Load the kin/dyn model up front if cartesian mode, model gravity, or the
     # no-motion gravity validation needs it.
     model = None
     if (args.mode == "cartesian" or args.gravity in ("model", "hybrid")
             or args.validate_gravity):
-        model = KinDynModel(args.urdf, args.base_link, args.tip_link)
+        model = KinDynModel(args.urdf, args.base_link, args.tip_link,
+                            tool=_model_tool(args))
     elif args.gravity != "none":
         # Joint mode with a constant feedforward does not otherwise need the
         # model, but the gravity SIGN check does, and an inverted feedforward is
@@ -1851,7 +1940,8 @@ def run_impedance(args):
         # still runs if PyKDL/urdf_parser_py are unavailable (the documented
         # contract), only unvalidated.
         try:
-            model = KinDynModel(args.urdf, args.base_link, args.tip_link)
+            model = KinDynModel(args.urdf, args.base_link, args.tip_link,
+                                tool=_model_tool(args))
         except Exception as e:  # noqa: BLE001
             print(f"NOTE: gravity sign UNVALIDATED (no kin/dyn model: {e}). "
                   "Engage with the e-stop in hand and watch the first second.")
@@ -1882,6 +1972,9 @@ def run_impedance(args):
             raise RuntimeError(
                 f"model chain has {model.n} joints but arm has {n}; "
                 "check --base-link/--tip-link.")
+        if model is not None:
+            print(f"Model tool: {args.tool}  (chain mass "
+                  f"{model.total_mass():.3f} kg)")
 
         kp = KP_JOINT[:n] * args.kp_scale
         kd = KD_JOINT[:n] * args.kd_scale
@@ -2004,6 +2097,13 @@ def run_impedance(args):
             q_des = np.array(args.q_des[:n])
         else:
             q_des = q0.copy()
+        # Task limits, resolved once -- before the
+        # startup banner, which prints them (it raised NameError when they were
+        # assigned further down). The impedance clamp is on the commanded
+        # ACCELERATION; the wrench clamp is the real EE force/moment ceiling.
+        acc_max = (MAX_IMP_ACC_LIN, args.max_cart_torque)
+        wrench_max = (args.max_ee_force, args.max_ee_torque)
+
         p_des = quat_des = None
         p_a = p_b = None                       # track-mode line endpoints
         # Posture / wrist-anchor reference. Starts at q0 and follows the arm on
@@ -2209,11 +2309,6 @@ def run_impedance(args):
         # at import time, so passing our own also avoids mutating that.
         send_opts = RouterClientSendOptions()
         send_opts.timeout_ms = args.cyclic_timeout_ms
-
-        # Task limits, resolved once. The impedance clamp is on the commanded
-        # ACCELERATION; the wrench clamp is the real EE force/moment ceiling.
-        acc_max = (MAX_IMP_ACC_LIN, args.max_cart_torque)
-        wrench_max = (args.max_ee_force, args.max_ee_torque)
 
         # (F) Loop invariants for the table barrier, hoisted out of the hot loop.
         table_alpha1, table_alpha2 = args.table_alpha
@@ -2999,6 +3094,13 @@ def main():
                         "then exit WITHOUT engaging torque (no motion).")
     p.add_argument("--urdf", default=DEFAULT_URDF,
                    help="[cartesian/model] URDF for the kin/dyn model.")
+    p.add_argument("--tool", choices=sorted(TOOL_PAYLOADS) + ["legacy"],
+                   required=True,
+                   help="What is mounted on the flange RIGHT NOW (it gets swapped "
+                        "between users -- look before you run). Lumps its mass "
+                        "into the model, plus the vision-module bracelet. "
+                        "'legacy' = the old bare chain with no tool at all, only "
+                        "for reproducing pre-2026-10-23 runs.")
     p.add_argument("--base-link", default=DEFAULT_BASE_LINK)
     p.add_argument("--tip-link", default=DEFAULT_TIP_LINK)
     p.add_argument("--rate", type=float, default=DEFAULT_RATE_HZ,
