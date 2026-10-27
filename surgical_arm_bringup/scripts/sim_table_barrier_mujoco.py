@@ -56,6 +56,18 @@ USAGE
   python3 sim_table_barrier_mujoco.py --quick          # 1 plant, rated force
   python3 sim_table_barrier_mujoco.py --plants nominal --forces 30 60
   python3 sim_table_barrier_mujoco.py --gravity-reserve 0.3
+
+RESULTS (2026-10-27, gravity reserve 0.4, hand speed 0.5 m/s)
+------------------------------------------------------------
+Largest push held in EVERY one of the 27 cases, per plant:
+  nominal (plant == model)                         25 N   (+17.6 mm at 20 N)
+  g-error (joint-4 gravity comp 30% low)           25 N   (+15.7 mm at 20 N)
+  g-err+rotor (+0.1 kg m^2 rotor inertia, M 14%)   20 N   (-0.8 mm at 20 N)
+  xacro-tool (pen-era tool inertia, M 21%)         20 N   (-0.9 mm at 20 N)
+Unguarded, 20 N on the needle puts the tool ~790 mm through the table. The
+rated 20 N holds on every plant, but with ~1 mm of margin once the mass model
+is 14-21% off -- unmodelled rotor inertia is the thing to watch on hardware.
+A full run is ~4 h; pass --plants/--forces to cut it.
 """
 import argparse
 import os
