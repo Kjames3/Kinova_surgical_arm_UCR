@@ -2704,7 +2704,23 @@ def run_impedance(args):
                       # went soft" from "the arm was near a singularity and the
                       # controller gave up that direction on purpose". NaN in
                       # joint mode, which never evaluates a Jacobian.
-                      + ["sigma_min", "lam_damp"])
+                      + ["sigma_min", "lam_damp"]
+                      # Table barrier trace (NaN / -1 without --table-avoidance).
+                      # tb_status: 0 inactive, 1 exact, 2 blocked, 3 degraded.
+                      # tb_clear is the smallest clearance over every guarded
+                      # row (tool rows already carry their own floor), tb_row
+                      # its index into the startup "table link" list + tool
+                      # hull rows. tau_ext is the observer's estimate of the
+                      # operator's push. dt_max is the worst raw cycle period
+                      # since the previous logged row, so overruns between
+                      # decimated rows are not lost.
+                      + ["tb_status", "tb_clear", "tb_row", "tb_fwall"]
+                      + [f"tau_ext{i+1}" for i in range(n)]
+                      + ["dt_max"])
+        TB_STATUS = {"inactive": 0, "exact": 1, "blocked": 2, "degraded": 3}
+        tb_log = [-1, float("nan"), -1, float("nan")]
+        tau_ext_log = [float("nan")] * n
+        dt_max_log = 0.0
         try:
             while True:
                 step_start = time.monotonic()
@@ -2723,6 +2739,7 @@ def run_impedance(args):
                 if frame_id > 0:            # first interval is seeded, not real
                     cyc_n += 1
                     cyc_sum += dt_raw
+                    dt_max_log = max(dt_max_log, dt_raw)
                     if dt_raw > cyc_max:
                         cyc_max = dt_raw
                     if dt_raw < cyc_min:
@@ -3056,6 +3073,13 @@ def run_impedance(args):
                     cbf_status = tinfo["status"]
                     z_surf, z_wall = tinfo["z"], tinfo["z_wall"]
                     f_wall = tinfo["f_wall"]
+                    if log_enabled:
+                        clear = z_surf - args.table_z_min
+                        k_low = int(np.argmin(clear))
+                        tb_log = [TB_STATUS.get(cbf_status, -1),
+                                  float(clear[k_low]), k_low,
+                                  float(np.max(f_wall)) if len(f_wall) else 0.0]
+                        tau_ext_log = list(tinfo["tau_ext"])
 
                     # A degraded solve means the projection is an approximation
                     # and NOT a safety certificate -- either the guarded links
@@ -3118,7 +3142,12 @@ def run_impedance(args):
                                     + [round(ramp, 3), round(engage, 3),
                                        round(pose_err, 4)]
                                     + [round(v, 4) for v in tau_trim]
-                                    + [round(sigma_min, 6), round(lam_damp, 6)])
+                                    + [round(sigma_min, 6), round(lam_damp, 6)]
+                                    + [tb_log[0], round(tb_log[1], 5),
+                                       tb_log[2], round(tb_log[3], 3)]
+                                    + [round(float(v), 4) for v in tau_ext_log]
+                                    + [round(dt_max_log, 6)])
+                    dt_max_log = 0.0
 
                 # Build the cyclic command frame.
                 frame_id = (frame_id + 1) % 65536
