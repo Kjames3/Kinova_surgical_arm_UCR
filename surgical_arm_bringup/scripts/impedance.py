@@ -116,6 +116,14 @@ import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
+# One BLAS thread, set BEFORE numpy loads. Every matrix here is 7x7; on
+# REAL-1's 32 cores OpenBLAS otherwise wakes a thread pool for each of them,
+# which doubled the table filter's cost (300 -> 157 us) and gave 4.5 ms
+# spikes (measured 2026-10-27, when the loop ran at 430 Hz). setdefault so an
+# explicit override from the shell still wins.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import numpy as np
 from control_barrier import (MomentumObserver, joint_limit_rows,
                              compute_table_hocbf_rows,
@@ -567,7 +575,8 @@ class TableSafetyFilter:
     def __init__(self, model, segs, link_radius, z_min, alpha, tau_max,
                  wall, tool_hull=None, tool_k=0, tool_z_min=None,
                  observer_gain=0.0, q_min=None, q_max=None,
-                 gravity_reserve=0.0, velocity_limits=False):
+                 gravity_reserve=0.0, velocity_limits=False,
+                 reserve_every=8):
         self.model = model
         self.segs = segs
         self.link_radius = link_radius
@@ -594,6 +603,14 @@ class TableSafetyFilter:
         self.reserve_limit = ((1.0 - gravity_reserve)
                               * tau_max[self.reserve_joints])
         self.gravity_reserve = gravity_reserve
+        # The reserve rows need g, dg/dq and the curvature term. g is one KDL
+        # call and is evaluated fresh every cycle; dg/dq and the curvature are
+        # ~16 finite-difference gravity calls (~200 us on REAL-1, measured
+        # 2026-10-27, when the loop fell to 440 Hz) and change slowly at hand
+        # speeds, so they are refreshed every `reserve_every` cycles.
+        self.reserve_every = max(1, int(reserve_every))
+        self._reserve_cache = None
+        self._reserve_age = 0
         self.observer = (MomentumObserver(n, observer_gain)
                          if observer_gain > 0.0 else None)
         self.tau_ext = np.zeros(n)
@@ -604,6 +621,7 @@ class TableSafetyFilter:
             self.observer.reset()
         self.tau_ext = np.zeros(self.model.n)
         self._tau_sent = None
+        self._reserve_cache = None
 
     def sent(self, tau):
         self._tau_sent = np.array(tau, dtype=float)
@@ -662,7 +680,16 @@ class TableSafetyFilter:
         if self.gravity_reserve > 0.0:
             # Keep enough torque in hand to hold the arm AND push back: the
             # table rows are only a guarantee while that is true.
-            g_r, Jg_r, curv_r = mdl.gravity_terms(q, dq, self.reserve_joints)
+            if (self._reserve_cache is None
+                    or self._reserve_age >= self.reserve_every):
+                g_r, Jg_r, curv_r = mdl.gravity_terms(q, dq,
+                                                      self.reserve_joints)
+                self._reserve_cache = (Jg_r, curv_r)
+                self._reserve_age = 1
+            else:
+                Jg_r, curv_r = self._reserve_cache
+                g_r = mdl.gravity(q)[self.reserve_joints]
+                self._reserve_age += 1
             A_r, b_r = gravity_reserve_rows(g_r, Jg_r, curv_r, dq,
                                             self.reserve_limit, *self.alpha)
             rows_A.append(A_r)
@@ -2680,7 +2707,8 @@ def run_impedance(args):
                 tool_hull=tool_hull, tool_k=args.table_tool_points,
                 tool_z_min=args.table_tool_z_min,
                 observer_gain=args.table_observer_gain,
-                gravity_reserve=args.table_gravity_reserve)
+                gravity_reserve=args.table_gravity_reserve,
+                reserve_every=args.table_reserve_every)
             row_names = table_names + ["tool hull"] * table_filter.tool_k
         last_table_warn = 0.0
         last_cbf_warn = 0.0
@@ -3567,6 +3595,10 @@ def main():
                         "the operator dragging the arm into poses it cannot "
                         "hold -- it will refuse to stretch out fully. "
                         "0 disables.")
+    p.add_argument("--table-reserve-every", type=int, default=8, metavar="N",
+                   help="Refresh the gravity-reserve gradient and curvature "
+                        "every N cycles (gravity itself is fresh every cycle). "
+                        "1 = every cycle, ~200 us dearer on REAL-1.")
     p.add_argument("--table-standoff", type=float, default=0.06, metavar="D",
                    help="Thickness of the band above --table-z-min in which "
                         "the virtual wall pushes back (m). 0 disables the "
@@ -3634,6 +3666,8 @@ def main():
                 f"lower --table-stiffness/--table-standoff.")
         if args.table_link_radius is None:
             args.table_link_radius = KinDynModel.CAPSULE_RADIUS
+        if args.table_reserve_every < 1:
+            p.error("--table-reserve-every must be >= 1")
         if not 0.0 <= args.table_gravity_reserve < 1.0:
             p.error("--table-gravity-reserve must be in [0, 1)")
         if args.table_observer_gain < 0:
