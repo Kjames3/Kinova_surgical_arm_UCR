@@ -19,6 +19,17 @@ Two independent mechanisms, deliberately kept separate:
 Both act on every monitored link, not just the end effector, so the elbow and
 forearm are covered too.
 
+  3. External-torque observer (`MomentumObserver`)
+     The HOCBF predicts the arm's acceleration from the torque the controller
+     commands. An operator's hand is not in that command, so without an
+     estimate of it the filter certifies a motion the arm is not making and
+     the push goes straight through -- in MuJoCo, 90 N at the flange drove the
+     tool 725 mm through the table with the filter reporting "exact". The
+     observer estimates every torque the model does not explain (the push, and
+     the joint-4 gravity error) from the arm's momentum, and the filter
+     predicts with it. Found 2026-10-26; every validation before that fed the
+     push through the filter, which overstated the guarantee.
+
 Agnostic to the robot backend: it consumes kinematics/dynamics state and
 returns joint-space quantities.
 """
@@ -345,6 +356,134 @@ class ObstacleWindow:
         return keep, info
 
 
+class MomentumObserver:
+    """Generalised-momentum observer for the unmodelled joint torque.
+
+    With p = M(q) dq the rigid-body dynamics M ddq + C dq + g = tau + tau_ext
+    give  dp/dt = tau + tau_ext + C^T dq - g,  so
+
+        r = K_O * ( p - p0 - integral(tau + C^T dq - g + r) dt )
+
+    obeys dr/dt = K_O (tau_ext - r): a first-order low-pass of the true
+    external torque with bandwidth K_O (rad/s), using only q, dq and the torque
+    actually applied -- no acceleration, no force sensor (De Luca et al.).
+
+    C^T dq is formed as (dM/dt) dq - C dq, which is all KDL offers; dM/dt
+    along the motion is a directional finite difference of M, one extra mass
+    matrix per cycle.
+
+    `tau_ext` absorbs everything the model misses, which is the point: the
+    joint-4 gravity underestimate is as unknown to the barrier as a hand is.
+    """
+
+    def __init__(self, n, gain):
+        self.gain = float(gain)
+        self.n = n
+        self.reset()
+
+    def reset(self):
+        self.r = np.zeros(self.n)
+        self._integral = None
+        self._p0 = None
+
+    def update(self, M, M_ahead, h, dq, tau_applied, c_dq, g, dt):
+        """Advance one cycle and return the estimate of tau_ext.
+
+        Args:
+            M: mass matrix at q
+            M_ahead: mass matrix at q + h*dq (for dM/dt @ dq)
+            h: the step used for M_ahead (s)
+            dq: joint velocity
+            tau_applied: torque sent LAST cycle (what the arm actually felt)
+            c_dq: Coriolis product C(q, dq) dq
+            g: model gravity torque
+            dt: cycle period (s)
+        """
+        p = M @ dq
+        if self._integral is None:
+            self._p0 = p.copy()
+            self._integral = np.zeros(self.n)
+            return self.r
+        ct_dq = ((M_ahead - M) / h) @ dq - c_dq
+        self._integral += (tau_applied + ct_dq - g + self.r) * dt
+        self.r = self.gain * (p - self._p0 - self._integral)
+        return self.r
+
+
+def joint_limit_rows(q, dq, q_min, q_max, alpha1=15.0, alpha2=15.0):
+    """HOCBF rows ``A @ ddq <= b`` keeping each joint inside its hard limits.
+
+    Stack these with the barrier and torque rows. Without them the filter can
+    certify an escape that drives a joint into its mechanical stop: the stop
+    then blocks the motion, the arm does something the filter never planned,
+    and in MuJoCo that took the tool 130 mm through the table with every
+    solve reporting "exact". Infinite limits (continuous joints) give no row.
+
+    Args:
+        q, dq (np.ndarray): joint position/velocity (n,)
+        q_min, q_max (np.ndarray): limits (n,), +/-inf for none
+    """
+    q = np.asarray(q, dtype=float)
+    dq = np.asarray(dq, dtype=float)
+    n = q.shape[0]
+    lo = np.flatnonzero(np.isfinite(q_min))
+    hi = np.flatnonzero(np.isfinite(q_max))
+    eye = np.eye(n)
+    # q - q_min >= 0 has gradient +e_i; q_max - q >= 0 has -e_i; no drift.
+    h1 = np.concatenate((q[lo] - q_min[lo], q_max[hi] - q[hi]))
+    Jh = np.vstack((eye[lo], -eye[hi]))
+    return compute_hocbf_rows(h1, Jh @ dq, Jh, np.zeros(len(h1)),
+                              alpha1, alpha2)
+
+
+def gravity_reserve_rows(g, Jg, curv, dq, limit, alpha1=15.0, alpha2=15.0):
+    """HOCBF rows keeping ``|g_j(q)| <= limit_j`` for the selected joints.
+
+    A barrier is only a guarantee while the motors have torque to spare. An
+    operator's push can walk an unloaded arm outward until gravity alone eats
+    the shoulder's budget -- in MuJoCo a 30 N shove did exactly that, and once
+    gravity plus the push exceeded 39 Nm the elbow fell 240 mm in 0.25 s with
+    nothing able to stop it. This keeps the arm in poses where it can still
+    hold itself AND push back: limit = (1 - reserve) * tau_max.
+
+    Two-sided, h = limit - g and h = limit + g, both relative degree 2:
+        h_ddot = -/+ (Jg @ ddq + curv)
+    """
+    g = np.atleast_1d(np.asarray(g, dtype=float))
+    Jg = np.atleast_2d(np.asarray(Jg, dtype=float))
+    curv = np.atleast_1d(np.asarray(curv, dtype=float))
+    limit = np.atleast_1d(np.asarray(limit, dtype=float))
+    h1 = np.concatenate((limit - g, limit + g))
+    Jh = np.vstack((-Jg, Jg))
+    drift = np.concatenate((-curv, curv))
+    return compute_hocbf_rows(h1, Jh @ dq, Jh, drift, alpha1, alpha2)
+
+
+def velocity_limit_rows(dq, dq_max, gain=20.0):
+    """CBF rows ``A @ ddq <= b`` keeping ``|dq_i| <= dq_max_i``.
+
+    Relative degree 1, so a first-order CBF:  d/dt (dq_max - |dq|) >=
+    -gain (dq_max - |dq|). Every barrier guarantee assumes the arm can still
+    be braked in time; that stops being true once the motion carries more
+    energy than the torque limits can remove in the remaining clearance. In
+    MuJoCo, with no speed bound, the projection's own corrections spun the
+    wrist to 8-20 rad/s and the tool went through the table. The Gen3 faults
+    above its rated joint speed anyway, so the filter never asks for more.
+
+    NOT used by default (TableSafetyFilter velocity_limits=False): the
+    inertia-weighted projection fixed the whipping on its own, and as hard
+    rows these conflict with the table rows exactly when the tool needs
+    braking.
+    """
+    dq = np.asarray(dq, dtype=float)
+    n = dq.shape[0]
+    eye = np.eye(n)
+    #  ddq <= gain (dq_max - dq)   and   -ddq <= gain (dq_max + dq)
+    A = np.vstack((eye, -eye))
+    b = np.concatenate((gain * (dq_max - dq), gain * (dq_max + dq)))
+    return A, b
+
+
 def torque_limit_rows(M, tau_bias, tau_max):
     """Rows enforcing ``|M @ ddq + tau_bias| <= tau_max`` as ``A @ ddq <= b``.
 
@@ -385,7 +524,65 @@ def torque_limit_rows(M, tau_bias, tau_max):
     return A, b
 
 
-def filter_control_qp(ddq_nom, A, b, iters=24):
+def _nnls(E, f, max_iter):
+    """Lawson-Hanson NNLS: minimise ||E u - f|| subject to u >= 0.
+
+    Active set with an interpolation step whenever a free variable would go
+    negative, so the objective decreases monotonically and the method cannot
+    cycle; it terminates finitely (Lawson & Hanson 1974, ch. 23). Returns
+    (u, converged).
+    """
+    k = E.shape[1]
+    u = np.zeros(k)
+    free = np.zeros(k, dtype=bool)
+    it = 0
+    w = E.T @ f
+    while it < max_iter:
+        cand = np.where(free, -np.inf, w)
+        t = int(np.argmax(cand))
+        if cand[t] <= 1e-10:
+            return u, True
+        free[t] = True
+        while True:
+            it += 1
+            idx = np.flatnonzero(free)
+            z = np.linalg.lstsq(E[:, idx], f, rcond=None)[0]
+            if np.all(z > 0.0):
+                u[:] = 0.0
+                u[idx] = z
+                break
+            # Step from u toward z only as far as the first variable to hit 0.
+            neg = z <= 0.0
+            ui = u[idx]
+            alpha = np.min(ui[neg] / (ui[neg] - z[neg]))
+            u[idx] = ui + alpha * (z - ui)
+            free[idx[u[idx] <= 1e-12]] = False
+            u[~free] = 0.0
+            if it >= max_iter:
+                return u, False
+        w = E.T @ (f - E @ u)
+    return u, False
+
+
+def filter_control_qp_weighted(ddq_nom, A, b, M):
+    """`filter_control_qp` in the inertia metric: min (x-d)' M (x-d), A x <= b.
+
+    The unweighted projection takes the smallest change in joint
+    ACCELERATION, which is cheapest in the light wrist joints, so it dumps the
+    correction there and whips the wrist. Weighting by M takes the smallest
+    change in effort instead (Gauss's principle of least constraint), which
+    is what the arm physically does. With M = L L' and y = L' x it is a plain
+    projection:  min ||y - L'd||  s.t.  (A L^-T) y <= b.
+    """
+    L = np.linalg.cholesky(M)
+    AL = np.linalg.solve(L, np.atleast_2d(A).T).T        # A L^-T
+    y, status = filter_control_qp(L.T @ ddq_nom, AL, b)
+    if status == "inactive":
+        return ddq_nom, status
+    return np.linalg.solve(L.T, y), status
+
+
+def filter_control_qp(ddq_nom, A, b, iters=None):
     """Project ``ddq_nom`` onto ``{x : A x <= b}`` in the least-squares sense.
 
     Solves  minimize ||x - ddq_nom||^2  s.t.  A x <= b.
@@ -396,25 +593,28 @@ def filter_control_qp(ddq_nom, A, b, iters=24):
     shows up directly as cycle jitter.
 
       * m == 1 (one barrier): exact closed-form halfspace projection.
-      * m  > 1: exact dual active-set solve. With P = I, stationarity gives
-        x = ddq_nom - A' lam and the dual is
-        minimize_{lam >= 0} 0.5 lam' (A A') lam - lam' (A ddq_nom - b).
-        The routine maintains a working set of active rows, solves the small
-        equality-constrained system on it exactly, drops rows whose multiplier
-        goes negative and adds the most-violated row otherwise. That terminates
-        finitely (typically in 1-3 passes, since usually only the lowest link
-        is binding) and returns the exact projection, not an approximation.
+      * m  > 1: exact least-distance programme (Lawson & Hanson ch. 23). With
+        y = x - ddq_nom the problem is  min ||y||  s.t.  -A y >= r,
+        r = A ddq_nom - b, whose solution is read off ONE non-negative least
+        squares problem  min_{u>=0} ||E u - e||,  E = [-A^T; r^T]:
+        y = -res[:n] / res[n]  with res = E u - e, and res == 0 exactly when
+        the constraints are infeasible. NNLS is a finite active-set method
+        that cannot cycle, and it is happy with more rows than joints.
 
-        An iterative scheme was tried first and rejected: an under-converged
-        sweep leaves lam too SMALL, i.e. a correction too WEAK, which for a
-        safety filter is the unsafe direction rather than a conservative one.
-        `iters` bounds the pass count so worst-case latency stays fixed.
+        This replaced (2026-10-26) a dual active set with no step-length rule,
+        which zigzagged and came back "degraded" on 11% of solvable random
+        problems -- and, once the tool hull and joint stops added rows, on
+        most real barrier problems in MuJoCo, with the tool going through the
+        table. An iterative scheme had been rejected before that for the same
+        reason this one is exact: an under-converged correction is too WEAK,
+        which for a safety filter is the unsafe direction.
 
     Args:
         ddq_nom (np.ndarray): Nominal desired joint accelerations (n,)
         A (np.ndarray): (m, n) inequality matrix
         b (np.ndarray): (m,) inequality vector
-        iters (int): Max active-set passes for the multi-row case.
+        iters (int): NNLS iteration cap (default 3*m + 10). Lawson-Hanson
+            needs far fewer in practice; the cap only bounds worst-case latency.
 
     Returns:
         ddq_safe (np.ndarray): Safe joint accelerations (n,). Returns the input
@@ -427,9 +627,10 @@ def filter_control_qp(ddq_nom, A, b, iters=24):
             * ``"exact"``    -- exact projection onto the feasible set.
             * ``"blocked"``  -- the only violated rows are unactuated in this
               configuration; nothing is expressible, input returned unchanged.
-            * ``"degraded"`` -- the active set did not converge, so the
-              residual was spread across the violated rows by least squares.
-              Constraints may still be violated; this is NOT a certificate.
+            * ``"degraded"`` -- the constraints conflict (no feasible point),
+              so the residual was spread across the violated rows by least
+              squares. Constraints are still violated; this is NOT a
+              certificate.
     """
     A = np.atleast_2d(A)
     b = np.atleast_1d(b)
@@ -449,80 +650,42 @@ def filter_control_qp(ddq_nom, A, b, iters=24):
             return ddq_nom, "blocked"
         return ddq_nom - (float(resid[0]) / aa) * a, "exact"
 
-    # --- Multi-row: exact dual active-set solve ------------------------------
-    G = A @ A.T
     # Rows with a ~zero gradient cannot be corrected at all (that point's
-    # height is unactuated here); never admit them to the working set.
-    dead = np.diag(G) < 1e-12
+    # height is unactuated here); leave them out of the solve.
+    norms = np.sqrt(np.einsum("ij,ij->i", A, A))
+    live = norms >= 1e-6
+    if not np.any(resid[live] > 0.0):
+        return ddq_nom, "blocked"
+    # Condition the LDP: unit-norm rows, then scale so the largest violation
+    # is 1. Unscaled, a ~1e3 rad/s^2 correction (torque rows far from the
+    # nominal) put res[-1] near 1e-7 and the division below lost the answer
+    # -- a feasible problem reported "degraded" on the torque rows alone.
+    Al = A[live] / norms[live, None]
+    rl = resid[live] / norms[live]
+    scale = float(np.max(np.abs(rl)))
+    rs = rl / scale
 
-    tol = 1e-9
-    work = []                       # indices of the active (binding) rows
-    x = ddq_nom
-    feasible = False
+    n = A.shape[1]
+    E = np.vstack((-Al.T, rs[None, :]))
+    e = np.zeros(n + 1)
+    e[-1] = 1.0
+    u, converged = _nnls(E, e, 3 * len(rl) + 10 if iters is None else iters)
+    res = E @ u - e
+    tol = 1e-7
+    if converged and abs(res[-1]) > 1e-12 and np.linalg.norm(res) > 1e-10:
+        x = ddq_nom - scale * res[:n] / res[-1]
+        # Feasibility in the normalised row metric (distance, rad/s^2).
+        if np.all(Al @ (x - ddq_nom) + rl <= tol * max(1.0, scale)):
+            return x, "exact"
 
-    for _ in range(iters):
-        over = A @ x - b
-        over[dead] = -np.inf
-        worst = int(np.argmax(over))
-        if over[worst] <= tol:
-            feasible = True         # exact projection reached
-            break
-        if worst in work:
-            # Zigzag: this row was dropped earlier for a negative multiplier
-            # and is violated again, but the working set cannot grow to fix it.
-            # There is no step-length rule here (each pass jumps straight to
-            # the working-set solution), so re-solving would reproduce this
-            # exact x for the rest of the budget. Stop now and degrade instead
-            # of burning ~20 pointless solves inside a 1 ms cycle.
-            break
-        work.append(worst)
-
-        # Solve G_ww lam_w = r_w on the working set, dropping any row whose
-        # multiplier turns negative (that constraint wants to push the wrong
-        # way, so it is not really binding).
-        while work:
-            idx = np.array(work)
-            try:
-                lam_w = np.linalg.solve(G[np.ix_(idx, idx)], resid[idx])
-            except np.linalg.LinAlgError:
-                # Dependent rows (parallel barriers): least-squares still gives
-                # a valid stationary point on the working set.
-                lam_w = np.linalg.lstsq(G[np.ix_(idx, idx)], resid[idx],
-                                        rcond=None)[0]
-            if np.all(lam_w >= -tol):
-                break
-            work.pop(int(np.argmin(lam_w)))
-
-        if not work:
-            break
-        x = ddq_nom - A[np.array(work)].T @ np.maximum(lam_w, 0.0)
-
-    if not feasible:
-        # Reached on three paths, and they are NOT all "the constraints
-        # conflict":
-        #   * the working set emptied, or the budget ran out, while rows were
-        #     still violated -- the rows genuinely conflict, e.g. two links
-        #     where saving one necessarily drives the other down, or a barrier
-        #     that cannot be honoured within the torque envelope;
-        #   * the zigzag break above -- the problem may well be feasible and
-        #     this is just the cost of having no anti-cycling step rule.
-        # Either way the answer below is an approximation, so it is reported as
-        # "degraded" and never as a safety certificate.
-        #
-        # Degrade predictably rather than returning whichever working set we
-        # stopped on: spread the correction across all violated rows in the
-        # least-squares sense, which shares the residual out instead of
-        # sacrificing one link entirely.
-        viol = (A @ x - b > tol) & ~dead
-        if np.any(viol):
-            Av = A[viol]
-            delta = np.linalg.lstsq(Av, Av @ ddq_nom - b[viol], rcond=None)[0]
-            x = ddq_nom - delta
-            return x, "degraded"
-        # Only dead rows left violated: nothing is expressible.
-        return x, ("blocked" if x is ddq_nom else "exact")
-
-    return x, "exact"
+    # Infeasible (the rows genuinely conflict -- e.g. two links where saving
+    # one drives the other down, or a barrier the torque envelope cannot
+    # honour) or the iteration cap was hit. Degrade predictably: spread the
+    # correction across all violated rows in the least-squares sense, which
+    # shares the residual out instead of sacrificing one link entirely.
+    viol = rl > tol
+    delta = np.linalg.lstsq(Al[viol], rl[viol], rcond=None)[0]
+    return ddq_nom - delta, "degraded"
 
 
 def wall_cap_clearance(standoff, k_wall, f_max):

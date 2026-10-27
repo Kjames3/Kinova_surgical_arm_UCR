@@ -117,7 +117,10 @@ import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import numpy as np
-from control_barrier import (compute_table_hocbf_rows, filter_control_qp,
+from control_barrier import (MomentumObserver, joint_limit_rows,
+                             compute_table_hocbf_rows,
+                             filter_control_qp_weighted, gravity_reserve_rows,
+                             velocity_limit_rows,
                              table_wall_torque, torque_limit_rows,
                              wall_cap_clearance)
 
@@ -540,6 +543,138 @@ def table_barrier_terms(model, q, dq, segs, link_radius, tool_hull=None,
     return (np.concatenate((z_surf, z_t)), np.vstack((J_z, J_t)),
             np.concatenate((dJdq_z, dJdq_t)),
             np.concatenate((z_surf, z_t[:1])), np.vstack((J_z, J_t[:1])))
+
+
+class TableSafetyFilter:
+    """The whole table-safety stack for one control cycle, in one place.
+
+    The hot loop, validate_table_barrier.py and sim_table_barrier_mujoco.py
+    all run THIS, so an offline pass means the robot's code passed. (Until
+    2026-10-26 each kept its own copy, and the copies had drifted: the
+    validator filtered the operator's push as if it were a command, and left
+    gravity out of the torque budget.)
+
+    Per cycle:
+      1. external-torque estimate (MomentumObserver), if enabled
+      2. virtual wall on the links and the lowest tool vertex
+      3. one exact projection of the commanded acceleration onto
+         table rows (links + tool hull) + joint hard limits + torque limits
+
+    Call `sent(tau)` with the torque actually commanded each cycle (after the
+    final clamp): the observer needs what the arm really felt.
+    """
+
+    def __init__(self, model, segs, link_radius, z_min, alpha, tau_max,
+                 wall, tool_hull=None, tool_k=0, tool_z_min=None,
+                 observer_gain=0.0, q_min=None, q_max=None,
+                 gravity_reserve=0.0, velocity_limits=False):
+        self.model = model
+        self.segs = segs
+        self.link_radius = link_radius
+        self.z_min = z_min
+        self.alpha = tuple(alpha)
+        self.tau_max = tau_max
+        self.wall = wall                      # dict(standoff, k_wall, d_wall, f_max)
+        self.tool_hull = tool_hull
+        self.tool_seg = (model.segment_index(TOOL_HULL_LINK)
+                         if tool_hull is not None else None)
+        self.tool_k = min(tool_k, len(tool_hull)) if tool_hull is not None else 0
+        self.tool_offset = ((tool_z_min - z_min)
+                            if tool_hull is not None else 0.0)
+        n = model.n
+        self.q_min = Q_HARD_MIN[:n] if q_min is None else q_min
+        self.q_max = Q_HARD_MAX[:n] if q_max is None else q_max
+        # Off by default: the inertia-weighted projection already stops the
+        # wrist whipping these rows were added for, and as HARD rows they
+        # conflict with the table rows exactly when the tool must be braked
+        # (validator, sideways tool, needle pushed: fails at 20 N with them,
+        # holds 25 N without).
+        self.dq_max = DQ_MAX[:n] if velocity_limits else None
+        self.reserve_joints = RESERVE_JOINTS[RESERVE_JOINTS < n]
+        self.reserve_limit = ((1.0 - gravity_reserve)
+                              * tau_max[self.reserve_joints])
+        self.gravity_reserve = gravity_reserve
+        self.observer = (MomentumObserver(n, observer_gain)
+                         if observer_gain > 0.0 else None)
+        self.tau_ext = np.zeros(n)
+        self._tau_sent = None
+
+    def reset(self):
+        if self.observer is not None:
+            self.observer.reset()
+        self.tau_ext = np.zeros(self.model.n)
+        self._tau_sent = None
+
+    def sent(self, tau):
+        self._tau_sent = np.array(tau, dtype=float)
+
+    def apply(self, q, dq, tau, tau_g, dt, M=None, Minv=None):
+        """Filter `tau` (which already contains `tau_g`). Returns (tau, info).
+
+        `tau_g` is the commanded gravity feedforward -- deliberately that, not
+        model.gravity(q), so --gravity-scale and the learned trim survive the
+        tau <-> ddq round trip. Whatever it gets wrong, the observer sees.
+        """
+        mdl = self.model
+        if M is None:
+            M = mdl.mass(q)
+        c_dq = mdl.coriolis(q, dq)
+
+        if self.observer is not None:
+            h = 1e-4
+            self.tau_ext = self.observer.update(
+                M, mdl.mass(q + h * dq), h, dq,
+                tau if self._tau_sent is None else self._tau_sent,
+                c_dq, tau_g, dt)
+
+        z, J_z, dJdq_z, z_wall, J_wall = table_barrier_terms(
+            mdl, q, dq, self.segs, self.link_radius, self.tool_hull,
+            self.tool_seg, self.tool_k, self.tool_offset)
+
+        # Layer 1: virtual wall (felt resistance).
+        tau_wall, f_wall = table_wall_torque(z_wall, J_wall, dq, self.z_min,
+                                             **self.wall)
+        tau = tau + tau_wall
+
+        # Layer 2: the HOCBF projection. Bias = the torque that buys no
+        # acceleration; anything the observer sees pushing on the arm is
+        # torque the motors need not supply -- and, crucially, motion the
+        # filter must now account for. Without it a hand's push is invisible
+        # and goes straight through the table (MuJoCo, 2026-10-26).
+        tau_bias = tau_g + c_dq - self.tau_ext
+        if Minv is not None:
+            ddq_nom = Minv @ (tau - tau_bias)
+        else:
+            ddq_nom = np.linalg.solve(M, tau - tau_bias)
+        A_c, b_c = compute_table_hocbf_rows(z, J_z, dJdq_z, dq, self.z_min,
+                                            *self.alpha)
+        # Joint stops and torque limits sit in the SAME projection: a solve
+        # that certifies motion a joint cannot make (stop) or deliver (torque)
+        # is not a certificate.
+        A_q, b_q = joint_limit_rows(q, dq, self.q_min, self.q_max, *self.alpha)
+        A_t, b_t = torque_limit_rows(M, tau_bias, self.tau_max)
+        rows_A = [A_c, A_q, A_t]
+        rows_b = [b_c, b_q, b_t]
+        if self.dq_max is not None:
+            A_v, b_v = velocity_limit_rows(dq, self.dq_max)
+            rows_A.append(A_v)
+            rows_b.append(b_v)
+        if self.gravity_reserve > 0.0:
+            # Keep enough torque in hand to hold the arm AND push back: the
+            # table rows are only a guarantee while that is true.
+            g_r, Jg_r, curv_r = mdl.gravity_terms(q, dq, self.reserve_joints)
+            A_r, b_r = gravity_reserve_rows(g_r, Jg_r, curv_r, dq,
+                                            self.reserve_limit, *self.alpha)
+            rows_A.append(A_r)
+            rows_b.append(b_r)
+        ddq, status = filter_control_qp_weighted(
+            ddq_nom, np.vstack(rows_A), np.concatenate(rows_b), M)
+        if ddq is not ddq_nom:
+            # Rebuild only when something was clipped -- otherwise the round
+            # trip just re-introduces float error.
+            tau = M @ ddq + tau_bias
+        return tau, dict(status=status, z=z, J_z=J_z, z_wall=z_wall,
+                         f_wall=f_wall, tau_ext=self.tau_ext)
 
 
 DEFAULT_TABLE_LINKS = [
@@ -996,6 +1131,31 @@ class KinDynModel:
 
         return z, J_z, dJdq_z
 
+    def gravity_terms(self, q, dq, joints, h=1e-5):
+        """(g_j, dg_j/dq, d2g_j/dt2 at ddq=0) for the gravity-reserve barrier.
+
+        Finite differences of `gravity`: one central difference per joint for
+        the gradient, and a second directional difference along dq for the
+        curvature term dq' (d2g/dq2) dq. ~16 gravity calls; KDL's are cheap.
+        """
+        q = np.asarray(q, dtype=float)
+        dq = np.asarray(dq, dtype=float)
+        g0 = self.gravity(q)
+        G = np.empty((self.n, self.n))
+        for k in range(self.n):
+            e = np.zeros(self.n)
+            e[k] = h
+            G[:, k] = (self.gravity(q + e) - self.gravity(q - e)) / (2 * h)
+        s = np.linalg.norm(dq)
+        if s > 1e-9:
+            u = dq / s
+            hh = 1e-4
+            curv = (self.gravity(q + hh * u) - 2 * g0
+                    + self.gravity(q - hh * u)) / hh**2 * s**2
+        else:
+            curv = np.zeros(self.n)
+        return g0[joints], G[joints], curv[joints]
+
     def body_point_heights(self, q, seg_index, pts):
         """Heights (base frame) of points `pts` (k, 3) fixed in link `seg_index`.
 
@@ -1446,6 +1606,21 @@ def _segment_distance_batch(P1, Q1, P2, Q2):
 Q_MIN = np.array([-np.inf, -2.41, -np.inf, -2.66, -np.inf, -2.23, -np.inf])
 Q_MAX = np.array([ np.inf,  2.41,  np.inf,  2.66,  np.inf,  2.23,  np.inf])
 LIMIT_MARGIN = 0.35          # rad -- barrier activates within this of a limit
+# Hard stops the table barrier must not plan through, from the surgical xacro
+# (surgical_arm_description, as in ~/mujoco_models/gen3_thesis_ee.xml). They are
+# 6-10 deg TIGHTER than Q_MIN/Q_MAX above (gen3_2f85.urdf), and which set the
+# arm firmware enforces is unverified -- so the safety filter takes the tight
+# one. The QP rows hold the joint at the limit; the spring above still eases
+# it away inside LIMIT_MARGIN.
+Q_HARD_MAX = np.array([np.inf, 2.24, np.inf, 2.57, np.inf, 2.09, np.inf])
+Q_HARD_MIN = -Q_HARD_MAX
+# Rated joint speeds (rad/s, gen3_2f85.urdf <limit velocity>): the table
+# filter never commands motion faster than the arm is allowed to make.
+DQ_MAX = np.array([1.3963, 1.3963, 1.3963, 1.3963, 1.2218, 1.2218, 1.2218])
+# Joints whose gravity load the reserve barrier bounds: 2, 4, 6 carry the
+# arm and tool; 1 is a vertical axis (never loaded), 3/5/7 are rolls that
+# carry almost nothing.
+RESERVE_JOINTS = np.array([1, 3, 5])
 
 
 def joint_limit_torque(q, k):
@@ -2490,24 +2665,23 @@ def run_impedance(args):
         send_opts = RouterClientSendOptions()
         send_opts.timeout_ms = args.cyclic_timeout_ms
 
-        # (F) Loop invariants for the table barrier, hoisted out of the hot loop.
-        table_alpha1, table_alpha2 = args.table_alpha
-        table_segs = [model.segment_index(nm) for nm in table_names]
-        table_radius = (0.0 if args.table_link_radius is None
-                        else args.table_link_radius)
-        # Tool hull rows: scanned in full each cycle, only the lowest
-        # --table-tool-points get barrier rows. Their own floor
-        # (--table-tool-z-min) is folded in as a height offset, so every row
-        # shares args.table_z_min below.
-        tool_seg = tool_k = None
-        tool_offset = 0.0
-        if tool_hull is not None:
-            tool_seg = model.segment_index(TOOL_HULL_LINK)
-            tool_k = min(args.table_tool_points, len(tool_hull))
-            tool_offset = args.table_tool_z_min - args.table_z_min
-            row_names = table_names + ["tool hull"] * tool_k
-        else:
-            row_names = table_names
+        # (F) The table-safety filter, built once outside the hot loop.
+        table_filter = None
+        row_names = table_names
+        if args.table_avoidance:
+            table_filter = TableSafetyFilter(
+                model, [model.segment_index(nm) for nm in table_names],
+                link_radius=args.table_link_radius, z_min=args.table_z_min,
+                alpha=args.table_alpha, tau_max=tau_max,
+                wall=dict(standoff=args.table_standoff,
+                          k_wall=args.table_stiffness,
+                          d_wall=args.table_damping,
+                          f_max=args.table_force_max),
+                tool_hull=tool_hull, tool_k=args.table_tool_points,
+                tool_z_min=args.table_tool_z_min,
+                observer_gain=args.table_observer_gain,
+                gravity_reserve=args.table_gravity_reserve)
+            row_names = table_names + ["tool hull"] * table_filter.tool_k
         last_table_warn = 0.0
         last_cbf_warn = 0.0
         last_clip_warn = 0.0
@@ -2873,60 +3047,15 @@ def run_impedance(args):
                 #          non-penetration but exerts no restoring force.
                 # The wall is what you feel; the CBF is the backstop.
                 if args.table_avoidance:
-                    z_surf, J_z, dJdq_z, z_wall, J_wall = table_barrier_terms(
-                        model, q, dq, table_segs, table_radius, tool_hull,
-                        tool_seg, tool_k, tool_offset)
-
-                    # -- Layer 1: virtual wall (felt resistance) --------------
-                    tau_wall, f_wall = table_wall_torque(
-                        z_wall, J_wall, dq, z_min=args.table_z_min,
-                        standoff=args.table_standoff,
-                        k_wall=args.table_stiffness,
-                        d_wall=args.table_damping,
-                        f_max=args.table_force_max)
-                    tau = tau + tau_wall
-
-                    # -- Layer 2: HOCBF constraint (hard backstop) -----------
-                    # The torque-limit rows are stacked UNDER the barrier rows
-                    # and solved in the same projection. Certifying a ddq the
-                    # wrist cannot deliver and then saturating tau below would
-                    # void the guarantee exactly when the barrier is braking
-                    # hardest; here the clamp at the end is left as a backstop
-                    # that should never bite.
-                    # Inversion bias: the torque that buys NO acceleration.
-                    # tau_g is the commanded gravity feedforward (deliberately
-                    # that, not model.gravity(q), so --gravity-scale and the
-                    # learned trim survive the round trip); tau_c is the
-                    # Coriolis/centrifugal term, which was missing until now --
-                    # without it ddq_nom is wrong by Minv @ C dq and the
-                    # torque rebuilt below does not produce ddq_safe.
-                    if M_cyc is None:               # joint / free mode
-                        # Nothing else this cycle wants M's inverse, and the
-                        # barrier needs exactly one solve against it, so solve
-                        # rather than invert: measurably faster and better
-                        # conditioned. Cartesian mode still reuses the explicit
-                        # Minv it already built for the operational-space term.
-                        M_cyc = model.mass(q)
-                    M = M_cyc
-                    tau_bias = tau_g + model.coriolis(q, dq)
-
-                    if Minv_cyc is not None:
-                        ddq_nom = Minv_cyc @ (tau - tau_bias)
-                    else:
-                        ddq_nom = np.linalg.solve(M, tau - tau_bias)
-                    A_cbf, b_cbf = compute_table_hocbf_rows(
-                        z_surf, J_z, dJdq_z, dq,
-                        z_min=args.table_z_min,
-                        alpha1=table_alpha1, alpha2=table_alpha2)
-                    A_tau, b_tau = torque_limit_rows(M, tau_bias, tau_max)
-                    A = np.vstack((A_cbf, A_tau))
-                    b = np.concatenate((b_cbf, b_tau))
-                    ddq_safe, cbf_status = filter_control_qp(ddq_nom, A, b)
-                    if ddq_safe is not ddq_nom:
-                        # Only rebuild the torque when the barrier actually
-                        # clipped something -- otherwise M @ ddq_nom + tau_bias
-                        # just re-introduces round-trip float error into tau.
-                        tau = M @ ddq_safe + tau_bias
+                    # Wall + table/tool rows + joint stops + torque limits in
+                    # one exact projection, with the operator's push estimated
+                    # by the observer -- see TableSafetyFilter. M_cyc/Minv_cyc
+                    # are reused from cartesian mode when it built them.
+                    tau, tinfo = table_filter.apply(
+                        q, dq, tau, tau_g, dt_meas, M=M_cyc, Minv=Minv_cyc)
+                    cbf_status = tinfo["status"]
+                    z_surf, z_wall = tinfo["z"], tinfo["z_wall"]
+                    f_wall = tinfo["f_wall"]
 
                     # A degraded solve means the projection is an approximation
                     # and NOT a safety certificate -- either the guarded links
@@ -2971,6 +3100,8 @@ def run_impedance(args):
                         last_clip_warn = step_start
 
                 tau = np.clip(tau, -tau_max, tau_max)
+                if args.table_avoidance:
+                    table_filter.sent(tau)
 
                 if np.any(np.isnan(tau)):
                     print("\nABORT: NaN in torque command.")
@@ -3392,6 +3523,21 @@ def main():
                    help="Barrier rows for the tool: the K lowest hull vertices "
                         "each cycle (the whole hull is scanned). 0 = do not "
                         "guard the tool.")
+    p.add_argument("--table-observer-gain", type=float, default=50.0,
+                   metavar="K",
+                   help="Bandwidth (rad/s) of the momentum observer that "
+                        "estimates the operator's push for the table barrier. "
+                        "Without it the barrier cannot see a hand at all and "
+                        "a push goes through the table. 0 disables (the "
+                        "pre-2026-10-26 behaviour -- do not).")
+    p.add_argument("--table-gravity-reserve", type=float, default=0.4,
+                   metavar="FRAC",
+                   help="Fraction of each loaded joint's (2, 4, 6) torque "
+                        "limit kept free of gravity, so the arm can always "
+                        "hold itself AND resist a push. The barrier stops "
+                        "the operator dragging the arm into poses it cannot "
+                        "hold -- it will refuse to stretch out fully. "
+                        "0 disables.")
     p.add_argument("--table-standoff", type=float, default=0.06, metavar="D",
                    help="Thickness of the band above --table-z-min in which "
                         "the virtual wall pushes back (m). 0 disables the "
@@ -3459,6 +3605,10 @@ def main():
                 f"lower --table-stiffness/--table-standoff.")
         if args.table_link_radius is None:
             args.table_link_radius = KinDynModel.CAPSULE_RADIUS
+        if not 0.0 <= args.table_gravity_reserve < 1.0:
+            p.error("--table-gravity-reserve must be in [0, 1)")
+        if args.table_observer_gain < 0:
+            p.error("--table-observer-gain must be >= 0")
         if args.table_tool_points < 0:
             p.error("--table-tool-points must be >= 0")
         if args.table_tool_z_min < TABLE_SURFACE_Z:
