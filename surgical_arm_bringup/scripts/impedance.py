@@ -2744,14 +2744,25 @@ def run_impedance(args):
                       # decimated rows are not lost.
                       + ["tb_status", "tb_clear", "tb_row", "tb_fwall"]
                       + [f"tau_ext{i+1}" for i in range(n)]
-                      + ["dt_max"])
+                      + ["dt_max"]
+                      # Where the cycle went, as means over the decimation
+                      # window (s): w_comp = everything from loop top to just
+                      # before Refresh, w_tbl = the table filter's share of
+                      # that, w_ref = blocked inside Refresh. A loop that is
+                      # slow because of compute and one that is slow because
+                      # the arm answers late look identical in dt alone.
+                      + ["w_comp", "w_tbl", "w_ref"])
         TB_STATUS = {"inactive": 0, "exact": 1, "blocked": 2, "degraded": 3}
         tb_log = [-1, float("nan"), -1, float("nan")]
         tau_ext_log = [float("nan")] * n
         dt_max_log = 0.0
+        w_acc = np.zeros(3)
+        w_n = 0
+        w_tbl_cyc = 0.0
         try:
             while True:
                 step_start = time.monotonic()
+                _t_cyc = time.perf_counter()
                 if args.duration and (step_start - t_start) >= args.duration:
                     break
 
@@ -3096,8 +3107,10 @@ def run_impedance(args):
                     # one exact projection, with the operator's push estimated
                     # by the observer -- see TableSafetyFilter. M_cyc/Minv_cyc
                     # are reused from cartesian mode when it built them.
+                    _t_tbl = time.perf_counter()
                     tau, tinfo = table_filter.apply(
                         q, dq, tau, tau_g, dt_meas, M=M_cyc, Minv=Minv_cyc)
+                    w_tbl_cyc = time.perf_counter() - _t_tbl
                     cbf_status = tinfo["status"]
                     z_surf, z_wall = tinfo["z"], tinfo["z_wall"]
                     f_wall = tinfo["f_wall"]
@@ -3174,8 +3187,12 @@ def run_impedance(args):
                                     + [tb_log[0], round(tb_log[1], 5),
                                        tb_log[2], round(tb_log[3], 3)]
                                     + [round(float(v), 4) for v in tau_ext_log]
-                                    + [round(dt_max_log, 6)])
+                                    + [round(dt_max_log, 6)]
+                                    + [round(v / max(w_n, 1), 6)
+                                       for v in w_acc])
                     dt_max_log = 0.0
+                    w_acc[:] = 0.0
+                    w_n = 0
 
                 # Build the cyclic command frame.
                 frame_id = (frame_id + 1) % 65536
@@ -3190,9 +3207,13 @@ def run_impedance(args):
                 # Bounded-latency cyclic exchange. Without an explicit options
                 # object this inherits timeout_ms=10000 and a single lost frame
                 # wedges the torque loop for ten seconds (see CYCLIC_TIMEOUT_MS).
+                _t_ref = time.perf_counter()
                 try:
                     feedback = base_cyclic.Refresh(command, 0, send_opts)
                     cyc_timeout_run = 0
+                    _t_done = time.perf_counter()
+                    w_acc += (_t_ref - _t_cyc, w_tbl_cyc, _t_done - _t_ref)
+                    w_n += 1
                 except FutureTimeoutError:
                     cyc_timeout_run += 1
                     cyc_timeout_total += 1

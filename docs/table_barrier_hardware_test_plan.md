@@ -29,6 +29,9 @@ wall resists and the HOCBF keeps every guarded point above its floor.
       guarded rows, m), `tb_row` (which row), `tb_fwall` (N), `tau_ext1..7`,
       `dt_max` (worst cycle since the previous logged row). Not yet seen in a
       real log: check the header after step 1.
+- [ ] REAL-1 is otherwise idle (`uptime` load < 1, no other python). A numpy job running
+      alongside, even pinned to one core, dropped the loop from 936 to 565 Hz on
+      2026-10-27. Log columns `w_comp` / `w_tbl` / `w_ref` show the split per window.
 - [ ] E-stop within reach of a second person; the table is clear except the test area.
 
 ## 1. Tool on the flange: 2F-140 (read from the arm 2026-10-27: 1.025 kg, CoM z 0.073)
