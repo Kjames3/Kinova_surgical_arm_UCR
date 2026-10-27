@@ -276,6 +276,232 @@ _, f_edge = table_wall_torque(z_edge, J_one, np.zeros(n), 0.05, 0.06,
 check("wall force is zero at the band edge", abs(float(f_edge[0])) < 1e-9,
       f"F={float(f_edge[0]):.3e} N")
 
+# --- 7. the mounted tool -----------------------------------------------------
+# Everything above guards the bare chain, which ends at the flange. The
+# thesis_ee needle hangs 0.41 m below the bracelet, so the part of the robot
+# that actually meets the table was unguarded until 2026-10-26. These checks
+# use the thesis_ee model and score clearance over the WHOLE hull, not just the
+# vertices the barrier chose to guard.
+print("\n7. Mounted tool (thesis_ee): hull guard")
+tmodel = imp.KinDynModel(imp.DEFAULT_URDF, imp.DEFAULT_BASE_LINK,
+                         imp.DEFAULT_TIP_LINK, tool="thesis_ee")
+hull = imp.load_tool_hull("thesis_ee")
+tseg = tmodel.segment_index(imp.TOOL_HULL_LINK)
+tsegs = [tmodel.segment_index(nm) for nm in links]
+TIP = np.array([0.108, -0.008, -0.411])          # measured assembly_tip
+check("hull contains the measured assembly_tip",
+      np.min(np.linalg.norm(hull - TIP, axis=1)) < 1e-6)
+
+worst_j = worst_d = 0.0
+pts = hull[rng.choice(len(hull), 6, replace=False)]
+for _ in range(20):
+    q = rng.uniform(-2.0, 2.0, n)
+    dq = rng.uniform(-1.5, 1.5, n)
+    z, J_z, dJdq_z = tmodel.body_point_barrier_terms(q, dq, tseg, pts)
+    check_z = tmodel.body_point_heights(q, tseg, pts)
+    worst_j = max(worst_j, np.max(np.abs(z - check_z)))
+    h = 1e-6
+    num = np.zeros_like(J_z)
+    for j in range(n):
+        qp, qm = q.copy(), q.copy()
+        qp[j] += h
+        qm[j] -= h
+        num[:, j] = (tmodel.body_point_heights(qp, tseg, pts)
+                     - tmodel.body_point_heights(qm, tseg, pts)) / (2 * h)
+    worst_j = max(worst_j, np.max(np.abs(J_z - num)))
+    _, Jp, _ = tmodel.body_point_barrier_terms(q + h * dq, dq, tseg, pts)
+    _, Jm, _ = tmodel.body_point_barrier_terms(q - h * dq, dq, tseg, pts)
+    worst_d = max(worst_d, np.max(np.abs(dJdq_z - ((Jp - Jm) / (2 * h)) @ dq)))
+check("tool J_z == d(z)/dq", worst_j < 1e-5, f"max err {worst_j:.2e}")
+check("tool dJ@dq == dJ/dt @ dq", worst_d < 1e-4, f"max err {worst_d:.2e}")
+
+
+def point_jacobian_z(q, p_local):
+    """Vertical Jacobian row of a point fixed in the bracelet (push site)."""
+    return tmodel.body_point_barrier_terms(q, np.zeros(n), tseg,
+                                           p_local[None])[1][0]
+
+
+def push_point_jacobian(q, site):
+    """3xN linear Jacobian of a point fixed in the bracelet (the push site)."""
+    J_full = tmodel.jacobian(q)
+    p_ee, _ = tmodel.fk(q)
+    frame = tmodel._scratch_frame
+    tmodel._fk.JntToCart(tmodel._to_jnt(q), frame, tseg)
+    Rb = np.array([[frame.M[i, j] for j in range(3)] for i in range(3)])
+    p_w = np.array([frame.p[i] for i in range(3)]) + Rb @ site
+    return J_full[:3] - np.cross(p_w - p_ee, J_full[3:].T).T
+
+
+def resistible_force(q, site, direction, J_low):
+    """Largest push the motors can stop at all, in this pose (N).
+
+    `J_low` is the vertical Jacobian row of the guarded point closest to its
+    floor (tool vertex or link). The biggest F for which SOME torque inside
+    TAU_MAX still gives that point zero-or-upward acceleration at rest:
+        max_tau  a @ (tau + Jv^T F d) >= 0,   a = J_low @ M^-1
+    i.e. |a| @ TAU_MAX >= -F a @ Jv^T d. Above this no controller can hold it
+    off the table -- a torque-authority limit, not a barrier one.
+    """
+    a = J_low @ np.linalg.inv(tmodel.mass(q))
+    per_newton = a @ (push_point_jacobian(q, site).T @ direction)
+    if per_newton >= 0.0:
+        return np.inf
+    return float(np.abs(a) @ imp.TAU_MAX[:n] / -per_newton)
+
+
+def simulate_tool(q0, push_pt, push_dir, push, use_tool, tool_z_min=-0.02,
+                  link_z_min=0.08, T=3.0, dt=1e-3, k=4):
+    """Push the thesis_ee arm at `push_pt` (bracelet frame) along `push_dir`.
+
+    Runs impedance.table_barrier_terms -- the hot loop's own row builder -- and
+    returns the worst clearance of ANY hull vertex below tool_z_min and of any
+    link surface below link_z_min, solver health counters, the smallest
+    resistible_force() met within 10 mm of contact (any guarded row), and the peak joint speed.
+    """
+    q = q0.copy()
+    dq = np.zeros(n)
+    tau_max = imp.TAU_MAX[:n]
+    off = tool_z_min - link_z_min
+    worst_tool = worst_link = np.inf
+    degraded = clipped = 0
+    f_cap = np.inf          # least resistible push seen near contact
+    peak_dq = 0.0
+    for _ in range(int(T / dt)):
+        clr_tool = np.min(tmodel.body_point_heights(q, tseg, hull)) - tool_z_min
+        worst_tool = min(worst_tool, clr_tool)
+        z, J_z, dJdq_z, z_w, J_w = imp.table_barrier_terms(
+            tmodel, q, dq, tsegs, 0.055, hull if use_tool else None, tseg,
+            k, off)
+        worst_link = min(worst_link, np.min(z[:len(tsegs)] - link_z_min))
+
+        Jv = push_point_jacobian(q, push_pt)
+        # The torque-authority limit where it matters: within 10 mm of any
+        # guarded row's floor (cheap enough only because it is gated).
+        clr_rows = z - link_z_min
+        k_low = int(np.argmin(clr_rows))
+        if clr_rows[k_low] < 0.01:
+            f_cap = min(f_cap, resistible_force(q, push_pt, push_dir,
+                                                J_z[k_low]))
+        peak_dq = max(peak_dq, np.max(np.abs(dq)))
+        # Damping: KD_GLOBAL only, no stiffness -- the least the controller
+        # ever applies (free mode while being moved), so the worst case. The
+        # bare 2*dq of section 3 let a sideways shove spin the wrist until
+        # Coriolis alone exceeded the torque limits, which no real mode allows.
+        tau = Jv.T @ (push * push_dir) - imp.KD_GLOBAL[:n] * dq
+
+        tw, _ = table_wall_torque(z_w, J_w, dq, link_z_min, 0.06, 1200.0,
+                                  60.0, f_max=90.0)
+        tau = tau + tw
+        M = tmodel.mass(q)
+        tau_c = tmodel.coriolis(q, dq)
+        ddq = np.linalg.solve(M, tau - tau_c)
+        A, b = compute_table_hocbf_rows(z, J_z, dJdq_z, dq, link_z_min,
+                                        alpha1=15.0, alpha2=15.0)
+        A_t, b_t = torque_limit_rows(M, tau_c, tau_max)
+        ddq, status = filter_control_qp(ddq, np.vstack((A, A_t)),
+                                        np.concatenate((b, b_t)))
+        degraded += status == "degraded"
+        tau = M @ ddq + tau_c
+        if np.any(np.abs(tau) > tau_max + 1e-6):
+            clipped += 1
+        tau = np.clip(tau, -tau_max, tau_max)
+        # Plant: the 1 kHz command is held for the whole period (ZOH, as on
+        # the robot) while the rigid body is integrated in 10 substeps. No
+        # velocity/acceleration clamps -- section 3 has them, and they make
+        # the plant something the CBF never certified, so a free wrist spun
+        # into them reads as "penetration" that is really a harness artefact.
+        for _ in range(10):
+            ddq = np.linalg.solve(tmodel.mass(q),
+                                  tau - tmodel.coriolis(q, dq))
+            dq = dq + ddq * dt / 10
+            q = q + dq * dt / 10
+    return worst_tool, worst_link, degraded, clipped, f_cap, peak_dq
+
+
+# Start poses: needle pointing down, tilted 45 deg (the insertion posture),
+# and lying sideways. Found by seeded search rather than hand-typed, so each
+# provably starts 50-200 mm above the tool floor with every link clear.
+def find_pose(tilt_deg, seed):
+    r = np.random.default_rng(seed)
+    axis = TIP / np.linalg.norm(TIP)
+    frame = tmodel._scratch_frame
+    for _ in range(200000):
+        q = r.uniform(-2.2, 2.2, n)
+        clr = np.min(tmodel.body_point_heights(q, tseg, hull)) + 0.02
+        if not 0.05 < clr < 0.20:
+            continue
+        z, _, _ = tmodel.height_barrier_terms(q, np.zeros(n), tsegs)
+        if np.min(z - 0.055) < 0.11:
+            continue
+        tmodel._fk.JntToCart(tmodel._to_jnt(q), frame, tseg)
+        Rb = np.array([[frame.M[i, j] for j in range(3)] for i in range(3)])
+        tilt = np.degrees(np.arccos(np.clip(-(Rb @ axis)[2], -1, 1)))
+        if abs(tilt - tilt_deg) < 5.0:
+            return q
+    raise RuntimeError(f"no start pose at {tilt_deg} deg")
+
+
+POSES = {"needle down": find_pose(0.0, 1), "tilted 45": find_pose(45.0, 2),
+         "sideways": find_pose(90.0, 3)}
+SITES = {"needle tip": TIP, "flange": np.array([0.0, 0.0, -0.0615]),
+         "tool body": np.array([0.115, 0.0, -0.20])}
+DIRS = {"down": np.array([0, 0, -1.0]),
+        "down+fwd": np.array([0.7, 0, -0.7]),
+        "down+side": np.array([0, 0.7, -0.7])}
+for name, q0 in POSES.items():
+    clr0 = np.min(tmodel.body_point_heights(q0, tseg, hull)) + 0.02
+    print(f"  pose '{name}': lowest tool point starts {clr0*1000:.0f} mm "
+          f"above the tool floor")
+    assert clr0 > 0.0, f"pose {name} starts in violation"
+
+print("  baseline -- links only, tool NOT guarded (pre-2026-10-26):")
+wt, wl, _, _, _, _ = simulate_tool(POSES["needle down"], TIP, DIRS["down"], 90.0,
+                             use_tool=False)
+print(f"    90 N at the needle: tool {wt*1000:+.1f} mm, links {wl*1000:+.1f} mm"
+      f"  [{'PENETRATED' if wt < -1e-3 else 'held'}]")
+check("baseline really was unguarded", wt < -1e-3,
+      "(if this passes, the sweep below is not testing anything new)")
+
+# A run that penetrates is only a barrier failure if the push was one the
+# motors could have stopped. Above resistible_force() it is physics, and is
+# reported as the operating envelope instead.
+worst = np.inf
+fail, beyond, unhealthy = [], [], []
+n_runs = 0
+for pname, q0 in POSES.items():
+    for sname, site in SITES.items():
+        for dname, dvec in DIRS.items():
+            for force in (30.0, 90.0, 150.0):
+                dvec_u = dvec / np.linalg.norm(dvec)
+                wt, wl, deg, clip, f_cap, pk = simulate_tool(
+                    q0, site, dvec_u, force, use_tool=True, T=2.0)
+                n_runs += 1
+                w = min(wt, wl)
+                tag = (f"{pname}/{sname}/{dname}/{force:g}N: tool "
+                       f"{wt*1000:+.1f} link {wl*1000:+.1f} mm, motors can "
+                       f"stop {f_cap:.0f} N here, peak {pk:.1f} rad/s")
+                within = force < f_cap
+                if within:
+                    worst = min(worst, w)
+                if w < -1e-3:
+                    (fail if within else beyond).append(tag)
+                elif (deg or clip) and within:
+                    unhealthy.append(f"{tag}, degraded {deg} clipped {clip}")
+print(f"  sweep: {n_runs} pushes (3 poses x 3 sites x 3 directions x "
+      f"30/90/150 N); worst clearance within torque authority "
+      f"{worst*1000:+.2f} mm")
+for line in fail:
+    print("    FAILED  " + line)
+for line in beyond:
+    print("    beyond authority (expected) " + line)
+for line in unhealthy:
+    print("    unhealthy " + line)
+check("held in every push the motors could resist", not fail,
+      f"{len(fail)} failed")
+check("filter exact and unclipped within authority", not unhealthy,
+      f"{len(unhealthy)} runs")
+
 print("\n" + "=" * 60)
 if fails:
     print("FAILED: " + ", ".join(fails))

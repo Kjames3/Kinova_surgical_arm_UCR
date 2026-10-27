@@ -486,6 +486,62 @@ def _resolve_table_links(args, model):
     return [nm for nm in on_chain if nm in sel]
 
 
+# Tool hulls for the table barrier, as guard points in TOOL_HULL_LINK's frame.
+# KDL's chain stops at the flange, so without these the barrier guards nothing
+# below it -- and the thesis_ee needle reaches 0.41 m past the bracelet, well
+# below every guarded link. A tool with no entry here is UNGUARDED.
+TOOL_HULL_LINK = "gen3_bracelet_link"
+TABLE_SURFACE_Z = -0.03     # m, base frame (setup_planning_scene.py's table)
+TOOL_HULLS = {
+    "thesis_ee": os.path.join(_PKG_DIR, "config", "thesis_ee_hull_bracelet.csv"),
+}
+
+
+def load_tool_hull(tool):
+    """(k, 3) hull vertices for `tool` in TOOL_HULL_LINK's frame, or None."""
+    path = TOOL_HULLS.get(tool)
+    if path is None:
+        return None
+    pts = np.loadtxt(path, delimiter=",", comments="#", ndmin=2)
+    if pts.shape[1] != 3 or len(pts) == 0:
+        raise ValueError(f"{path}: expected rows of x,y,z")
+    return pts
+
+
+def table_barrier_terms(model, q, dq, segs, link_radius, tool_hull=None,
+                        tool_seg=None, tool_k=0, tool_offset=0.0):
+    """Barrier rows for the table: guarded links, then the tool's lowest vertices.
+
+    Shared by the hot loop and validate_table_barrier.py, so the offline sim
+    exercises exactly the row selection the robot runs.
+
+    Returns (z, J_z, dJdq_z) for the HOCBF -- one row per link plus `tool_k`
+    tool rows -- and (z_wall, J_wall) for the virtual wall, which springs only
+    the single lowest tool vertex: springing every selected vertex would
+    stiffen the felt wall k-fold whenever the tool lies flat. Heights are
+    already shifted so that every row is held above the same z_min: links by
+    their capsule radius, tool rows by `tool_offset`.
+    """
+    z_pts, J_z, dJdq_z = model.height_barrier_terms(q, dq, segs)
+    # Guard the link SURFACE, not its centreline: each monitored point is
+    # offset up by the capsule radius so a link's skin is what stops at z_min.
+    z_surf = z_pts - link_radius
+    if tool_hull is None or not tool_k:
+        return z_surf, J_z, dJdq_z, z_surf, J_z
+    # The tool is what actually reaches the table, and none of its body is on
+    # the KDL chain. A plane's closest approach to a convex body is a hull
+    # vertex, so take the lowest few: exact, and cheap enough to rescan.
+    z_hull = model.body_point_heights(q, tool_seg, tool_hull)
+    low = np.argpartition(z_hull, tool_k - 1)[:tool_k]
+    low = low[np.argsort(z_hull[low])]
+    z_t, J_t, dJdq_t = model.body_point_barrier_terms(q, dq, tool_seg,
+                                                      tool_hull[low])
+    z_t = z_t - tool_offset
+    return (np.concatenate((z_surf, z_t)), np.vstack((J_z, J_t)),
+            np.concatenate((dJdq_z, dJdq_t)),
+            np.concatenate((z_surf, z_t[:1])), np.vstack((J_z, J_t[:1])))
+
+
 DEFAULT_TABLE_LINKS = [
     "gen3_half_arm_2_link",
     "gen3_forearm_link",
@@ -938,6 +994,48 @@ class KinDynModel:
             self._jdot.JntToJacDot(qv, twist, s)
             dJdq_z[k] = twist.vel[2]
 
+        return z, J_z, dJdq_z
+
+    def body_point_heights(self, q, seg_index, pts):
+        """Heights (base frame) of points `pts` (k, 3) fixed in link `seg_index`.
+
+        Cheap (one FK + a k x 3 product), so the barrier can scan a whole tool
+        hull every cycle and only build Jacobians for the lowest few points.
+        """
+        frame = self._scratch_frame
+        self._fk.JntToCart(self._to_jnt(q), frame, seg_index)
+        r_z = np.array([frame.M[2, j] for j in range(3)])
+        return frame.p[2] + pts @ r_z
+
+    def body_point_barrier_terms(self, q, dq, seg_index, pts):
+        """(z, J_z, dJdq_z) for points `pts` (k, 3) rigidly fixed in a link.
+
+        Same contract as `height_barrier_terms`, for points that are not link
+        origins -- the tool hull. Built from the link's own HYBRID Jacobian and
+        dJ@dq by rigid-body transport, r = R @ p_local:
+            v_p = v + w x r                  -> J_z = Jv_z + r_y Jw_x - r_x Jw_y
+            a_p = a + dw x r + w x (w x r)   -> the dJdq_z drift below
+        so one FK/Jacobian/JacDot call covers every point on the body.
+        """
+        ja = self._to_jnt(q)
+        qv = self._scratch_qv
+        for i in range(self.n):
+            qv.q[i] = float(q[i])
+            qv.qdot[i] = float(dq[i])
+        frame, jac, twist = (self._scratch_frame, self._scratch_jac,
+                             self._scratch_twist)
+        self._fk.JntToCart(ja, frame, seg_index)
+        self._jac.JntToJac(ja, jac, seg_index)
+        self._jdot.JntToJacDot(qv, twist, seg_index)
+
+        R = np.array([[frame.M[i, j] for j in range(3)] for i in range(3)])
+        J = np.array([[jac[r, c] for c in range(self.n)] for r in range(6)])
+        r = np.asarray(pts, dtype=float) @ R.T              # (k, 3) world offsets
+        w = J[3:] @ np.asarray(dq, dtype=float)              # link angular velocity
+        z = frame.p[2] + r[:, 2]
+        J_z = J[2] + np.outer(r[:, 1], J[3]) - np.outer(r[:, 0], J[4])
+        dJdq_z = (twist.vel[2] + twist.rot[0] * r[:, 1] - twist.rot[1] * r[:, 0]
+                  + w[2] * (r @ w) - r[:, 2] * (w @ w))
         return z, J_z, dJdq_z
 
     def point_barrier_terms(self, q, dq, seg_indices):
@@ -2013,6 +2111,19 @@ def run_impedance(args):
     # Resolve (and validate) the guarded link set before opening the robot
     # connection, so a typo in --table-links costs nothing.
     table_names = _resolve_table_links(args, model)
+    # The tool hull is the part of the robot that actually meets the table.
+    # A guarded tool whose hull cannot be loaded is a refusal, like a missing
+    # model: torque mode with half the barrier the user asked for is worse.
+    tool_hull = None
+    if args.table_avoidance and args.table_tool_points > 0:
+        try:
+            tool_hull = load_tool_hull(args.tool)
+        except OSError as e:
+            raise SystemExit(f"--table-avoidance: cannot load the {args.tool} "
+                             f"hull ({e}). Refusing to start.")
+        if tool_hull is not None and TOOL_HULL_LINK not in model.segment_names():
+            raise SystemExit(f"--table-avoidance: tool hull needs "
+                             f"{TOOL_HULL_LINK} on the chain. Refusing to start.")
 
     with DeviceConnection(args.robot_ip, TCP_PORT, DEFAULT_CREDENTIALS) as router, \
          DeviceConnection(args.robot_ip, UDP_PORT, DEFAULT_CREDENTIALS) as router_rt:
@@ -2268,6 +2379,13 @@ def run_impedance(args):
                   "together, so the clamp never overrides the filter")
             print(f"  table link: {len(table_names)} guarded -- "
                   + ", ".join(nm.replace('gen3_', '') for nm in table_names))
+            if tool_hull is not None:
+                print(f"  table tool: {args.tool} hull, {len(tool_hull)} "
+                      f"vertices, lowest {args.table_tool_points} guarded, "
+                      f"held above z={args.table_tool_z_min} m")
+            elif args.table_tool_points > 0:
+                print(f"  table tool: WARNING -- no hull for --tool "
+                      f"{args.tool}; nothing below the flange is guarded")
             if args.table_standoff > 0.0 and args.table_stiffness > 0.0:
                 print(f"  table wall: K={args.table_stiffness:g} N/m "
                       f"D={args.table_damping:g} Ns/m over a "
@@ -2377,6 +2495,19 @@ def run_impedance(args):
         table_segs = [model.segment_index(nm) for nm in table_names]
         table_radius = (0.0 if args.table_link_radius is None
                         else args.table_link_radius)
+        # Tool hull rows: scanned in full each cycle, only the lowest
+        # --table-tool-points get barrier rows. Their own floor
+        # (--table-tool-z-min) is folded in as a height offset, so every row
+        # shares args.table_z_min below.
+        tool_seg = tool_k = None
+        tool_offset = 0.0
+        if tool_hull is not None:
+            tool_seg = model.segment_index(TOOL_HULL_LINK)
+            tool_k = min(args.table_tool_points, len(tool_hull))
+            tool_offset = args.table_tool_z_min - args.table_z_min
+            row_names = table_names + ["tool hull"] * tool_k
+        else:
+            row_names = table_names
         last_table_warn = 0.0
         last_cbf_warn = 0.0
         last_clip_warn = 0.0
@@ -2742,16 +2873,13 @@ def run_impedance(args):
                 #          non-penetration but exerts no restoring force.
                 # The wall is what you feel; the CBF is the backstop.
                 if args.table_avoidance:
-                    z_pts, J_z, dJdq_z = model.height_barrier_terms(
-                        q, dq, table_segs)
-                    # Guard the link SURFACE, not its centreline: each monitored
-                    # point is offset up by the capsule radius so a link's skin
-                    # is what stops at z_min.
-                    z_surf = z_pts - table_radius
+                    z_surf, J_z, dJdq_z, z_wall, J_wall = table_barrier_terms(
+                        model, q, dq, table_segs, table_radius, tool_hull,
+                        tool_seg, tool_k, tool_offset)
 
                     # -- Layer 1: virtual wall (felt resistance) --------------
                     tau_wall, f_wall = table_wall_torque(
-                        z_surf, J_z, dq, z_min=args.table_z_min,
+                        z_wall, J_wall, dq, z_min=args.table_z_min,
                         standoff=args.table_standoff,
                         k_wall=args.table_stiffness,
                         d_wall=args.table_damping,
@@ -2810,7 +2938,7 @@ def run_impedance(args):
                             and step_start - last_cbf_warn > 1.0):
                         k = int(np.argmin(z_surf - args.table_z_min))
                         print(f"\nWARNING: table CBF degraded (no exact "
-                              f"projection) -- closest {table_names[k]} at "
+                              f"projection) -- closest {row_names[k]} at "
                               f"{z_surf[k] - args.table_z_min:+.3f} m. The "
                               f"barrier may not hold; back the arm off and "
                               f"check --table-alpha / --table-z-min.",
@@ -2821,9 +2949,9 @@ def run_impedance(args):
                     # closest link whenever the wall is engaged, rate-limited.
                     if (args.table_verbose and np.any(f_wall > 0.0)
                             and step_start - last_table_warn > 0.5):
-                        k = int(np.argmin(z_surf - args.table_z_min))
-                        print(f"  [table] {table_names[k]} "
-                              f"clr={z_surf[k] - args.table_z_min:+.3f} m  "
+                        k = int(np.argmin(z_wall - args.table_z_min))
+                        print(f"  [table] {row_names[k]} "
+                              f"clr={z_wall[k] - args.table_z_min:+.3f} m  "
                               f"F={f_wall[k]:5.1f} N"
                               + ("" if cbf_status == "inactive"
                                  else f"  CBF:{cbf_status}"),
@@ -3254,6 +3382,16 @@ def main():
                         "(m), so its SURFACE stops at --table-z-min rather "
                         "than its centreline. Default: the capsule radius "
                         f"({KinDynModel.CAPSULE_RADIUS}). 0 = guard centrelines.")
+    p.add_argument("--table-tool-z-min", type=float, default=-0.02,
+                   metavar="Z",
+                   help="Floor for the mounted tool's hull (base frame, m). "
+                        "Separate from --table-z-min because the needle must "
+                        "go far lower than any arm link. Default: 1 cm above "
+                        "the table surface (z=-0.03).")
+    p.add_argument("--table-tool-points", type=int, default=4, metavar="K",
+                   help="Barrier rows for the tool: the K lowest hull vertices "
+                        "each cycle (the whole hull is scanned). 0 = do not "
+                        "guard the tool.")
     p.add_argument("--table-standoff", type=float, default=0.06, metavar="D",
                    help="Thickness of the band above --table-z-min in which "
                         "the virtual wall pushes back (m). 0 disables the "
@@ -3321,6 +3459,11 @@ def main():
                 f"lower --table-stiffness/--table-standoff.")
         if args.table_link_radius is None:
             args.table_link_radius = KinDynModel.CAPSULE_RADIUS
+        if args.table_tool_points < 0:
+            p.error("--table-tool-points must be >= 0")
+        if args.table_tool_z_min < TABLE_SURFACE_Z:
+            p.error(f"--table-tool-z-min {args.table_tool_z_min:g} is below "
+                    f"the table surface (z={TABLE_SURFACE_Z:g}).")
 
     # Gravity default depends on mode: 'model' (config-dependent g(q), valid
     # across the workspace) for cartesian, 'startup' (constant) for joint.
