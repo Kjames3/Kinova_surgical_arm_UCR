@@ -65,12 +65,18 @@ def load_plant_with_payload(args, timestep):
     m = mujoco.MjModel.from_xml_path(bench.PLANT_URDF)
     m.opt.timestep = timestep
     m.dof_armature[:] = args.armature
-    d = mujoco.MjData(m)
     dofadr, qposadr = [], []
     for name in joint_names:
         jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, name)
         dofadr.append(int(m.jnt_dofadr[jid]))
         qposadr.append(int(m.jnt_qposadr[jid]))
+    # Joint friction identified on hardware (impedance.FRICTION_*): Coulomb
+    # as MuJoCo frictionloss, viscous as joint damping. Without it the sim
+    # has no idea why the real arm lags a sweep.
+    n = len(dofadr)
+    m.dof_frictionloss[dofadr] = args.plant_friction * imp.FRICTION_FC[:n]
+    m.dof_damping[dofadr] = args.plant_friction * imp.FRICTION_FV[:n]
+    d = mujoco.MjData(m)
     return m, d, np.array(dofadr), np.array(qposadr)
 
 
@@ -145,6 +151,12 @@ def simulate(args, trim_error, track_q_ref=True, vel_ff=True):
             tau_trim = np.clip(
                 tau_trim + k_trim * imp.trim_error(trim_error, q, q_ref, task) * dt,
                 -i_cap, i_cap)
+        if args.friction_ff > 0.0 and vel_ff:
+            tau = tau + imp.friction_feedforward(
+                imp.reference_joint_velocity(
+                    kin, q_ref, imp.track_velocity(p_a, p_b, t,
+                                                   args.track_period))[:n],
+                args.friction_ff)
         tau = tau + tau_trim
         tau = tau - kd_global * dq
         tau = tau + kp_anchor * imp._wrap_rad(q_ref - q)
@@ -231,6 +243,12 @@ def main():
     p.add_argument("--rate", type=float, default=1000.0)
     p.add_argument("--substeps", type=int, default=4)
     p.add_argument("--armature", type=float, default=0.01)
+    p.add_argument("--plant-friction", type=float, default=0.0, metavar="S",
+                   help="Give the plant S x the hardware-identified joint "
+                        "friction (impedance.FRICTION_*). 0 = frictionless.")
+    p.add_argument("--friction-ff", type=float, default=0.0, metavar="S",
+                   help="Controller friction feedforward scale, as "
+                        "impedance.py --friction-ff.")
     p.add_argument("--q0", type=float, nargs=7, default=None)
     p.add_argument("--urdf", default=imp.DEFAULT_URDF)
     p.add_argument("--base-link", default=imp.DEFAULT_BASE_LINK)

@@ -894,6 +894,19 @@ KD_GLOBAL = np.array([2.0, 2.0, 1.5, 1.5, 0.8, 0.8, 0.6])
 # few Nm/rad holds the joint within <1 deg while barely perturbing the EE task.
 CONTINUOUS_JOINTS = np.array([True, False, True, False, True, False, True])
 
+# --- Joint friction (track-mode feedforward) ---------------------------------
+# Identified 2026-10-27 from the 2026-10-23 track sweeps (2F-140, 8 logs, 22k
+# samples): residual tau_cmd - (M ddq + C dq + g) fitted per joint to
+# Fc*tanh(v/FRICTION_VS) + Fv*v. Viscous friction dominates and is LARGER than
+# the loop's own damping -- that is the lag the 2026-10-23 sweeps showed.
+# Only j1/j5/j7 moved enough to identify (R^2 0.95/0.93/0.87); j2/j3/j4/j6
+# barely moved, so they BORROW their actuator class's values (big: j1; small:
+# mean of j5/j7). Re-identify them from a sweep that moves them.
+FRICTION_FC = np.array([0.62, 0.62, 0.62, 0.62, 0.47, 0.38, 0.29])   # Nm
+FRICTION_FV = np.array([8.0, 8.0, 8.0, 8.0, 10.3, 9.4, 8.5])         # Nm s/rad
+FRICTION_IDENTIFIED = np.array([True, False, False, False, True, False, True])
+FRICTION_VS = 0.01                                                   # rad/s
+
 # 'free' interaction-mode position hold. 'free' captures a joint-space hold pose
 # whenever the arm is (nearly) stationary and applies a light critically-damped
 # spring toward it: while |dq| exceeds FREE_MOVE_THRESH the operator is moving it
@@ -1994,6 +2007,29 @@ def free_drive_torque(q, tau_g, tau_collide, k_limit):
     return tau_g + joint_limit_torque(q, k_limit) + tau_collide
 
 
+def friction_feedforward(dq_ref, scale):
+    """Joint friction torque for the REFERENCE motion, times `scale`.
+
+    Deliberately driven by the reference joint velocity, not the measured
+    one: the identified viscous term (8-10 Nm s/rad) exceeds the loop's own
+    damping, so cancelling it on MEASURED velocity would remove the loop's
+    damping and an over-estimate would make the arm gain energy. As a
+    feedforward it sits outside the feedback loop and cannot destabilise it;
+    scale < 1 keeps it on the under-compensating side.
+    """
+    v = np.asarray(dq_ref, dtype=float)
+    n = len(v)
+    return scale * (FRICTION_FC[:n] * np.tanh(v / FRICTION_VS)
+                    + FRICTION_FV[:n] * v)
+
+
+def reference_joint_velocity(model, q_ref, xdot_des):
+    """Joint velocity that realises the setpoint twist at q_ref (damped J+)."""
+    J = model.jacobian(q_ref)
+    JJt = J @ J.T + TRIM_TASK_DAMPING ** 2 * np.eye(6)
+    return J.T @ np.linalg.solve(JJt, xdot_des)
+
+
 def track_velocity(p_a, p_b, t, period):
     """Time derivative of track_setpoint, as a 6-D twist (angular part 0)."""
     ds = 0.5 * (2.0 * np.pi / period) * np.sin(2.0 * np.pi * t / period)
@@ -3063,6 +3099,16 @@ def run_impedance(args):
                             dyn=(M_cyc, Minv_cyc), tau_sing=tau_sing,
                             acc_max=acc_max, wrench_max=wrench_max,
                             xdot_des=xdot_des)
+                        # Track-mode friction feedforward on the REFERENCE
+                        # joint velocity (see friction_feedforward). Needs the
+                        # setpoint twist, so only with --track-vel-ff on.
+                        if (args.friction_ff > 0.0
+                                and args.interaction_mode == "track"
+                                and xdot_des is not None):
+                            tau = tau + friction_feedforward(
+                                reference_joint_velocity(model, q_ref,
+                                                         xdot_des)[:n],
+                                args.friction_ff)
 
                         # Null-space singularity escape: advance ONE column of
                         # the d(sigma_min)/dq finite difference per cycle and
@@ -3405,6 +3451,12 @@ def main():
                    default=[0.0, 0.10, 0.0], metavar=("DX", "DY", "DZ"),
                    help="[track] Point B = startup EE position + this offset "
                         "(m, base frame); oscillates A(startup) <-> B.")
+    p.add_argument("--friction-ff", type=float, default=0.0, metavar="S",
+                   help="[track] Joint-friction feedforward on the reference "
+                        "joint velocity, scaled by S (0 = off; 0.8 = 80%% of "
+                        "the identified friction). Never on measured velocity "
+                        "-- see friction_feedforward. j2/j3/j4/j6 use "
+                        "borrowed, not identified, values.")
     p.add_argument("--track-period", type=float, default=6.0,
                    help="[track] Seconds for one full A->B->A cycle.")
     p.add_argument("--free-hold-scale", type=float, default=1.0,
@@ -3760,6 +3812,10 @@ def main():
         if args.table_tool_z_min < TABLE_SURFACE_Z:
             p.error(f"--table-tool-z-min {args.table_tool_z_min:g} is below "
                     f"the table surface (z={TABLE_SURFACE_Z:g}).")
+
+    if not 0.0 <= args.friction_ff <= 1.0:
+        p.error("--friction-ff must be in [0, 1] (over-compensating "
+                "friction is the unstable direction)")
 
     # Gravity default depends on mode: 'model' (config-dependent g(q), valid
     # across the workspace) for cartesian, 'startup' (constant) for joint.
