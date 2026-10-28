@@ -576,7 +576,7 @@ class TableSafetyFilter:
                  wall, tool_hull=None, tool_k=0, tool_z_min=None,
                  observer_gain=0.0, q_min=None, q_max=None,
                  gravity_reserve=0.0, velocity_limits=False,
-                 reserve_every=8):
+                 reserve_every=8, tool_wall=None):
         self.model = model
         self.segs = segs
         self.link_radius = link_radius
@@ -584,12 +584,20 @@ class TableSafetyFilter:
         self.alpha = tuple(alpha)
         self.tau_max = tau_max
         self.wall = wall                      # dict(standoff, k_wall, d_wall, f_max)
+        # The tool's wall. In transit it shares the links' wide band -- the
+        # 20 N guarantee was measured with that, and a thin band costs it
+        # (sideways tool, needle pushed: -1.9 mm). During an insertion the
+        # needle must descend THROUGH its floor's band, and a 60 mm band would
+        # push back ~60 N at the target, so set_tool_z_min() swaps in a thin
+        # one together with the depth-stop floor.
+        self.tool_wall = wall if tool_wall is None else tool_wall
         self.tool_hull = tool_hull
         self.tool_seg = (model.segment_index(TOOL_HULL_LINK)
                          if tool_hull is not None else None)
         self.tool_k = min(tool_k, len(tool_hull)) if tool_hull is not None else 0
         self.tool_offset = ((tool_z_min - z_min)
                             if tool_hull is not None else 0.0)
+        self.tool_z_min = tool_z_min
         n = model.n
         self.q_min = Q_HARD_MIN[:n] if q_min is None else q_min
         self.q_max = Q_HARD_MAX[:n] if q_max is None else q_max
@@ -626,6 +634,32 @@ class TableSafetyFilter:
     def sent(self, tau):
         self._tau_sent = np.array(tau, dtype=float)
 
+    def set_tool_z_min(self, z, q, tool_wall=None):
+        """Move the tool's floor at runtime (e.g. to the insertion depth stop).
+
+        Refused (returns False, nothing changed) if any tool-hull vertex is
+        already below the new floor: switching would start the barrier in
+        violation and the projection would yank the tool upward. Lowering the
+        floor is always allowed. `tool_wall` (dict like `wall`) replaces the
+        tool's wall at the same moment -- pass a thin band with the insertion
+        floor and `self.wall` when going back to transit. Raises if there is
+        no tool hull, or the floor is below the table.
+        """
+        if self.tool_hull is None:
+            raise ValueError("no tool hull: nothing to set a floor for")
+        if z < TABLE_SURFACE_Z:
+            raise ValueError(f"tool floor {z:+.3f} is below the table "
+                             f"(z={TABLE_SURFACE_Z:+.3f})")
+        lowest = float(np.min(self.model.body_point_heights(
+            q, self.tool_seg, self.tool_hull)))
+        if z > self.tool_z_min and lowest < z:
+            return False
+        self.tool_z_min = z
+        self.tool_offset = z - self.z_min
+        if tool_wall is not None:
+            self.tool_wall = tool_wall
+        return True
+
     def apply(self, q, dq, tau, tau_g, dt, M=None, Minv=None):
         """Filter `tau` (which already contains `tau_g`). Returns (tau, info).
 
@@ -649,9 +683,17 @@ class TableSafetyFilter:
             mdl, q, dq, self.segs, self.link_radius, self.tool_hull,
             self.tool_seg, self.tool_k, self.tool_offset)
 
-        # Layer 1: virtual wall (felt resistance).
-        tau_wall, f_wall = table_wall_torque(z_wall, J_wall, dq, self.z_min,
-                                             **self.wall)
+        # Layer 1: virtual wall (felt resistance). Links and the lowest tool
+        # vertex each get their own band -- see tool_wall in __init__.
+        nl = len(self.segs)
+        tau_wall, f_links = table_wall_torque(z_wall[:nl], J_wall[:nl], dq,
+                                              self.z_min, **self.wall)
+        f_wall = f_links
+        if len(z_wall) > nl:
+            tau_t, f_tool = table_wall_torque(z_wall[nl:], J_wall[nl:], dq,
+                                              self.z_min, **self.tool_wall)
+            tau_wall = tau_wall + tau_t
+            f_wall = np.concatenate((f_links, f_tool))
         tau = tau + tau_wall
 
         # Layer 2: the HOCBF projection. Bias = the torque that buys no
@@ -1157,6 +1199,26 @@ class KinDynModel:
             dJdq_z[k] = twist.vel[2]
 
         return z, J_z, dJdq_z
+
+    def point_frame_jacobian(self, q, seg_index, p_local):
+        """(p, R, J) for a point fixed in link `seg_index` (e.g. the needle tip).
+
+        p: point position (base frame); R: the link's rotation; J: 6xN with
+        rows 0-2 the point's linear velocity and rows 3-5 the link's angular
+        velocity -- the Jacobian of the point, not of the link origin, so a
+        task-space controller can act at the tool tip 0.41 m past the flange.
+        """
+        ja = self._to_jnt(q)
+        frame, jac = self._scratch_frame, self._scratch_jac
+        self._fk.JntToCart(ja, frame, seg_index)
+        self._jac.JntToJac(ja, jac, seg_index)
+        R = np.array([[frame.M[i, j] for j in range(3)] for i in range(3)])
+        J = np.array([[jac[r, c] for c in range(self.n)] for r in range(6)])
+        r = R @ np.asarray(p_local, dtype=float)
+        p = np.array([frame.p[i] for i in range(3)]) + r
+        # v_p = v + w x r = v - r x w
+        J[:3] -= np.cross(r, J[3:].T).T
+        return p, R, J
 
     def gravity_terms(self, q, dq, joints, h=1e-5):
         """(g_j, dg_j/dq, d2g_j/dt2 at ddq=0) for the gravity-reserve barrier.

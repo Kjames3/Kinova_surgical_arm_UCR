@@ -65,3 +65,32 @@ def container_top_z(table_z, container_height, base_offset):
     if container_height <= 0 or base_offset < 0:
         raise ValueError('Container height must be positive and support offset nonnegative')
     return table_z + base_offset + container_height
+
+
+# Deepest a 45-degree insertion can go before the assembly meets the container
+# wall: the 42 mm inner radius clears to ~39 mm at 45 deg (CLAUDE.md).
+MAX_INSERT_DEPTH_45 = 0.039
+
+
+def insertion_tool_floor(rim_z, target_depth, margin=0.005,
+                         max_depth=MAX_INSERT_DEPTH_45):
+    """Table-barrier floor for the needle during the insertion descent (m).
+
+    The floor sits `margin` below the target tip, so the descent reaches its
+    target but an overshoot is stopped by the barrier before the assembly can
+    reach the container wall. Never below rim_z - max_depth. A target deeper
+    than max_depth is REFUSED, not clamped: the caller asked for a descent
+    that ends in the wall, and silently stopping short would hide that.
+    """
+    vals = (rim_z, target_depth, margin, max_depth)
+    if not all(math.isfinite(v) for v in vals):
+        raise ValueError('Nonfinite insertion floor parameter')
+    if target_depth <= 0 or margin < 0:
+        raise ValueError('Target depth must be positive and margin nonnegative')
+    if target_depth > max_depth:
+        raise ValueError(
+            f'Target {target_depth*1000:.1f} mm below the rim is past the '
+            f'{max_depth*1000:.0f} mm wall-clearance limit: the assembly would '
+            f'hit the container wall. Deepest allowed tip: '
+            f'z={rim_z - max_depth:+.3f} m.')
+    return max(rim_z - target_depth - margin, rim_z - max_depth)

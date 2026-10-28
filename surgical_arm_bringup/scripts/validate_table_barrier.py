@@ -38,6 +38,14 @@ rng = np.random.default_rng(3)
 fails = []
 
 
+def _raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
 def check(name, ok, detail=""):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name} {detail}")
     if not ok:
@@ -329,6 +337,8 @@ def push_point_jacobian(q, site):
 
 LINK_Z_MIN, TOOL_Z_MIN = 0.08, -0.02
 WALL = dict(standoff=0.06, k_wall=1200.0, d_wall=60.0, f_max=90.0)
+# Thin tool wall for the insertion phase only (set_tool_z_min swaps it in).
+TOOL_WALL = dict(standoff=0.005, k_wall=6000.0, d_wall=60.0, f_max=90.0)
 HAND_SPEED = 0.5                                   # m/s, see simulate_tool
 
 
@@ -472,6 +482,114 @@ for line in unhealthy:
     print("    degraded " + line)
 check(f"held every {RATED:g} N push", not bad, f"{len(bad)} failed")
 check("filter exact throughout", not unhealthy, f"{len(unhealthy)} runs")
+
+# --- 8. insertion depth stop -------------------------------------------------
+# During the insertion descent the tool floor moves up from the table to just
+# under the target tip (container_geometry.insertion_tool_floor), so the same
+# barrier stops an overshoot before the assembly reaches the container wall.
+print("\n8. Insertion depth stop (tool floor moved to target - 5 mm)")
+import container_geometry as cg                            # noqa: E402
+
+RIM = cg.container_top_z(-0.030, 0.086, 0.005)
+DEPTH = 0.030
+FLOOR = cg.insertion_tool_floor(RIM, DEPTH)
+TARGET_Z = RIM - DEPTH
+print(f"  rim z={RIM:+.3f}, target tip z={TARGET_Z:+.3f}, floor z={FLOOR:+.3f}")
+check("a 61 mm target (3 cm above the table) is refused",
+      _raises(lambda: cg.insertion_tool_floor(RIM, 0.061)))
+
+# A 45-deg insertion pose with the needle tip over the target and the tool
+# hull's lowest point being the tip, found by seeded search.
+axis = TIP / np.linalg.norm(TIP)
+
+
+def tip_z(q):
+    return float(tmodel.body_point_heights(q, tseg, TIP[None])[0])
+
+
+def insertion_pose(tip_height, seed=7):
+    r = np.random.default_rng(seed)
+    frame = tmodel._scratch_frame
+    probe = make_filter()
+    for _ in range(400000):
+        q = r.uniform(-2.2, 2.2, n)
+        if abs(tip_z(q) - tip_height) > 0.004:
+            continue
+        if np.min(tmodel.body_point_heights(q, tseg, hull)) < tip_z(q) - 1e-6:
+            continue                      # needle tip must be the lowest point
+        z, _, _ = tmodel.height_barrier_terms(q, np.zeros(n), tsegs)
+        if np.min(z - 0.055) < LINK_Z_MIN + 0.03:
+            continue
+        if np.any(np.abs(q) > imp.Q_HARD_MAX[:n] - 0.1):
+            continue
+        if np.any(np.abs(tmodel.gravity(q)[probe.reserve_joints])
+                  > 0.9 * probe.reserve_limit):
+            continue
+        tmodel._fk.JntToCart(tmodel._to_jnt(q), frame, tseg)
+        Rb = np.array([[frame.M[i, j] for j in range(3)] for i in range(3)])
+        if abs(np.degrees(np.arccos(np.clip(-(Rb @ axis)[2], -1, 1))) - 45) < 5:
+            return q
+    raise RuntimeError("no 45-deg insertion pose")
+
+
+q_above = insertion_pose(RIM + 0.02)          # needle 2 cm above the rim
+q_deep = insertion_pose(FLOOR - 0.004)         # needle already below the floor
+f8 = make_filter()
+check("raising the floor is refused while the needle is below it",
+      f8.set_tool_z_min(FLOOR, q_deep) is False and f8.tool_z_min == TOOL_Z_MIN)
+check("raising the floor is accepted with the needle above it",
+      f8.set_tool_z_min(FLOOR, q_above, tool_wall=TOOL_WALL)
+      and f8.tool_z_min == FLOOR and f8.tool_wall is TOOL_WALL)
+
+# The wall must not fight the descent: at the target, 5 mm above the floor,
+# the tool wall (10 mm band) is the only spring acting on the needle.
+_, f_tgt = table_wall_torque(np.array([TARGET_Z - FLOOR + LINK_Z_MIN]),
+                             np.zeros((1, n)), np.zeros(n), LINK_Z_MIN,
+                             **TOOL_WALL)
+_, f_old = table_wall_torque(np.array([TARGET_Z - FLOOR + LINK_Z_MIN]),
+                             np.zeros((1, n)), np.zeros(n), LINK_Z_MIN, **WALL)
+print(f"  wall push at the target: {float(f_tgt[0]):.1f} N with the tool wall, "
+      f"{float(f_old[0]):.1f} N if the tool shared the links' 60 mm wall")
+check("insertion tool wall pushes back < 1 N at the target",
+      float(f_tgt[0]) < 1.0)
+check("going back to transit restores the shared wall",
+      f8.set_tool_z_min(TOOL_Z_MIN, q_above, tool_wall=f8.wall)
+      and f8.tool_wall is f8.wall)
+f8.set_tool_z_min(FLOOR, q_above, tool_wall=TOOL_WALL)
+
+# Overshoot: drive the needle down along its own axis with a commanded 15 N
+# (a controller that has lost its depth target), starting above the rim.
+# The barrier alone must stop it at the floor.
+f8.reset()
+q = q_above.copy()
+dq = np.zeros(n)
+lowest = np.inf
+for _ in range(4000):
+    tau_g = tmodel.gravity(q)
+    Jv = push_point_jacobian(q, TIP)
+    tmodel._fk.JntToCart(tmodel._to_jnt(q), tmodel._scratch_frame, tseg)
+    Rb = np.array([[tmodel._scratch_frame.M[i, j] for j in range(3)]
+                   for i in range(3)])
+    down_axis = Rb @ axis                       # needle direction, world frame
+    tau_cmd = tau_g + Jv.T @ (15.0 * down_axis) - 3.0 * imp.KD_GLOBAL[:n] * dq
+    tau, info = f8.apply(q, dq, tau_cmd, tau_g, 1e-3)
+    tau = np.clip(tau, -imp.TAU_MAX[:n], imp.TAU_MAX[:n])
+    f8.sent(tau)
+    lowest = min(lowest, float(np.min(
+        tmodel.body_point_heights(q, tseg, hull))))
+    for _ in range(10):
+        ddq = np.linalg.solve(tmodel.mass(q), tau - tmodel.coriolis(q, dq)
+                              - tmodel.gravity(q))
+        dq = dq + ddq * 1e-4
+        q = q + dq * 1e-4
+print(f"  15 N overshoot along the needle: lowest tool point "
+      f"{(lowest - FLOOR)*1000:+.2f} mm vs the floor, "
+      f"{(lowest - (RIM - cg.MAX_INSERT_DEPTH_45))*1000:+.2f} mm vs the "
+      f"wall-contact depth")
+check("overshoot stopped at the floor", lowest > FLOOR - 1e-3,
+      f"{(lowest - FLOOR)*1000:+.2f} mm")
+check("overshoot never reaches wall-contact depth",
+      lowest > RIM - cg.MAX_INSERT_DEPTH_45)
 
 print("\n" + "=" * 60)
 if fails:
