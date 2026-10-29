@@ -90,6 +90,13 @@ def build(sc, robot_ip, tool, python):
     key, title, _, base, params, torque, _ = sc
     cmd = [python, IMPEDANCE, "--robot-ip", robot_ip, "--tool", tool] + base
     for name, label, default, cast in params:
+        if name == "table-z-min" and tool != "thesis_ee":
+            # Only thesis_ee has a tool hull in impedance.py; any other tool is
+            # unguarded below the flange, so raise the flange floor instead.
+            # 0.30 = table (-0.03) + 2F-140 length (~0.25) + ~8 cm margin.
+            print(f"    {tool}: no tool hull -- barrier guards the FLANGE only; "
+                  "default raised to 0.30 so the fingers clear the table")
+            default = 0.30
         val = ask(label, default, cast)
         if name == "table-standoff" and val <= 0:
             print("    standoff 0 disables the wall (CBF alone penetrates); using 0.06")
