@@ -37,6 +37,7 @@ install(PROGRAMS
   scripts/test_pen_tip_offset.py
   scripts/calibrate_camera_offsets.py
   scripts/calibration_for_cameras.py
+  scripts/arm_kinematics.py
   scripts/impedance.py
   scripts/curobo_planner_protocol.py
   scripts/curobo_planner_server.py

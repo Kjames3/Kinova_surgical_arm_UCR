@@ -88,7 +88,7 @@ class ArmKinematics:
     """FK / Jacobian / per-link positions / damped least-squares IK."""
 
     def __init__(self, urdf, base_link="base_link", tip_link="assembly_tip"):
-        from impedance import KinDynModel
+        from arm_kinematics import KinDynModel
         self.model = KinDynModel(urdf, base_link, tip_link)
         self.kdl = self.model.kdl
         self.n = self.model.n
