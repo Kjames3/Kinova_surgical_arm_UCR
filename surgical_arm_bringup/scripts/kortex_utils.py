@@ -41,23 +41,10 @@ MOVEIT_ERROR_CODES = {
 def get_error_string(error_code_val: int) -> str:
     return MOVEIT_ERROR_CODES.get(error_code_val, f"UNKNOWN_ERROR_CODE_{error_code_val}")
 
-def quat_multiply(q1, q2):
-    """Hamilton product of two (x,y,z,w) tuples."""
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return (
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-    )
+# Re-exported for `from kortex_utils import *` users; defined once in
+# insertion_geometry (ROS-free).
+from insertion_geometry import quat_multiply, rotate_vector_by_quat  # noqa: F401
 
-def rotate_vector_by_quat(v, q):
-    """Rotate vector v=(x,y,z) by unit quaternion q=(x,y,z,w)."""
-    qv  = (v[0], v[1], v[2], 0.0)
-    qc  = (-q[0], -q[1], -q[2], q[3])
-    res = quat_multiply(quat_multiply(q, qv), qc)
-    return res[0], res[1], res[2]
 
 def validate_trajectory(traj: RobotTrajectory, label: str, logger, display_traj_pub=None, real_robot: bool = False) -> bool:
     """

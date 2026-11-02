@@ -31,6 +31,7 @@ install(PROGRAMS
   scripts/extract_approach_fixture.py
   scripts/view_approach_benchmark.py
   scripts/container_geometry.py
+  scripts/insertion_geometry.py
   scripts/setup_planning_scene.py
   scripts/test_pen_tip_offset.py
   scripts/calibrate_camera_offsets.py
