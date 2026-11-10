@@ -42,6 +42,7 @@ install(PROGRAMS
   scripts/curobo_planner_protocol.py
   scripts/curobo_planner_server.py
   scripts/curobo_planning_preview.py
+  scripts/curobo_approach_execution.py
   scripts/curobo_planner_client.py
   scripts/test_curobo_wiring.py
   scripts/gamepad_teleop.py
