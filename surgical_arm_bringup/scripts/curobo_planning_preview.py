@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Read-only cuRobo approach preview. No motion/action or scene-write APIs."""
+"""cuRobo approach preview, plus the M2 guarded approach-only execution.
+
+Planning-only unless BOTH execute_motion:=true and curobo_execute_approach:=true
+(which in turn requires step_by_step:=true). Execution sends only the validated
+Phase 0 approach; the motion itself lives in curobo_approach_execution.py so
+this module stays motion-free. No scene-write APIs, no recovery or fallback.
+"""
 import json
 import math
 from pathlib import Path
@@ -8,7 +14,17 @@ from datetime import datetime, timezone
 
 
 def check_preview_parameters(params):
-    for flag in ('execute_motion', 'teach_mode', 'replay_mode', 'use_action_server',
+    if params.get('curobo_execute_approach', False):
+        if not params.get('execute_motion', False):
+            raise ValueError('curobo_execute_approach requires execute_motion:=true')
+        if not params.get('step_by_step', False):
+            raise ValueError('curobo_execute_approach requires step_by_step:=true (operator confirmation)')
+        if not params.get('real_robot', False):
+            raise ValueError('curobo_execute_approach requires real_robot:=true')
+    elif params.get('execute_motion', False):
+        raise ValueError('cuRobo approach preview requires execute_motion:=false '
+                         '(or curobo_execute_approach:=true for the guarded approach)')
+    for flag in ('teach_mode', 'replay_mode', 'use_action_server',
                  'direct_to_angled_hover', 'use_current_orientation'):
         if params.get(flag, False):
             raise ValueError(f'cuRobo approach preview requires {flag}:=false')
@@ -48,7 +64,7 @@ def scene_geometry_signature(scene):
         'padding':data.get('link_padding',[]), 'scale':data.get('link_scale',[])},sort_keys=True)
 
 
-def run_preview(node):
+def run_preview(node, execute=False):
     from rcl_interfaces.srv import GetParameters
     from moveit_msgs.srv import GetPlanningScene
     from moveit_msgs.msg import DisplayTrajectory, PlanningSceneComponents
@@ -61,7 +77,8 @@ def run_preview(node):
     check_preview_parameters(params)
     out = Path(params['curobo_result_dir']).expanduser()/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     out.mkdir(parents=True, mode=0o700)
-    node.get_logger().info(f'cuRobo PLANNING ONLY; artifacts: {out}')
+    node.get_logger().info(('cuRobo GUARDED APPROACH EXECUTION' if execute else 'cuRobo PLANNING ONLY')
+                           + f'; artifacts: {out}')
 
     def call(client, request):
         if not client.wait_for_service(timeout_sec=5.):
@@ -106,6 +123,21 @@ def run_preview(node):
                   'tilt_deg':params['insertion_angle_deg'], 'azimuth_deg':params['insertion_azimuth_deg'],
                   'tangential':params['azimuth_mode']=='tangential' or (not params['azimuth_mode'] and params['auto_azimuth']),
                   'quaternion_xyzw':[params['vertical_quat_'+a] for a in 'xyzw']})
+    def check_unchanged():
+        # The arm must still be where the plan starts, and the scene must still
+        # be the one the plan was validated against; never act on an old world.
+        sample_time, current = node._preview_joint_sample
+        if time.monotonic()-sample_time > .5:
+            raise ValueError('Joint state stale after planning')
+        for n, q in start.items():
+            delta = current[n]-q
+            if n in ('joint_1','joint_3','joint_5','joint_7'): delta = math.remainder(delta, 2*math.pi)
+            if abs(delta) > .01: raise ValueError('Arm moved during planning; preview rejected')
+        latest_scene = call(node._scene_snapshot_cli, req).scene
+        if scene_geometry_signature(message_to_ordereddict(latest_scene)) != scene_geometry_signature(request['scene']):
+            raise ValueError('Planning scene changed during solve; retry with a fresh sidecar')
+        return max(abs(math.remainder(current[n]-q, 2*math.pi)) for n,q in start.items())
+
     (out/'request.json').write_text(json.dumps(request, indent=2, allow_nan=False)+'\n')
     client = CuroboPlannerClient(params['curobo_socket'], timeout=180.)
     response = client._request(request)
@@ -114,21 +146,9 @@ def run_preview(node):
         raise ValueError(response.get('error') or 'Sidecar did not return a validated cuRobo plan')
     validate_upright_response(response, params['curobo_max_tilt_deg'])
     traj = client.to_robot_trajectory(response)
-    # Display only if the stationary arm still agrees with the captured start.
-    sample_time, current = node._preview_joint_sample
-    if time.monotonic()-sample_time > .5:
-        raise ValueError('Joint state stale after planning')
-    for n, q in start.items():
-        delta = current[n]-q
-        if n in ('joint_1','joint_3','joint_5','joint_7'): delta = math.remainder(delta, 2*math.pi)
-        if abs(delta) > .01: raise ValueError('Arm moved during planning; preview rejected')
-    # Reject a scene update during the solve; never display an old-world plan
-    # as if it were validated against the newly returned world.
-    latest_scene = call(node._scene_snapshot_cli, req).scene
-    if scene_geometry_signature(message_to_ordereddict(latest_scene)) != scene_geometry_signature(request['scene']):
-        raise ValueError('Planning scene changed during solve; retry with a fresh sidecar')
+    start_change = check_unchanged()
     (out/'preview_status.json').write_text(json.dumps({'passed':True, 'motion_sent':False,
-        'start_max_change_rad':max(abs(math.remainder(current[n]-q, 2*math.pi)) for n,q in start.items()),
+        'start_max_change_rad':start_change,
         'scene_unchanged':True}, indent=2)+'\n')
     display = DisplayTrajectory(); display.model_id = 'gen3'
     display.trajectory_start = scene.robot_state
@@ -141,6 +161,10 @@ def run_preview(node):
     node._curobo_display_pub.publish(display)
     node._traj_pub.publish(traj)
     node.get_logger().info('cuRobo preview PASS: '+json.dumps(response['meta']))
-    node.get_logger().info('Display published; no motion sent. Holding display publisher for 5 seconds.')
-    time.sleep(5.)
-    return response
+    if not execute:
+        node.get_logger().info('Display published; no motion sent. Holding display publisher for 5 seconds.')
+        time.sleep(5.)
+        return response
+    from curobo_approach_execution import execute_approach
+    return execute_approach(node, response, traj, start, params, out, check_unchanged)
+

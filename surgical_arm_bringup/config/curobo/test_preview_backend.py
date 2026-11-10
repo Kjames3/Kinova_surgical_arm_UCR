@@ -117,6 +117,11 @@ class PreviewTests(unittest.TestCase):
         preview=(Path(__file__).resolve().parents[2]/'scripts'/'curobo_planning_preview.py').read_text()
         for forbidden in ('send_goal','_execute_fjt','_execute_moveit','_recovery_return','_run_phases'):
             self.assertNotIn(forbidden,preview)
+        # M2: the one motion path may send the approach and nothing else.
+        execution=(Path(__file__).resolve().parents[2]/'scripts'/'curobo_approach_execution.py').read_text()
+        self.assertEqual(execution.count('node._execute_fjt('),1)
+        for forbidden in ('send_goal','_execute_moveit','_recovery_return','_run_phases','_execute_kortex'):
+            self.assertNotIn(forbidden,execution)
 
 
 if __name__=='__main__': unittest.main()

@@ -455,6 +455,9 @@ class AngledInserter(Node):
         self.declare_parameter("curobo_max_tilt_deg", 15.0)
         self.declare_parameter("curobo_socket", "/tmp/curobo_planner.sock")
         self.declare_parameter("curobo_result_dir", "~/curobo_planning_runs")
+        # M2: opt-in execution of the validated cuRobo Phase 0 approach ONLY.
+        # Needs execute_motion, step_by_step and real_robot all true.
+        self.declare_parameter("curobo_execute_approach", False)
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
         # True = action server (wait for goals on /insert_container).
@@ -2164,9 +2167,10 @@ class AngledInserter(Node):
     def _run_impl(self, goal_handle, pub_fb):
         if self._planner_backend == "curobo":
             from curobo_planning_preview import run_preview
-            if not goal_handle.request.dry_run:
-                raise ValueError("cuRobo is planning-only; motion requests are rejected")
-            return run_preview(self)
+            execute = not goal_handle.request.dry_run
+            if execute and not self.get_parameter("curobo_execute_approach").value:
+                raise ValueError("cuRobo is planning-only unless curobo_execute_approach:=true")
+            return run_preview(self, execute=execute)
         record = (self.get_parameter("record_bag").value
                   and not goal_handle.request.dry_run)
         bag = self._start_bag() if record else None
@@ -2860,6 +2864,11 @@ def main(args=None):
             sys.exit(1)
         _interrupted.set()
         node._run_done.set()
+        # cuRobo has no recovery motion, so Ctrl+C must stop the arm itself:
+        # cancel the in-flight FJT goal (the spin thread delivers it).
+        gh = node._active_gh if node._planner_backend == "curobo" else None
+        if gh is not None:
+            gh.cancel_goal_async()
 
     signal.signal(signal.SIGINT, _sigint)
 
