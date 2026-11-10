@@ -209,5 +209,13 @@ All 152 archived planned trajectories pass; the closest approach was 5.3 mm,
 the parked start just mentioned. Link heights agree with the impedance
 barrier's height_barrier_terms to 1e-6 m on 50 random poses.
 
+Insertion tip floor (same day): for the insertion-depth phases only
+(`INSERTION_DEPTH_LABELS`: Phase4*, Phase6a*), the tip vertex alone may go down
+to (target height above table - `table_check_tip_allowance`, 5 mm). Every other
+hull vertex and every link keeps the 10 mm margin. At startup, before the home
+move, a target leaving less than `table_check_tip_min_floor` (3 mm) is refused.
+At the default 30 mm depth the target is 61 mm above the table, so the floor is
+56 mm: not binding today.
+
 Not hardware-run. On REAL-1, `trajectory_table_check.py` needs the same
 manual install-tree symlink as the other new modules.

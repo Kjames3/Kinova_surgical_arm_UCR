@@ -20,7 +20,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from trajectory_table_check import (TableClearanceChecker, TableCheckRejected,  # noqa: E402
-                                    TABLE_Z, LINKS)
+                                    TABLE_Z, LINKS, target_tip_floor)
 
 URDF = (HERE.parent / "config" / "curobo" / "gen3_surgical.urdf").read_text()
 HOME = np.array([0.0, -0.3049, -3.1416, -1.6607, 0.0, -1.7928, -0.0006])
@@ -151,6 +151,74 @@ class Checker(unittest.TestCase):
             np.testing.assert_allclose(mine, z_imp - imp.CAPSULE_RADIUS - TABLE_Z, atol=1e-6)
 
 
+class TipFloor(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.c = TableClearanceChecker(URDF, "thesis_ee")
+
+    @classmethod
+    def tip_model(cls):
+        if not hasattr(cls, "_tip"):
+            from arm_kinematics import KinDynModel
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False) as f:
+                f.write(URDF)
+            try:
+                cls._tip = KinDynModel(f.name, "base_link", "assembly_tip")
+            finally:
+                os.unlink(f.name)
+        return cls._tip
+
+    def lower_until(self, clear):
+        """Bring the tip straight down, tool kept vertical (resolved-rate IK),
+        until it is `clear` above the table -- the insertion's geometry."""
+        m, q = self.tip_model(), HOME.copy()
+        for _ in range(5000):
+            tip = self.c._split(q)[2]
+            if tip <= clear:
+                return q
+            step = min(0.002, tip - clear + 1e-4)
+            J = m.jacobian(q)
+            q = q + np.linalg.pinv(J) @ np.array([0, 0, -step, 0, 0, 0])
+        self.fail("could not lower the tip")
+
+    def test_tip_vertex_is_found(self):
+        self.assertIsNotNone(self.c.tip_idx)
+        np.testing.assert_allclose(self.c.hull[self.c.tip_idx], (0.108, -0.008, -0.411))
+
+    def test_tip_may_reach_its_floor_but_not_below(self):
+        q6 = self.lower_until(0.006)                     # tip 6 mm above the table
+        with self.assertRaises(TableCheckRejected):
+            self.c.check(J, ramp(HOME, q6))              # no floor: 10 mm margin applies
+        rep = self.c.check(J, ramp(HOME, q6), tip_floor=0.005)
+        self.assertEqual(rep["tip_floor_m"], 0.005)
+        with self.assertRaisesRegex(TableCheckRejected, "tool_tip"):
+            self.c.check(J, ramp(HOME, q6), tip_floor=0.007)
+
+    def test_floor_never_raises_the_limit(self):
+        q = self.lower_until(0.012)
+        self.c.check(J, ramp(HOME, q), tip_floor=0.05)  # capped at the 10 mm margin
+
+    def test_other_hull_vertices_keep_the_margin(self):
+        # Tip lifted out of the way, rest of the tool driven low: the floor
+        # must not help, because only the tip vertex is relaxed.
+        rng = np.random.default_rng(5)
+        for _ in range(4000):
+            q = HOME + rng.uniform(-2.0, 2.0, 7)
+            b, name, tip = self.c._split(q)
+            if name == "tool_hull" and 0.0 < b < 0.008 and tip > 0.02:
+                with self.assertRaisesRegex(TableCheckRejected, "tool_hull"):
+                    self.c.check(J, [HOME, q], tip_floor=0.0)
+                return
+        self.skipTest("no pose with a low non-tip vertex found")
+
+    def test_target_tip_floor(self):
+        top = TABLE_Z + 0.005 + 0.086                    # board + container
+        self.assertAlmostEqual(target_tip_floor(top - 0.030, TABLE_Z, 0.005, 0.003), 0.056)
+        with self.assertRaisesRegex(TableCheckRejected, "before any motion"):
+            target_tip_floor(TABLE_Z + 0.006, TABLE_Z, 0.005, 0.003)
+
+
 class InsertionWiring(unittest.TestCase):
     """Drive insertion.py's real execute functions with a stub node: a rejected
     trajectory must never be published or sent to the controller."""
@@ -168,7 +236,7 @@ class InsertionWiring(unittest.TestCase):
                    if isinstance(v, type) and hasattr(v, "_execute_fjt_inner"))
         self.cls = cls
         params = {"table_check": True, "table_check_tool": "thesis_ee",
-                  "table_check_margin": 0.01}
+                  "table_check_margin": 0.01, "table_z": TABLE_Z}
         node = MagicMock()
         node.get_parameter = lambda n: type("P", (), {"value": params[n]})()
         node._robot_description_xml = URDF
@@ -219,6 +287,41 @@ class InsertionWiring(unittest.TestCase):
         self.node._fjt_cli.server_is_ready.return_value = False
         self.cls._execute_fjt_inner(self.node, self.bad, "t", 1.0)
         self.node._traj_pub.publish.assert_called_once()
+
+    def test_floor_only_for_insertion_labels(self):
+        from unittest.mock import patch
+        import trajectory_table_check as ttc
+        self.node._insert_tip_floor = 0.04
+        seen = {}
+        real = ttc.check_joint_trajectory
+
+        def spy(checker, jt, tip_floor=None):
+            seen["floor"] = tip_floor
+            return real(checker, jt, tip_floor)
+        with patch.object(ttc, "check_joint_trajectory", spy):
+            self.cls._table_check_ok(self.node, self.good, "Phase4b_insert")
+            self.assertEqual(seen["floor"], 0.04)
+            self.cls._table_check_ok(self.node, self.good, "Phase0_approach")
+            self.assertIsNone(seen["floor"])
+            self.cls._table_check_ok(self.node, self.good, "Phase3_tip_rotate")
+            self.assertIsNone(seen["floor"])
+
+    def test_low_target_refused_before_any_motion(self):
+        import types
+        vals = dict(transit_velocity_scaling=0.15, max_velocity_scaling=0.15, insert_speed_mps=0.01,
+                    insert_rot_speed_dps=5., blend_transit=True, axis_speed_mps=0.02,
+                    insert_slow_zone_m=0.01, real_robot=False, world_frame="world",
+                    tip_link="assembly_tip", ee_link="end_effector_link", move_group_name="manipulator",
+                    table_z=TABLE_Z, container_height=0.086, approach_clearance=0.18,
+                    return_to_start=True, post_insert_wait=0., table_check=True,
+                    container_base_offset=0.005, target_depth_mm=85.0,   # tip 6 mm above table
+                    table_check_tip_allowance=0.005, table_check_tip_min_floor=0.003)
+        self.node.get_parameter = lambda n: types.SimpleNamespace(value=vals[n])
+        gh = types.SimpleNamespace(request=types.SimpleNamespace(dry_run=False, hover_above_top=0.03))
+        with self.assertRaisesRegex(TableCheckRejected, "before any motion"):
+            self.cls._run_phases(self.node, gh, lambda *a: None)
+        for m in ("_plan", "_execute_moveit", "_execute_fjt", "_plan_sequence", "_blended_transit"):
+            getattr(self.node, m).assert_not_called()
 
     def test_kortex_lin_refused_while_check_on(self):
         self.node._motion_blocked = lambda label: False

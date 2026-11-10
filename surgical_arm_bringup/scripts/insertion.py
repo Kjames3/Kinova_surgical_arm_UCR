@@ -183,6 +183,14 @@ def create_kortex_client(ip, user, pw):
 # Gen3 7-DOF position limits of the bounded joints [rad]; 1/3/5/7 are continuous.
 
 
+# Phases that put the tip at insertion depth; only these get the tip floor.
+INSERTION_DEPTH_LABELS = frozenset({
+    "Phase4_angled_descent", "Phase4a_axis_approach", "Phase4a_guard_retreat",
+    "Phase4b_insert", "Phase4b_fail_extract", "Phase4b_fail_retreat",
+    "Phase6a_extract", "Phase6a_axis_retreat", "Phase6a_angled_ascent",
+})
+
+
 def joint_goal_from_response(resp, arm_joint_names, continuous=()):
     """Final joints of a planner response, as a list in arm_joint_names order
     (the form _build_pilz_ptp_joints takes). Continuous joints are wrapped into
@@ -482,6 +490,11 @@ class AngledInserter(Node):
         self.declare_parameter("table_check", True)
         self.declare_parameter("table_check_tool", "thesis_ee")   # thesis_ee | none
         self.declare_parameter("table_check_margin", 0.01)       # m above the table
+        # Insertion-depth phases only: the TIP vertex may go as low as
+        # (target height above table - allowance); all else keeps the margin.
+        # A target leaving less than min_floor under that is refused up front.
+        self.declare_parameter("table_check_tip_allowance", 0.005)
+        self.declare_parameter("table_check_tip_min_floor", 0.003)
         self.declare_parameter("pilz_joint_goal_file", "")
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
@@ -537,6 +550,7 @@ class AngledInserter(Node):
         
         self._robot_description_xml = None
         self._table_checker = None
+        self._insert_tip_floor = None
         c_joints, m_vel, h_joints = get_robot_info(self)
         self.continuous_joints = c_joints if c_joints else {"joint_1", "joint_3", "joint_5", "joint_7"}
         self.home_joints = h_joints if h_joints else {
@@ -1090,7 +1104,8 @@ class AngledInserter(Node):
                                    "refusing (set table_check:=false to override)")
             self._table_checker = TableClearanceChecker(
                 self._robot_description_xml, self.get_parameter("table_check_tool").value,
-                margin=self.get_parameter("table_check_margin").value)
+                margin=self.get_parameter("table_check_margin").value,
+                table_z=self.get_parameter("table_z").value)
         return self._table_checker
 
     def _table_check_ok(self, traj, label):
@@ -1098,13 +1113,17 @@ class AngledInserter(Node):
         if not self.get_parameter("table_check").value:
             return True
         from trajectory_table_check import check_joint_trajectory, TableCheckRejected
+        floor = self._insert_tip_floor if label in INSERTION_DEPTH_LABELS else None
         try:
-            rep = check_joint_trajectory(self._get_table_checker(), traj.joint_trajectory)
+            rep = check_joint_trajectory(self._get_table_checker(), traj.joint_trajectory,
+                                         tip_floor=floor)
         except TableCheckRejected as e:
             self.get_logger().error(f"  [{label}] {e}")
             self._mark_phase(f"table_check_reject:{label}")
             return False
         note = " (started inside margin; not getting closer)" if rep["started_inside_margin"] else ""
+        if floor is not None:
+            note += f" [tip floor {floor * 1000:.0f} mm]"
         self.get_logger().info(
             f"  [table check] {label}: min clearance {rep['min_clear_m'] * 1000:.0f} mm "
             f"({rep['worst']['body']}){note}")
@@ -2322,6 +2341,21 @@ class AngledInserter(Node):
         approach   = self.get_parameter("approach_clearance").value
         ret        = self.get_parameter("return_to_start").value
         post_wait  = self.get_parameter("post_insert_wait").value
+
+        # Up-front table check of the insertion target, BEFORE any motion
+        # (the home move is next). Target height depends only on parameters.
+        self._insert_tip_floor = None
+        if self.get_parameter("table_check").value:
+            from trajectory_table_check import target_tip_floor
+            target_z = container_top_z(
+                table_z, cont_h, self.get_parameter("container_base_offset").value) \
+                - self.get_parameter("target_depth_mm").value / 1000.0
+            self._insert_tip_floor = target_tip_floor(
+                target_z, table_z, self.get_parameter("table_check_tip_allowance").value,
+                self.get_parameter("table_check_tip_min_floor").value)
+            self.get_logger().info(
+                f"  [table check] target {(target_z - table_z) * 1000:.0f} mm above the table; "
+                f"insertion tip floor {self._insert_tip_floor * 1000:.0f} mm")
 
         p = dict(group_name=group_name, vel_scale=vel_scale,
                  execute=execute, world_frame=world_frame,
