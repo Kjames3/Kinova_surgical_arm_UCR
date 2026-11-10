@@ -159,7 +159,9 @@ upright (j2 = 1.30 rad). Artifacts: `~/robot-logs/2026-11-09/curobo_m2_motionles
 | Pilz pose-goal dry run + plan dump | PASS; later Phase 3 dry-run planning fails -31 (planned from the parked pose; unrelated) |
 | Pilz joint-goal dry run | PASS after two fixes (below) |
 
-Fair comparison: same start, end tips 0.0 mm apart.
+Fair comparison: same start, end tips 0.0 mm apart. Three cuRobo previews from this
+start were identical (sd 0.000 on every metric): in this setup the sidecar is
+deterministic, so repeat trials are not needed.
 
 | | Pilz pose goal | Pilz joint goal | cuRobo |
 |---|---|---|---|
