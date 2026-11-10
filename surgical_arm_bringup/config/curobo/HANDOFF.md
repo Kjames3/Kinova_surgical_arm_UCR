@@ -140,3 +140,51 @@ later Pilz pivot must use the same azimuth, so never mix `search` with cuRobo.
    ```
    Restart the sidecar whenever the speed scale changes. Pull logs the same day
    with /pull-run.
+
+## Motionless REAL-1 test — 2026-11-09 21:30 (bringup up, arm parked, no motion sent)
+
+The branch scripts were synced to `~/ros2_kortex_ws` with backups (tag
+`pre_curobo_m2_20261109_212824`). `insertion_geometry.py` and
+`curobo_approach_execution.py` were symlinked into REAL-1's install tree by
+hand, because REAL-1's CMakeLists.txt has uncommitted local edits and was not
+overwritten. Scene: `~/insertion_scenes/curobo_preview_20261009/scene.json`,
+the virtual container at (0.3485, -0.1060). The parked start was far from
+upright (j2 = 1.30 rad). Artifacts: `~/robot-logs/2026-11-09/curobo_m2_motionless/`.
+
+| test | result |
+|---|---|
+| cuRobo preview, live | PASS: 31.1 s = ready transition 22.5 s + upright approach 8.5 s, approach tilt 1.25 deg |
+| execution gate on that live plan | PASS: vel ratio 0.99, acc 0.77, start err 3e-7 rad |
+| `execute_motion:=true` without `curobo_execute_approach` | rejected at startup |
+| Pilz pose-goal dry run + plan dump | PASS; later Phase 3 dry-run planning fails -31 (planned from the parked pose; unrelated) |
+| Pilz joint-goal dry run | PASS after two fixes (below) |
+
+Fair comparison: same start, end tips 0.0 mm apart.
+
+| | Pilz pose goal | Pilz joint goal | cuRobo |
+|---|---|---|---|
+| duration | 5.6 s | 17.7 s | 31.1 s |
+| tip path | 0.52 m | 3.91 m | 1.81 m |
+| joint path | 4.69 rad | 12.95 rad | 16.74 rad |
+| peak joint vel | **0.615** | 0.183 | 0.181 rad/s |
+| max tool tilt | 33.8 deg | **140.8 deg** | 70.9 deg (ready stage); 1.25 deg in approach |
+| tool-container clearance (AABB) | 0.165 | 0.237 | 0.183 m |
+
+Reading:
+- **Pilz at transit scaling 0.15 runs 3.4x faster in joint space than cuRobo**
+  (0.615 vs 0.18 rad/s). Its PTP respects joint scaling (the joint-goal run peaks
+  at 0.183), so the excess comes from the blended LIN segment, which is limited in
+  Cartesian space. "Match Pilz" therefore means joint vel scale ~0.45, not 0.15.
+- cuRobo is slower and longer here mostly because `skip_home_move:=false` routes
+  it through the ready pose first. A Pilz dry run does not plan its home move
+  (the home move runs only on execute), so the pose-goal Pilz row omits roughly
+  15 s of home move. A fully fair end-to-end comparison needs that home move
+  counted, or cuRobo run with `skip_home_move:=true` from an upright start.
+- A Pilz PTP to the same joints turns the tool 140.8 deg (past horizontal) on
+  the way. That is the case for an upright-constrained planner.
+
+Bugs found and fixed during this test: the joint goal was passed as a dict
+(Pilz needs a list), and the joint goal kept cuRobo's winding (joint_3 = 4.095)
+→ Pilz -2. It is now wrapped to (-pi, pi], so joint_3 turns 3.19 rad the other
+way to the same pose. The `pilz_joint_goal_file` + execute rejection moved to
+startup; before, it fired only after the home move.

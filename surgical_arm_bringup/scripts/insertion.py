@@ -183,6 +183,19 @@ def create_kortex_client(ip, user, pw):
 # Gen3 7-DOF position limits of the bounded joints [rad]; 1/3/5/7 are continuous.
 
 
+def joint_goal_from_response(resp, arm_joint_names, continuous=()):
+    """Final joints of a planner response, as a list in arm_joint_names order
+    (the form _build_pilz_ptp_joints takes). Continuous joints are wrapped into
+    (-pi, pi]: cuRobo keeps the arm's winding (e.g. joint_3 = 4.1 rad), which
+    Pilz rejects with error -2. Same pose; that joint may turn the other way."""
+    last = resp["points"][-1]["positions"]
+    out = []
+    for n in arm_joint_names:
+        q = float(last[resp["joint_names"].index(n)])
+        out.append(math.remainder(q, 2 * math.pi) if n in continuous else q)
+    return out
+
+
 def rank_azimuth_candidates(start, solved, joint_names, continuous_joints,
                             limits=None, limit_margin=0.10):
     """Order approach azimuths by how little the arm has to move.
@@ -540,6 +553,12 @@ class AngledInserter(Node):
         self._planner_backend = self.get_parameter("planner_backend").value.lower()
         if self._planner_backend not in ("pilz", "curobo"):
             raise ValueError("planner_backend must be pilz or curobo")
+        # Reject at startup, before any motion (the home move runs before Phase 0).
+        # Action goals carry their own dry_run flag, so refuse that mode outright.
+        if self.get_parameter("pilz_joint_goal_file").value and (
+                self.get_parameter("execute_motion").value
+                or self.get_parameter("use_action_server").value):
+            raise ValueError("pilz_joint_goal_file is for standalone dry-run comparison only")
         if self._planner_backend == "curobo":
             from curobo_planning_preview import check_preview_parameters
             check_preview_parameters({n: p.value for n, p in self._parameters.items()})
@@ -2401,8 +2420,7 @@ class AngledInserter(Node):
             import json
             with open(os.path.expanduser(goal_file)) as f:
                 cu = json.load(f)
-            last = cu["points"][-1]["positions"]
-            search_ready = {n: last[cu["joint_names"].index(n)] for n in self.arm_joint_names}
+            search_ready = joint_goal_from_response(cu, self.arm_joint_names, self.continuous_joints)
             self.get_logger().info(f"  Phase 0 joint goal taken from {goal_file}")
 
         hover_xyz, (axis_x, axis_y, axis_z), D = insertion_axis_geometry(

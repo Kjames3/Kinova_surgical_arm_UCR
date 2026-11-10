@@ -117,6 +117,25 @@ class Params(unittest.TestCase):
                 check_preview_parameters(dict(full, **{flag: True}))
 
 
+class JointGoal(unittest.TestCase):
+    def test_reorders_to_arm_joint_order(self):
+        try:
+            from insertion import joint_goal_from_response
+        except ImportError:
+            self.skipTest('insertion.py needs ROS sourced')
+        r = synthetic()
+        r['joint_names'] = list(reversed(r['joint_names']))
+        for p in r['points']:
+            p['positions'] = list(reversed(p['positions']))
+        goal = joint_goal_from_response(r, list(ARM_JOINTS))
+        self.assertIsInstance(goal, list)
+        self.assertAlmostEqual(goal[1], START['joint_2'] + 0.3)
+        self.assertAlmostEqual(goal[2], START['joint_3'])
+        r['points'][-1]['positions'][-3] = 4.0953          # joint_3, reversed order
+        wrapped = joint_goal_from_response(r, list(ARM_JOINTS), {'joint_3'})
+        self.assertAlmostEqual(wrapped[2], 4.0953 - 2 * math.pi)
+
+
 class Archive(unittest.TestCase):
     def test_archived_responses(self):
         root = os.environ.get('CUROBO_ARCHIVE')
