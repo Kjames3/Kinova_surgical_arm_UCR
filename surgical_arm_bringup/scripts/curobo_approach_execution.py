@@ -161,5 +161,6 @@ def execute_approach(node, response, traj, start, params, out, check_unchanged):
     if not ok:
         # No recovery or fallback motion: the operator decides what happens next.
         raise RuntimeError(f'{label} failed; arm left where it stopped (no recovery motion)')
-    node.get_logger().info(f'{label} complete. Pivot/descent are not cuRobo-qualified; stopping here.')
+    node.get_logger().info(f'{label} complete.' + ('' if params.get('curobo_hybrid_insertion')
+                           else ' Pivot/descent are not cuRobo-qualified; stopping here.'))
     return response

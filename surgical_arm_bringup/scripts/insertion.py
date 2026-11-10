@@ -290,6 +290,11 @@ def robust_centre(samples, max_spread_m):
 # Main node
 # ---------------------------------------------------------------------------
 
+
+def _wrap_pi(q):
+    """Angle wrapped to (-pi, pi]."""
+    return math.remainder(q, 2 * math.pi)
+
 class EffortGuard:
     """Joint-torque contact guard for position-mode motions.
 
@@ -370,6 +375,11 @@ class AngledInserter(Node):
         # Target point inside container (mm from container centre, depth from top)
         # These are overridden by the interactive prompt when interactive_target=true.
         self.declare_parameter("insertion_angle_deg",  45.0)
+        # azimuth_mode:=search only: if nothing plans at insertion_angle_deg, retry
+        # shallower tilts down to this angle (steps of insertion_angle_step_deg)
+        # and keep the steepest that plans. 0 (default) = off.
+        self.declare_parameter("insertion_angle_min_deg", 0.0)
+        self.declare_parameter("insertion_angle_step_deg", 5.0)
         self.declare_parameter("insertion_azimuth_deg",  -90.0)
         self.declare_parameter("auto_azimuth", False)
         # How the approach direction is chosen:
@@ -479,6 +489,10 @@ class AngledInserter(Node):
         # M2: opt-in execution of the validated cuRobo Phase 0 approach ONLY.
         # Needs execute_motion, step_by_step and real_robot all true.
         self.declare_parameter("curobo_execute_approach", False)
+        # Hybrid demo: cuRobo plans/executes the Phase 0 approach, then the
+        # existing Pilz phases (rotate, descend, insert, extract, ascend) take
+        # over from cuRobo's hover, and Phase 8 returns to the pre-cuRobo pose.
+        self.declare_parameter("curobo_hybrid_insertion", False)
         # Pilz-vs-cuRobo comparison (compare_pilz_curobo.py). plan_dump_dir writes
         # each planned Phase 0 trajectory to JSON, including in dry runs.
         # pilz_joint_goal_file points Pilz Phase 0 at the final joints of a cuRobo
@@ -591,6 +605,9 @@ class AngledInserter(Node):
                 self.get_parameter("execute_motion").value
                 or self.get_parameter("use_action_server").value):
             raise ValueError("pilz_joint_goal_file is for standalone dry-run comparison only")
+        if (self.get_parameter("curobo_hybrid_insertion").value
+                and self._planner_backend != "curobo"):
+            raise ValueError("curobo_hybrid_insertion needs planner_backend:=curobo")
         if self.get_parameter("dry_run_start_file").value and (
                 self.get_parameter("execute_motion").value
                 or self.get_parameter("use_action_server").value
@@ -2318,13 +2335,44 @@ class AngledInserter(Node):
             proc.kill()
         self.get_logger().info("Bag recording stopped.")
 
+    def _hybrid_handoff(self, response, execute):
+        """After the cuRobo approach: hand over to Pilz only if the arm is really
+        at cuRobo's final waypoint (execute) -- declined/failed means stop."""
+        names = list(response["joint_names"])
+        end = dict(zip(names, response["points"][-1]["positions"]))
+        start = dict(zip(names, response["points"][0]["positions"]))
+        if execute:
+            deadline = time.monotonic() + 2.0
+            while True:
+                _, live = self._preview_joint_sample
+                err = max(abs(math.remainder(live[n] - q, 2 * math.pi)) for n, q in end.items())
+                if err <= 0.01 or time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+            if err > 0.01:
+                self.get_logger().warn(
+                    f"  [hybrid] arm is {err:.3f} rad from cuRobo's hover (declined or stopped); "
+                    "not continuing to the Pilz phases.")
+                return None
+        goal = response["meta"]["goal_position_m"]
+        self.get_logger().info(
+            "\n=== [hybrid] cuRobo approach done; Pilz takes over at the hover "
+            f"({goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}) ===")
+        return {"start": start, "end": end, "goal": goal}
+
     def _run_impl(self, goal_handle, pub_fb):
         if self._planner_backend == "curobo":
             from curobo_planning_preview import run_preview
             execute = not goal_handle.request.dry_run
             if execute and not self.get_parameter("curobo_execute_approach").value:
                 raise ValueError("cuRobo is planning-only unless curobo_execute_approach:=true")
-            return run_preview(self, execute=execute)
+            response = run_preview(self, execute=execute)
+            self._hybrid = None
+            if not self.get_parameter("curobo_hybrid_insertion").value:
+                return response
+            self._hybrid = self._hybrid_handoff(response, execute)
+            if self._hybrid is None:
+                return response
         record = (self.get_parameter("record_bag").value
                   and not goal_handle.request.dry_run)
         bag = self._start_bag() if record else None
@@ -2394,6 +2442,13 @@ class AngledInserter(Node):
                  tip_link=tip_link, ee_link=ee_link)
         self._dry_chain = None if execute else {}
         self._dry_seeded = False
+        hybrid = getattr(self, "_hybrid", None) if self._planner_backend == "curobo" else None
+        if hybrid and not execute:
+            # As the driver would report it: continuous joints wrapped to (-pi, pi].
+            self._dry_chain = {}
+            for n, q in hybrid["end"].items():
+                self._dry_chain[n] = _wrap_pi(q) if n in self.continuous_joints else q
+            self._dry_seeded = True
         seed_file = self.get_parameter("dry_run_start_file").value
         if seed_file and not execute:
             import json as _json
@@ -2412,7 +2467,7 @@ class AngledInserter(Node):
 
         pub_fb("home_move", 0.0)
         # Home move
-        if real_robot and not goal_handle.request.skip_home_move:
+        if real_robot and not goal_handle.request.skip_home_move and not hybrid:
             self.get_logger().info("Moving arm to Home...")
             req = MotionPlanRequest()
             req.group_name = group_name
@@ -2444,6 +2499,9 @@ class AngledInserter(Node):
             self.get_logger().info("Arm at Home.")
 
         self._js_frozen = True
+        if hybrid:
+            # Phase 8 / recovery return to where the arm stood before cuRobo moved it.
+            self._start_joints = {n: float(v) for n, v in hybrid["start"].items()}
         if real_robot:
             self.get_logger().info("Arm is ready.")
 
@@ -2530,12 +2588,34 @@ class AngledInserter(Node):
             "tangential" if self.get_parameter("auto_azimuth").value else "fixed")
         azimuth_rad, search_ready = None, None
         if azimuth_mode == "search":
-            found = self._search_azimuth(
-                cont_x, cont_y, ready_z, target_xyz[2], tilt_rad, q_search, vel_scale)
+            lo = float(self.get_parameter("insertion_angle_min_deg").value) or angle_deg
+            step = max(1.0, float(self.get_parameter("insertion_angle_step_deg").value))
+            if not 0.0 < lo <= angle_deg <= 60.0:
+                raise ValueError("need 0 < insertion_angle_min_deg <= insertion_angle_deg <= 60")
+            tilts = [angle_deg]
+            while tilts[-1] - step >= lo - 1e-6:
+                tilts.append(tilts[-1] - step)
+            if tilts[-1] > lo + 1e-6:
+                tilts.append(lo)
+            found = None
+            for a in tilts:
+                if len(tilts) > 1:
+                    self.get_logger().info(f"\n=== [Tilt search] trying {a:.1f} deg ===")
+                found = self._search_azimuth(
+                    cont_x, cont_y, ready_z, target_xyz[2], math.radians(a), q_search, vel_scale)
+                if found is not None:
+                    break
             if found is None:
                 self.get_logger().error(
-                    "  Azimuth search found no approach direction that plans. Aborting.")
+                    "  Azimuth search found no approach direction that plans"
+                    + (f" at any tilt {tilts[0]:.0f}..{tilts[-1]:.0f} deg" if len(tilts) > 1 else "")
+                    + ". Aborting.")
                 return
+            if a != angle_deg:
+                self.get_logger().warn(
+                    f"  [Tilt search] {angle_deg:.1f} deg does not plan here; using {a:.1f} deg.")
+            angle_deg, tilt_rad = a, math.radians(a)
+            self._run_info("tilt_search", requested_deg=tilts[0], chosen_deg=a)
             # Phase 0 must go to the posture the search ranked, not to whatever
             # posture a pose-goal PTP would pick for the same Cartesian pose.
             azimuth_rad, search_ready = found
@@ -2680,8 +2760,19 @@ class AngledInserter(Node):
 
         ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
         transit_01 = "fallback"
+        if hybrid:
+            gap = math.dist(hover_xyz, hybrid["goal"])
+            if gap > 0.005:
+                self.get_logger().error(
+                    f"  [hybrid] Pilz hover ({hover_xyz[0]:.4f}, {hover_xyz[1]:.4f}, {hover_xyz[2]:.4f}) is "
+                    f"{gap * 1000:.1f} mm from cuRobo's; set target_x/target_y to the scene container. "
+                    "Stopping at the hover.")
+                return
+            self.get_logger().info(f"  [hybrid] hover agrees with cuRobo ({gap * 1000:.1f} mm); "
+                                   "skipping Pilz Phase 0-1.")
+            transit_01 = "curobo"
         # A joint goal already IS the hover, so a LIN to it would be zero-length.
-        blend_01 = blend and not goal_file
+        blend_01 = blend and not goal_file and not hybrid
         if not self.get_parameter("direct_to_angled_hover").value and blend_01:
             seg0 = math.dist((ee_w.x, ee_w.y, ee_w.z), ee_ready)
             seg1 = math.dist(ee_ready, ee_hover)
@@ -3108,7 +3199,8 @@ def main(args=None):
 
         try:
             node._run_impl(gh, _pub_fb)
-            node.get_logger().info("Planning preview finished." if node._planner_backend == "curobo"
+            node.get_logger().info("Planning preview finished."
+                                   if node._planner_backend == "curobo" and not getattr(node, "_hybrid", None)
                                    else "Standalone insertion finished.")
         except Exception as e:
             node.get_logger().error(f"Standalone insertion error: {e}")
