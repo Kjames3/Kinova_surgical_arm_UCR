@@ -245,3 +245,22 @@ tool tip); FJT PASS; stopped after Phase 0 as designed. Artifacts:
 - `~/curobo` must stay at `a35a708` for this env. Upstream HEAD (6850070, "cuRobo v2")
   needs a newer torch (`shared_memory_per_block`), and pulling it under a running
   sidecar breaks NVRTC kernel compiles. Upgrade in a cloned env, re-run tests, then switch.
+
+## Pilz vs cuRobo, end to end from the same start — 2026-11-10 (dry run, no motion)
+
+New `dry_run_start_file:=<cuRobo run>/request.json` (Pilz dry runs only) seeds the
+planning chain with the recorded start, so Pilz's home move is planned and counted.
+Pilz needs `target_x:=0.3485 target_y:=-0.1060` to match the scene container (its
+default is (0.26, 0)). Start identical, goal gap 0.1 mm, both at 0.15.
+
+| | Pilz (home 15.3 s + blended PTP/LIN 3.7 s) | cuRobo (ready 19.0 s + approach 8.5 s) |
+|---|---|---|
+| duration | **19.0 s** | 27.6 s |
+| tip path / joint path | 0.973 m / 8.68 rad | 0.978 m / 8.77 rad |
+| peak joint vel | 0.583 rad/s (joint_7, in the LIN) | 0.183 rad/s |
+| table / container clearance | 258 / 179 mm | 266 / 183 mm |
+
+Same route. The home/ready leg is near-identical in speed (Pilz PTP 15.3 s vs 19.0 s).
+The 8.6 s gap is the final leg: Pilz's Cartesian LIN runs joint_7 at 3.2x cuRobo's
+joint cap; cuRobo's upright approach is 8.5 s vs Pilz's 3.7 s.
+Artifacts: `~/robot-logs/2026-11-10/curobo_m2_first_execution/compare_pilz_home_vs_curobo.json`.

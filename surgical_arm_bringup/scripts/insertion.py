@@ -484,6 +484,10 @@ class AngledInserter(Node):
         # pilz_joint_goal_file points Pilz Phase 0 at the final joints of a cuRobo
         # response.json (same-joint-goal comparison); it forces blend_transit off.
         self.declare_parameter("plan_dump_dir", "")
+        # Dry-run comparison only: plan the whole run (home move included) as if
+        # the arm stood at these joints. JSON: a cuRobo request.json
+        # (start_joints) or a plain {joint: rad} dict. Rejected with execution.
+        self.declare_parameter("dry_run_start_file", "")
         # Independent table-clearance check on EVERY trajectory before it is sent
         # (trajectory_table_check.py): FK of the arm links + the tool hull along
         # the densified path. Fail-closed: a tool without a hull is refused.
@@ -587,6 +591,11 @@ class AngledInserter(Node):
                 self.get_parameter("execute_motion").value
                 or self.get_parameter("use_action_server").value):
             raise ValueError("pilz_joint_goal_file is for standalone dry-run comparison only")
+        if self.get_parameter("dry_run_start_file").value and (
+                self.get_parameter("execute_motion").value
+                or self.get_parameter("use_action_server").value
+                or self._planner_backend != "pilz"):
+            raise ValueError("dry_run_start_file is for standalone Pilz dry runs only")
         if self._planner_backend == "curobo":
             from curobo_planning_preview import check_preview_parameters
             check_preview_parameters({n: p.value for n, p in self._parameters.items()})
@@ -1995,6 +2004,23 @@ class AngledInserter(Node):
         wx, wy, wz = ee_world_offset
         return (tip_xyz[0] + wx, tip_xyz[1] + wy, tip_xyz[2] + wz)
 
+    def _fk_positions(self, joints, links, frame):
+        """Positions of `links` at `joints` via move_group's /compute_fk (dry runs)."""
+        from moveit_msgs.srv import GetPositionFK
+        cli = getattr(self, "_fk_cli", None) or self.create_client(GetPositionFK, "/compute_fk")
+        self._fk_cli = cli
+        if not cli.wait_for_service(timeout_sec=5.0):
+            return None
+        req = GetPositionFK.Request()
+        req.header.frame_id = frame
+        req.fk_link_names = list(links)
+        req.robot_state.joint_state.name = list(joints)
+        req.robot_state.joint_state.position = [float(v) for v in joints.values()]
+        res = self._wait_for_future(cli.call_async(req), 5.0)
+        if res is None or res.error_code.val != 1 or len(res.pose_stamped) != len(links):
+            return None
+        return [ps.pose.position for ps in res.pose_stamped]
+
     def _ee_for_tip(self, tip_xyz, q_xyzw):
         """EE (ee_link) position so assembly_tip lands at tip_xyz with EE orientation q.
 
@@ -2367,6 +2393,20 @@ class AngledInserter(Node):
                  execute=execute, world_frame=world_frame,
                  tip_link=tip_link, ee_link=ee_link)
         self._dry_chain = None if execute else {}
+        self._dry_seeded = False
+        seed_file = self.get_parameter("dry_run_start_file").value
+        if seed_file and not execute:
+            import json as _json
+            with open(os.path.expanduser(seed_file)) as fh:
+                seed = _json.load(fh)
+            seed = seed.get("start_joints", seed)
+            if set(seed) != set(self.arm_joint_names):
+                raise ValueError(f"dry_run_start_file needs all of {self.arm_joint_names}")
+            self._js_frozen = True
+            self._start_joints.update({n: float(seed[n]) for n in self.arm_joint_names})
+            self._dry_chain = {n: float(seed[n]) for n in self.arm_joint_names}
+            self._dry_seeded = True
+            self.get_logger().info(f"  [dry run] planning from {seed_file}, not the live state")
         self._step_declined = False
 
 
@@ -2395,6 +2435,7 @@ class AngledInserter(Node):
             if not ok:
                 self.get_logger().error("Home move planning failed.")
                 return
+            self._dump_plan("home_move", [traj])
             if execute and self._wait_for_user("home_move"):
                 if not self._execute_moveit(traj, "home_move", timeout=90.0):
                     self.get_logger().error("Home move failed.")
@@ -2579,6 +2620,13 @@ class AngledInserter(Node):
 
         tip_w = tip_tf.transform.translation
         ee_w  = ee_tf.transform.translation
+        if self._dry_seeded and self._dry_chain:
+            # Seeded dry run: the live TF is not where the plan starts.
+            fk = self._fk_positions(self._dry_chain, [tip_link, ee_link], world_frame)
+            if fk is None:
+                self.get_logger().error("  FK of the seeded start failed.")
+                return
+            tip_w, ee_w = fk
         cur_tip = (tip_w.x, tip_w.y, tip_w.z)
 
         # World-frame EE→tip offset at current arm pose
