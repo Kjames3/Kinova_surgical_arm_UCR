@@ -86,8 +86,12 @@ prompt too. There is no recovery or fallback motion: a failure leaves the arm
 where it stopped. Ctrl+C cancels the in-flight FJT goal. Artifacts, including
 `execution_status.json`, go to `curobo_result_dir`.
 
-Not verified: whether the joint-torque force guard is armed on this path. Its
-setup may live only in the Pilz flow. Do not rely on it for the first run.
+The joint-torque force guard is NOT armed on this path, and the same is true of
+Pilz Phase 0: `_guarded()` only wraps Phase 4a/4b. That is deliberate. The guard
+trips on torque *change* from the start of the motion (6 Nm on j1-4), and a large
+free-space transit changes gravity torque by more than that, so it would
+false-trip. The e-stop and Ctrl+C (which cancels the FJT goal) are the
+protection for this run.
 
 ## Pilz vs cuRobo (offline, `compare_pilz_curobo.py`)
 
