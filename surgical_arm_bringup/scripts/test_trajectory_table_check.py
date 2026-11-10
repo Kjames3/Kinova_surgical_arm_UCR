@@ -107,12 +107,12 @@ class Checker(unittest.TestCase):
 
     def test_tool_policy(self):
         with self.assertRaisesRegex(TableCheckRejected, "no tool hull"):
-            TableClearanceChecker(URDF, "2f140")
+            TableClearanceChecker(URDF, "some_new_gripper")
         bare = TableClearanceChecker(URDF, "none")
         link, tool, _ = bare.clearances(HOME)
         self.assertEqual(tool, math.inf)
         # With no tool modelled, a pose that buries the needle still passes
-        # (only links are guarded) -- which is exactly why 2f140 is refused.
+        # (only links are guarded) -- which is exactly why unknown tools are refused.
         q1 = HOME.copy()
         while self.tip_clear(q1) > -0.05:
             q1[1] += 0.02
@@ -219,6 +219,74 @@ class TipFloor(unittest.TestCase):
             target_tip_floor(TABLE_Z + 0.006, TABLE_Z, 0.005, 0.003)
 
 
+URDF_2F140 = Path("/tmp/gen3_2f140.urdf")
+
+
+class Gripper2F140(unittest.TestCase):
+    """2F-140 hull. Uses the xacro output named in generate_tool_hull_2f140.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not URDF_2F140.exists():
+            raise unittest.SkipTest(f"{URDF_2F140} missing; see generate_tool_hull_2f140.py")
+        cls.c = TableClearanceChecker(URDF_2F140.read_text(), "2f140")
+
+    def test_hull_covers_the_finger_pads_at_every_opening(self):
+        from scipy.spatial import Delaunay
+        import generate_tool_hull_2f140 as g
+        from urdf_parser_py.urdf import URDF
+        tri = Delaunay(self.c.hull)
+        robot = URDF.from_xml_string(URDF_2F140.read_text())
+        for f in np.linspace(0, 0.7, 8):
+            T = g.link_transforms(robot, f)
+            for pad in ("left_inner_finger_pad", "right_inner_finger_pad"):
+                p = T[pad][:3, 3]
+                self.assertGreaterEqual(tri.find_simplex(p), 0, f"{pad} at finger {f:.2f} outside hull")
+
+    def test_no_tip_vertex_so_tip_floor_refused(self):
+        self.assertIsNone(self.c.tip_idx)
+        with self.assertRaisesRegex(TableCheckRejected, "tip vertex"):
+            self.c.check(J, [HOME], tip_floor=0.02)
+
+    def test_home_clears_and_dive_rejected(self):
+        rep = self.c.check(J, [HOME])
+        self.assertGreater(rep["min_clear_m"], 0.1)
+        q = HOME.copy()
+        while self.c._split(q)[0] > -0.03:
+            q[1] += 0.02
+        with self.assertRaisesRegex(TableCheckRejected, "NOT sent"):
+            self.c.check(J, ramp(HOME, q))
+
+    def test_gripper_is_what_hits_first_when_lowered_tool_down(self):
+        # Resolved-rate descent with the flange orientation held: the fingers,
+        # not the links, must be what the check stops.
+        from arm_kinematics import KinDynModel
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False) as f:
+            f.write(URDF_2F140.read_text())
+        try:
+            m = KinDynModel(f.name, "base_link", "bracelet_link")
+        finally:
+            os.unlink(f.name)
+        q = HOME.copy()
+        for _ in range(3000):
+            b, name, _ = self.c._split(q)
+            if b < 0.005:
+                break
+            q = q + np.linalg.pinv(m.jacobian(q)) @ np.array([0, 0, -0.002, 0, 0, 0])
+        self.assertEqual(name, "tool_hull")
+        with self.assertRaisesRegex(TableCheckRejected, "tool_hull"):
+            self.c.check(J, ramp(HOME, q))
+        bare = TableClearanceChecker(URDF_2F140.read_text(), "none")
+        bare.check(J, ramp(HOME, q))           # links alone would have let it through
+
+    def test_fingers_reach_lower_than_the_bare_flange(self):
+        bare = TableClearanceChecker(URDF_2F140.read_text(), "none")
+        b_bare = bare._split(HOME)[0]
+        b_grip = self.c._split(HOME)[0]
+        self.assertLess(b_grip, b_bare - 0.05)    # ~80 mm below the lowest link surface at home
+
+
 class InsertionWiring(unittest.TestCase):
     """Drive insertion.py's real execute functions with a stub node: a rejected
     trajectory must never be published or sent to the controller."""
@@ -279,7 +347,7 @@ class InsertionWiring(unittest.TestCase):
         self.node._traj_pub.publish.assert_called_once()
 
     def test_unguardable_tool_refused(self):
-        self.params["table_check_tool"] = "2f140"
+        self.params["table_check_tool"] = "some_new_gripper"
         self.assertRaises(TableCheckRejected, self.cls._get_table_checker, self.node)
 
     def test_off_switch(self):
@@ -314,12 +382,24 @@ class InsertionWiring(unittest.TestCase):
                     tip_link="assembly_tip", ee_link="end_effector_link", move_group_name="manipulator",
                     table_z=TABLE_Z, container_height=0.086, approach_clearance=0.18,
                     return_to_start=True, post_insert_wait=0., table_check=True,
-                    container_base_offset=0.005, target_depth_mm=85.0,   # tip 6 mm above table
+                    container_base_offset=0.005, target_depth_mm=85.0,   # past the 39 mm wall limit
                     table_check_tip_allowance=0.005, table_check_tip_min_floor=0.003)
         self.node.get_parameter = lambda n: types.SimpleNamespace(value=vals[n])
         gh = types.SimpleNamespace(request=types.SimpleNamespace(dry_run=False, hover_above_top=0.03))
+        with self.assertRaisesRegex(ValueError, "wall-clearance limit"):
+            self.cls._run_phases(self.node, gh, lambda *a: None)
+        # A short container: depth is legal for the wall, but the tip floor
+        # would sit 0 mm above the table -> the 3 mm table minimum refuses it.
+        vals.update(container_height=0.030, target_depth_mm=30.0)   # floor lands on the table
         with self.assertRaisesRegex(TableCheckRejected, "before any motion"):
             self.cls._run_phases(self.node, gh, lambda *a: None)
+        vals.update(container_height=0.086, target_depth_mm=30.0)   # today's task
+        self.node._get_table_checker = lambda: (_ for _ in ()).throw(RuntimeError("stop here"))
+        try:
+            self.cls._run_phases(self.node, gh, lambda *a: None)
+        except Exception:
+            pass
+        self.assertAlmostEqual(self.node._insert_tip_floor, 0.056, places=6)
         for m in ("_plan", "_execute_moveit", "_execute_fjt", "_plan_sequence", "_blended_transit"):
             getattr(self.node, m).assert_not_called()
 

@@ -488,7 +488,7 @@ class AngledInserter(Node):
         # (trajectory_table_check.py): FK of the arm links + the tool hull along
         # the densified path. Fail-closed: a tool without a hull is refused.
         self.declare_parameter("table_check", True)
-        self.declare_parameter("table_check_tool", "thesis_ee")   # thesis_ee | none
+        self.declare_parameter("table_check_tool", "thesis_ee")   # thesis_ee | 2f140 | none
         self.declare_parameter("table_check_margin", 0.01)       # m above the table
         # Insertion-depth phases only: the TIP vertex may go as low as
         # (target height above table - allowance); all else keeps the margin.
@@ -2346,15 +2346,21 @@ class AngledInserter(Node):
         # (the home move is next). Target height depends only on parameters.
         self._insert_tip_floor = None
         if self.get_parameter("table_check").value:
+            # One floor for both safety layers: the impedance depth stop's own
+            # container_geometry.insertion_tool_floor (target - allowance, never
+            # below rim - 39 mm; deeper targets refused), then a table minimum.
+            from container_geometry import insertion_tool_floor
             from trajectory_table_check import target_tip_floor
-            target_z = container_top_z(
-                table_z, cont_h, self.get_parameter("container_base_offset").value) \
-                - self.get_parameter("target_depth_mm").value / 1000.0
+            rim_z = container_top_z(
+                table_z, cont_h, self.get_parameter("container_base_offset").value)
+            depth = self.get_parameter("target_depth_mm").value / 1000.0
+            allowance = self.get_parameter("table_check_tip_allowance").value
+            floor_z = insertion_tool_floor(rim_z, depth, margin=allowance)
+            # target_tip_floor(z, table, a, m) = z - table - a, so pass a=0 to get the floor itself.
             self._insert_tip_floor = target_tip_floor(
-                target_z, table_z, self.get_parameter("table_check_tip_allowance").value,
-                self.get_parameter("table_check_tip_min_floor").value)
+                floor_z, table_z, 0.0, self.get_parameter("table_check_tip_min_floor").value)
             self.get_logger().info(
-                f"  [table check] target {(target_z - table_z) * 1000:.0f} mm above the table; "
+                f"  [table check] target {(rim_z - depth - table_z) * 1000:.0f} mm above the table; "
                 f"insertion tip floor {self._insert_tip_floor * 1000:.0f} mm")
 
         p = dict(group_name=group_name, vel_scale=vel_scale,

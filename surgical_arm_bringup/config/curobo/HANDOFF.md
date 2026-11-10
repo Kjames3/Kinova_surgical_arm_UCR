@@ -217,5 +217,17 @@ move, a target leaving less than `table_check_tip_min_floor` (3 mm) is refused.
 At the default 30 mm depth the target is 61 mm above the table, so the floor is
 56 mm: not binding today.
 
+2F-140 hull (same day): `config/2f140_hull_bracelet.csv` has 409 vertices.
+It comes from the URDF collision meshes and pad boxes, swept over finger_joint
+0..0.7 rad, and reaches 297 mm below the bracelet. It is registered in both the
+trajectory check and impedance.py's TOOL_HULLS (`--tool 2f140`), so torque mode
+now guards the fingers too. Offline, validate_table_barrier.py section 9 shows a
+20 N push driving the fingers 56 mm into the table with links-only (the old
+2F-140 behaviour), and all 27 pushes held with the hull (worst +25 mm). Caveat:
+the package's robotiq_2f_140_coupling.stl is not referenced by the URDF. If a
+physical coupling plate is fitted, the real fingers sit lower than the hull, so
+measure it. Raising --table-z-min for the 2F-140 is no longer needed, but it is
+harmless. The validator now takes ~15 min.
+
 Not hardware-run. On REAL-1, `trajectory_table_check.py` needs the same
 manual install-tree symlink as the other new modules.

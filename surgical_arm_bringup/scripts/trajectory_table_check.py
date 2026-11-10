@@ -17,10 +17,9 @@ Same geometry as the impedance barrier, deliberately:
     the vertices is exact for the tool;
   * table: z = -0.03 in base frame (setup_planning_scene.py).
 
-Tool policy is fail-closed: a tool with a hull is checked; "none" checks the
-links only; any other tool (e.g. "2f140") is REFUSED, because the hull that
-would make it safe does not exist yet. Pass the right `tool`, not "none", to
-get past that.
+Tool policy is fail-closed: a tool with a hull (thesis_ee, 2f140) is checked;
+"none" checks the links only; any other tool is REFUSED. Pass the right
+`tool`, not "none", to get past that.
 
 If the arm STARTS inside the margin (e.g. parked low after a jog), refusing
 every motion would trap it there, including the move up and away. The rule is
@@ -58,7 +57,12 @@ LINKS = ("half_arm_2_link", "forearm_link", "spherical_wrist_1_link",
          "spherical_wrist_2_link", "bracelet_link", "end_effector_link")
 HULL_LINK = "bracelet_link"
 _CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config")
-TOOL_HULLS = {"thesis_ee": os.path.join(_CONFIG, "thesis_ee_hull_bracelet.csv")}
+TOOL_HULLS = {
+    "thesis_ee": os.path.join(_CONFIG, "thesis_ee_hull_bracelet.csv"),
+    # Whole finger range, open to closed (generate_tool_hull_2f140.py). No tip
+    # vertex, so insertion tip floors are refused with this tool.
+    "2f140": os.path.join(_CONFIG, "2f140_hull_bracelet.csv"),
+}
 LINKS_ONLY_TOOLS = ("none",)
 TIP_OFFSET = (0.108, -0.008, -0.411)    # assembly_tip in the bracelet frame (2026-10-09)
 

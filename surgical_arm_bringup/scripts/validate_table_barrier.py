@@ -591,6 +591,56 @@ check("overshoot stopped at the floor", lowest > FLOOR - 1e-3,
 check("overshoot never reaches wall-contact depth",
       lowest > RIM - cg.MAX_INSERT_DEPTH_45)
 
+# --- 9. Robotiq 2F-140 hull ---------------------------------------------------
+# Until 2026-11-09 only the thesis_ee had a hull, so with the 2F-140 the barrier
+# guarded the flange and the fingers (~0.24 m below it) were unguarded. Re-run
+# section 7's external-push sweep with the gripper's own payload model and its
+# finger-range hull (generate_tool_hull_2f140.py).
+print("\n9. Mounted tool (2F-140): hull guard")
+tmodel = imp.KinDynModel(imp.DEFAULT_URDF, imp.DEFAULT_BASE_LINK,
+                         imp.DEFAULT_TIP_LINK, tool="2f140")
+hull = imp.load_tool_hull("2f140")
+tseg = tmodel.segment_index(imp.TOOL_HULL_LINK)
+tsegs = [tmodel.segment_index(nm) for nm in links]
+check("2F-140 hull loads", hull is not None and hull.shape[1] == 3, f"{len(hull)} vertices")
+check("hull reaches below the flange like the fingers do",
+      hull[:, 2].min() < -0.28, f"lowest z {hull[:, 2].min():+.3f} m (bracelet frame)")
+TIP = np.array([0.0, 0.0, -0.29])        # gripper axis; find_pose measures tilt from it
+POSES = {"fingers down": find_pose(0.0, 11), "tilted 45": find_pose(45.0, 12),
+         "sideways": find_pose(90.0, 13)}
+low = hull[np.argmin(hull[:, 2])]
+SITES = {"finger tips": low, "flange": np.array([0.0, 0.0, -0.0615]),
+         "gripper body": np.array([0.0, 0.0, -0.15])}
+wt, _, _, _ = simulate_tool(POSES["fingers down"], low, DIRS["down"], RATED,
+                            make_filter(use_tool=False, observer_gain=0.0,
+                                        gravity_reserve=0.0))
+print(f"    links only (pre-2026-11-09 for the 2F-140): fingers {wt*1000:+.1f} mm")
+check("links-only filter really let the fingers through", wt < -1e-3,
+      "(if not, the sweep below proves nothing new)")
+full = make_filter()
+worst = np.inf
+bad, unhealthy = [], []
+peak_all = 0.0
+for pname, q0 in POSES.items():
+    for sname, site in SITES.items():
+        for dname, dvec in DIRS.items():
+            wt, wl, deg, pk = simulate_tool(q0, site, dvec, RATED, full)
+            worst = min(worst, wt, wl)
+            peak_all = max(peak_all, pk)
+            tag = f"{pname}/{sname}/{dname}: tool {wt*1000:+.1f} link {wl*1000:+.1f} mm"
+            if min(wt, wl) < -1e-3:
+                bad.append(tag)
+            elif deg:
+                unhealthy.append(f"{tag}, degraded {deg} cycles")
+print(f"  sweep: 27 pushes at {RATED:g} N, worst clearance {worst*1000:+.2f} mm, "
+      f"peak joint speed {peak_all:.2f} rad/s")
+for line in bad:
+    print("    FAILED " + line)
+for line in unhealthy:
+    print("    degraded " + line)
+check(f"2F-140: held every {RATED:g} N push", not bad, f"{len(bad)} failed")
+check("2F-140: filter exact throughout", not unhealthy, f"{len(unhealthy)} runs")
+
 print("\n" + "=" * 60)
 if fails:
     print("FAILED: " + ", ".join(fails))

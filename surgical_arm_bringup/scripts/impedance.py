@@ -463,6 +463,10 @@ TOOL_HULL_LINK = "gen3_bracelet_link"
 TABLE_SURFACE_Z = -0.03     # m, base frame (setup_planning_scene.py's table)
 TOOL_HULLS = {
     "thesis_ee": os.path.join(_PKG_DIR, "config", "thesis_ee_hull_bracelet.csv"),
+    # Swept over the whole finger range (generate_tool_hull_2f140.py), so it
+    # holds at any opening. Same frame as the thesis_ee hull (checked: the
+    # gen3_2f85 / 2F-140 / surgical URDFs give bit-identical bracelet poses).
+    "2f140": os.path.join(_PKG_DIR, "config", "2f140_hull_bracelet.csv"),
 }
 
 
