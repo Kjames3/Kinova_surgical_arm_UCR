@@ -79,4 +79,5 @@ def get_robot_info(node, timeout_sec=5.0):
     else:
         node.get_logger().warn("Did not receive /robot_description_semantic topic.")
 
+    node._robot_description_xml = urdf_xml   # kept for the trajectory table check
     return continuous_joints, max_vel, home_joints

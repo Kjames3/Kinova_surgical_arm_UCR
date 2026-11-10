@@ -476,6 +476,12 @@ class AngledInserter(Node):
         # pilz_joint_goal_file points Pilz Phase 0 at the final joints of a cuRobo
         # response.json (same-joint-goal comparison); it forces blend_transit off.
         self.declare_parameter("plan_dump_dir", "")
+        # Independent table-clearance check on EVERY trajectory before it is sent
+        # (trajectory_table_check.py): FK of the arm links + the tool hull along
+        # the densified path. Fail-closed: a tool without a hull is refused.
+        self.declare_parameter("table_check", True)
+        self.declare_parameter("table_check_tool", "thesis_ee")   # thesis_ee | none
+        self.declare_parameter("table_check_margin", 0.01)       # m above the table
         self.declare_parameter("pilz_joint_goal_file", "")
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
@@ -529,6 +535,8 @@ class AngledInserter(Node):
             "joint_4", "joint_5", "joint_6", "joint_7"
         ]).value
         
+        self._robot_description_xml = None
+        self._table_checker = None
         c_joints, m_vel, h_joints = get_robot_info(self)
         self.continuous_joints = c_joints if c_joints else {"joint_1", "joint_3", "joint_5", "joint_7"}
         self.home_joints = h_joints if h_joints else {
@@ -553,6 +561,12 @@ class AngledInserter(Node):
         self._planner_backend = self.get_parameter("planner_backend").value.lower()
         if self._planner_backend not in ("pilz", "curobo"):
             raise ValueError("planner_backend must be pilz or curobo")
+        # Build the table check now when motion is possible, so a missing URDF or
+        # an unguardable tool stops the node before anything moves.
+        if self.get_parameter("table_check").value and (
+                self.get_parameter("execute_motion").value
+                or self.get_parameter("use_action_server").value):
+            self._get_table_checker()
         # Reject at startup, before any motion (the home move runs before Phase 0).
         # Action goals carry their own dry_run flag, so refuse that mode outright.
         if self.get_parameter("pilz_joint_goal_file").value and (
@@ -917,6 +931,13 @@ class AngledInserter(Node):
         """Execute a straight Cartesian line via native Kortex API (bypassing MoveIt/IK)"""
         if self._motion_blocked(label):
             return False
+        if self.get_parameter("table_check").value:
+            # No joint trajectory exists for a native Kortex move, so the table
+            # check cannot see it. Refuse rather than run unguarded.
+            self.get_logger().error(
+                f"  [{label}] native Kortex LIN is not covered by the table check; "
+                "set use_kortex_lin:=false (Pilz LIN is checked) or table_check:=false.")
+            return False
         if not _HAS_KORTEX_API or not self._kortex_base:
             self.get_logger().error(f"  [{label}] Kortex API not connected!")
             return False
@@ -1026,6 +1047,8 @@ class AngledInserter(Node):
         # which the controller aborts on (error -4 / state-tolerance violation).
         self._unwrap_trajectory(traj, ref_joints=self._live_joints)
         self._clamp_traj(traj)
+        if not self._table_check_ok(traj, label):
+            return False
         self._traj_pub.publish(traj)
         if not self._execute_cli.wait_for_server(timeout_sec=5.0):
             self.get_logger().error(f"  /execute_trajectory not available ({label}).")
@@ -1059,6 +1082,34 @@ class AngledInserter(Node):
         elif text.startswith("guard_trip:"):
             self._run_log.setdefault("guard_trips", []).append(text[len("guard_trip:"):])
 
+    def _get_table_checker(self):
+        if self._table_checker is None:
+            from trajectory_table_check import TableClearanceChecker
+            if not self._robot_description_xml:
+                raise RuntimeError("table check: no /robot_description received; "
+                                   "refusing (set table_check:=false to override)")
+            self._table_checker = TableClearanceChecker(
+                self._robot_description_xml, self.get_parameter("table_check_tool").value,
+                margin=self.get_parameter("table_check_margin").value)
+        return self._table_checker
+
+    def _table_check_ok(self, traj, label):
+        """True if `traj` keeps the arm and tool clear of the table (or the check is off)."""
+        if not self.get_parameter("table_check").value:
+            return True
+        from trajectory_table_check import check_joint_trajectory, TableCheckRejected
+        try:
+            rep = check_joint_trajectory(self._get_table_checker(), traj.joint_trajectory)
+        except TableCheckRejected as e:
+            self.get_logger().error(f"  [{label}] {e}")
+            self._mark_phase(f"table_check_reject:{label}")
+            return False
+        note = " (started inside margin; not getting closer)" if rep["started_inside_margin"] else ""
+        self.get_logger().info(
+            f"  [table check] {label}: min clearance {rep['min_clear_m'] * 1000:.0f} mm "
+            f"({rep['worst']['body']}){note}")
+        return True
+
     def _execute_fjt(self, traj, label, timeout=60.0):
         """Execute via direct FJT, publishing phase start/end markers for the bag."""
         if self._motion_blocked(label):
@@ -1072,6 +1123,8 @@ class AngledInserter(Node):
         """Execute via direct FJT (Cartesian paths — overrides 0.1 rad path tol)."""
         self._unwrap_trajectory(traj, ref_joints=self._live_joints)
         self._clamp_traj(traj)
+        if not self._table_check_ok(traj, label):
+            return False
         self._traj_pub.publish(traj)
         deadline = time.time() + 5.0
         while not self._fjt_cli.server_is_ready() and time.time() < deadline:

@@ -190,3 +190,24 @@ Bugs found and fixed during this test: the joint goal was passed as a dict
 → Pilz -2. It is now wrapped to (-pi, pi], so joint_3 turns 3.19 rad the other
 way to the same pose. The `pilz_joint_goal_file` + execute rejection moved to
 startup; before, it fired only after the home move.
+
+## Trajectory table check (barrier item b) — 2026-11-09, offline only
+
+Every trajectory insertion.py sends through FJT or MoveIt (Pilz, OMPL, cuRobo,
+recovery) is now checked before it is published. The check is FK along the
+path, densified to 0.01 rad, over the six impedance-barrier links (as spheres
+of 0.055 m) plus the thesis_ee hull, against the table at z = -0.03. Params:
+`table_check` (default true), `table_check_tool` (thesis_ee | none),
+`table_check_margin` (0.01 m). Fail-closed: a tool with no hull (2f140) is
+refused; with motion enabled, the checker is built at startup. Native Kortex
+LIN is refused while the check is on: it has no joint trajectory to check.
+
+If the arm starts inside the margin, the rule becomes "never closer than the
+start, minus 2 mm", so a parked-low arm can still move away. Two archived
+2026-10-10 home moves started 5.3 and 8.3 mm above the table under this model.
+All 152 archived planned trajectories pass; the closest approach was 5.3 mm,
+the parked start just mentioned. Link heights agree with the impedance
+barrier's height_barrier_terms to 1e-6 m on 50 random poses.
+
+Not hardware-run. On REAL-1, `trajectory_table_check.py` needs the same
+manual install-tree symlink as the other new modules.
