@@ -231,3 +231,17 @@ harmless. The validator now takes ~15 min.
 
 Not hardware-run. On REAL-1, `trajectory_table_check.py` needs the same
 manual install-tree symlink as the other new modules.
+
+## First hardware execution — 2026-11-10 14:04 (container absent, thesis_ee) — PASS
+
+Supervised `curobo_execute_approach` from Kinova home (j3 = pi, start tilt 89.6 deg):
+ready transition 19.0 s + upright approach 8.5 s = 27.6 s, approach tilt 1.25 deg.
+Gate PASS (vel 0.998, acc 0.77, start err 1e-7 rad); table check PASS (min 266 mm,
+tool tip); FJT PASS; stopped after Phase 0 as designed. Artifacts:
+`~/robot-logs/2026-11-10/curobo_m2_first_execution/`.
+
+- Ran at **0.15**, not 0.10: from home, 0.10 makes the ready transition longer than
+  the trajopt horizon (maximum_trajectory_dt 0.3) and the solver fails. Not safety.
+- `~/curobo` must stay at `a35a708` for this env. Upstream HEAD (6850070, "cuRobo v2")
+  needs a newer torch (`shared_memory_per_block`), and pulling it under a running
+  sidecar breaks NVRTC kernel compiles. Upgrade in a cloned env, re-run tests, then switch.
