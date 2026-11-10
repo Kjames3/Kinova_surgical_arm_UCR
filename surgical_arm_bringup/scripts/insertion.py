@@ -458,6 +458,12 @@ class AngledInserter(Node):
         # M2: opt-in execution of the validated cuRobo Phase 0 approach ONLY.
         # Needs execute_motion, step_by_step and real_robot all true.
         self.declare_parameter("curobo_execute_approach", False)
+        # Pilz-vs-cuRobo comparison (compare_pilz_curobo.py). plan_dump_dir writes
+        # each planned Phase 0 trajectory to JSON, including in dry runs.
+        # pilz_joint_goal_file points Pilz Phase 0 at the final joints of a cuRobo
+        # response.json (same-joint-goal comparison); it forces blend_transit off.
+        self.declare_parameter("plan_dump_dir", "")
+        self.declare_parameter("pilz_joint_goal_file", "")
         self.declare_parameter("execute_motion",       False)
         # Run mode: False = standalone (run one insertion from params, then exit);
         # True = action server (wait for goals on /insert_container).
@@ -1347,6 +1353,36 @@ class AngledInserter(Node):
         self._chain_advance(resp.planned_trajectories[-1])
         return True, list(resp.planned_trajectories)
 
+    def _dump_plan(self, label, trajs, **extra):
+        """Write planned trajectories to plan_dump_dir (no-op when unset)."""
+        root = self.get_parameter("plan_dump_dir").value
+        if not root:
+            return
+        import json
+        from datetime import datetime, timezone
+        out = os.path.expanduser(root)
+        os.makedirs(out, exist_ok=True)
+        segs = []
+        for traj in trajs:
+            jt = traj.joint_trajectory
+            segs.append({"joint_names": list(jt.joint_names), "points": [{
+                "positions": list(pt.positions), "velocities": list(pt.velocities),
+                "accelerations": list(pt.accelerations),
+                "time_from_start": pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9}
+                for pt in jt.points]})
+        names = ("planner_backend", "azimuth_mode", "blend_transit", "blend_radius",
+                 "max_velocity_scaling", "transit_velocity_scaling", "skip_home_move",
+                 "container_base_offset", "approach_clearance", "pilz_joint_goal_file")
+        doc = {"label": label, "planner": "pilz",
+               "live_joints": {n: self._live_joints.get(n) for n in self.arm_joint_names},
+               "params": {n: self.get_parameter(n).value for n in names},
+               "segments": segs, **extra}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        path = os.path.join(out, f"pilz_{label}_{stamp}.json")
+        with open(path, "w") as f:
+            json.dump(doc, f, indent=1)
+        self.get_logger().info(f"  [dump] {label} plan -> {path}")
+
     def _blended_transit(self, reqs, seg_lengths, label, execute):
         """Plan and run a blended free-space transit.
 
@@ -1367,6 +1403,7 @@ class AngledInserter(Node):
             self.get_logger().warn(f"  {label}: falling back to separate phases.")
             return "fallback"
         self.get_logger().info(f"  [PASS] {label} planned ({len(trajs)} trajectory segment(s)).")
+        self._dump_plan(label, trajs)
         if not execute:
             return "done"
         if not self._wait_for_user(label):
@@ -2357,6 +2394,16 @@ class AngledInserter(Node):
                 f"  Unknown azimuth_mode '{azimuth_mode}'; using insertion_azimuth_deg.")
         if azimuth_rad is None:
             azimuth_rad = math.radians(self.get_parameter("insertion_azimuth_deg").value)
+        goal_file = self.get_parameter("pilz_joint_goal_file").value
+        if goal_file:
+            if execute:
+                raise ValueError("pilz_joint_goal_file is for dry-run comparison only")
+            import json
+            with open(os.path.expanduser(goal_file)) as f:
+                cu = json.load(f)
+            last = cu["points"][-1]["positions"]
+            search_ready = {n: last[cu["joint_names"].index(n)] for n in self.arm_joint_names}
+            self.get_logger().info(f"  Phase 0 joint goal taken from {goal_file}")
 
         hover_xyz, (axis_x, axis_y, axis_z), D = insertion_axis_geometry(
             cont_x, cont_y, ready_z, target_xyz[2], tilt_rad, azimuth_rad)
@@ -2474,7 +2521,9 @@ class AngledInserter(Node):
 
         ee_ready = self._ee_for_tip((cont_x, cont_y, ready_z), q_vertical_xyzw)
         transit_01 = "fallback"
-        if not self.get_parameter("direct_to_angled_hover").value and blend:
+        # A joint goal already IS the hover, so a LIN to it would be zero-length.
+        blend_01 = blend and not goal_file
+        if not self.get_parameter("direct_to_angled_hover").value and blend_01:
             seg0 = math.dist((ee_w.x, ee_w.y, ee_w.z), ee_ready)
             seg1 = math.dist(ee_ready, ee_hover)
             transit_01 = self._blended_transit(
@@ -2501,6 +2550,7 @@ class AngledInserter(Node):
             if not ok:
                 self.get_logger().error("  Phase 0 planning failed.")
                 return
+            self._dump_plan("Phase0_approach", [traj])
             if execute and self._wait_for_user("Phase0_approach") and not self._execute_fjt(traj, "Phase0_approach"):
                 self._recovery_return(p); return
 

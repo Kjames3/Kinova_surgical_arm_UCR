@@ -124,6 +124,12 @@ later Pilz pivot must use the same azimuth, so never mix `search` with cuRobo.
    Load the scene with setup_planning_scene. The preview requires a
    `glass_container` *scene object* even with the physical container removed.
 4. Run a preview first (`execute_motion:=false`) and check it in RViz.
+   While bringup is up, take the fair-comparison dry runs (no motion, about 2 min,
+   all from the same pose). The recipe is in the compare_pilz_curobo.py docstring:
+   Pilz pose-goal with `plan_dump_dir:=~/curobo_planning_runs/pilz`, the cuRobo
+   preview, then Pilz with `pilz_joint_goal_file:=<that cuRobo run>/response.json`.
+   Use tangential azimuth throughout. container_base_offset now defaults to the
+   5 mm board, which closes the old 5 mm height gap.
 5. Then, with a hand on the e-stop:
    ```bash
    ros2 run surgical_arm_bringup insertion.py --ros-args \
