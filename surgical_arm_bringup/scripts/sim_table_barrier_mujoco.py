@@ -104,7 +104,7 @@ class Controller:
     commanded gravity feedforward, carrying the configured error."""
 
     def __init__(self, g_error_j4, observer_gain=50.0, gravity_reserve=0.4,
-                 speed_soft=0.0, speed_soft_band=0.5):
+                 speed_soft=0.0, speed_soft_band=0.5, wall_damping=None):
         self.model = imp.KinDynModel(imp.DEFAULT_URDF, imp.DEFAULT_BASE_LINK,
                                      imp.DEFAULT_TIP_LINK, tool="thesis_ee")
         self.n = self.model.n
@@ -122,7 +122,7 @@ class Controller:
             self.model, self.segs, LINK_RADIUS, LINK_Z_MIN, ALPHA,
             self.tau_max, WALL, tool_hull=self.hull, tool_k=TOOL_K,
             tool_z_min=TOOL_Z_MIN, observer_gain=observer_gain,
-            gravity_reserve=gravity_reserve)
+            gravity_reserve=gravity_reserve, wall_damping=wall_damping)
 
     def reset(self):
         self.filter.reset()
@@ -381,6 +381,9 @@ def main():
     ap.add_argument("--speed-soft", type=float, default=0.0,
                     help="impedance.py --speed-soft (rad/s, 0 = off).")
     ap.add_argument("--speed-soft-band", type=float, default=0.5)
+    ap.add_argument("--wall-damping", type=float, nargs=7, default=None,
+                    metavar="D", help="TableSafetyFilter(wall_damping=...): joint damping "
+                         "faded in with the wall (experimental, no CLI flag yet).")
     ap.add_argument("--quick", action="store_true",
                     help="g-error plant, rated force only")
     args = ap.parse_args()
@@ -396,7 +399,8 @@ def main():
         g_err, damp, arm, tool = PLANTS[pname]
         ctrl = Controller(g_err, gravity_reserve=args.gravity_reserve,
                           speed_soft=args.speed_soft,
-                          speed_soft_band=args.speed_soft_band)
+                          speed_soft_band=args.speed_soft_band,
+                          wall_damping=args.wall_damping)
         plant = Plant(args.mjcf, damp, arm, tool, args.substeps, ctrl)
         eg, eM = check_model(ctrl, plant)
         print(f"\n=== plant '{pname}': g error j4 {g_err:.0%}, damping {damp}, "

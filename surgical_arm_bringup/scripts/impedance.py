@@ -534,6 +534,7 @@ class TableSafetyFilter:
                  wall, tool_hull=None, tool_k=0, tool_z_min=None,
                  observer_gain=0.0, q_min=None, q_max=None,
                  gravity_reserve=0.0, velocity_limits=False,
+                 wall_damping=None,
                  reserve_every=8, tool_wall=None):
         self.model = model
         self.segs = segs
@@ -565,6 +566,14 @@ class TableSafetyFilter:
         # (validator, sideways tool, needle pushed: fails at 20 N with them,
         # holds 25 N without).
         self.dq_max = DQ_MAX[:n] if velocity_limits else None
+        # Joint damping (Nm*s/rad, per joint) faded in with the wall. A wall
+        # force on the needle tip, 108 mm off joint 7's axis, has a long lever
+        # on the light wrist: undamped, the push-back spins joint 7 past the
+        # 1.5 rad/s abort instead of lifting the tool (MuJoCo 2026-11-10,
+        # sideways tool: 3.4 rad/s). Scaled by the wall's engagement, so it is
+        # zero in free space and full at the wall's peak force.
+        self.wall_damping = (None if wall_damping is None
+                             else np.asarray(wall_damping, float)[:n])
         self.reserve_joints = RESERVE_JOINTS[RESERVE_JOINTS < n]
         self.reserve_limit = ((1.0 - gravity_reserve)
                               * tau_max[self.reserve_joints])
@@ -652,6 +661,12 @@ class TableSafetyFilter:
                                               self.z_min, **self.tool_wall)
             tau_wall = tau_wall + tau_t
             f_wall = np.concatenate((f_links, f_tool))
+        if self.wall_damping is not None and np.any(f_wall > 0.0):
+            peak = max(self.wall["k_wall"] * self.wall["standoff"],
+                       self.tool_wall["k_wall"] * self.tool_wall["standoff"],
+                       1e-9)
+            engage = min(1.0, float(np.max(f_wall)) / peak)
+            tau_wall = tau_wall - engage * self.wall_damping * dq
         tau = tau + tau_wall
 
         # Layer 2: the HOCBF projection. Bias = the torque that buys no
