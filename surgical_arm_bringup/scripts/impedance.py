@@ -1079,6 +1079,15 @@ DQ_MAX = np.array([1.3963, 1.3963, 1.3963, 1.3963, 1.2218, 1.2218, 1.2218])
 RESERVE_JOINTS = np.array([1, 3, 5])
 
 
+def speed_governor(dq, soft, gain):
+    """Braking torque (subtract it from the command) for joints over `soft`.
+
+    Zero below `soft` rad/s; above it, gain * (|dq| - soft) opposing the
+    motion. The hot loop and sim_table_barrier_mujoco.py both call this.
+    """
+    return gain * (dq - np.clip(dq, -soft, soft))
+
+
 def joint_limit_torque(q, k):
     """Repulsive joint torque, nonzero only within LIMIT_MARGIN of a limit.
 
@@ -1805,6 +1814,8 @@ def run_impedance(args):
         i_cap = I_CLAMP_FRAC * tau_max
         i_tau = np.zeros(n)
         kd_global = KD_GLOBAL[:n] * args.kd_scale   # drift-bleed, applied to total
+        gov_gain = (TAU_MAX[:n] / args.speed_soft_band
+                    if args.speed_soft > 0.0 else None)   # Nm per rad/s of excess
         # Cartesian gravity trim: reuses the joint-mode integral gains and the
         # same anti-windup cap, but is applied unscaled by the yield (weight
         # support, not stiffness). See GRAVITY_TRIM_SCALE.
@@ -2557,6 +2568,18 @@ def run_impedance(args):
                 else:
                     ramp = 1.0
 
+                # (G) Soft speed governor. Extra damping on any joint moving
+                # faster than --speed-soft, rising to the joint's full torque
+                # limit --speed-soft-band rad/s later, so the arm brakes well
+                # before the hard MAX_JOINT_SPEED abort. It is added to the
+                # NOMINAL torque, ahead of the table filter, on purpose: as hard
+                # QP rows the speed limit fought the table rows exactly when the
+                # tool had to be braked (see velocity_limit_rows). Here the
+                # filter still has the last word, so table safety takes
+                # priority over speed. Not faded by the ramp.
+                if gov_gain is not None:
+                    tau = tau - speed_governor(dq, args.speed_soft, gov_gain)
+
                 # (F) Table avoidance, applied to every monitored link. Two
                 # cooperating layers -- see control_barrier.py for the split:
                 #   wall : a real repulsive force, so the arm pushes back and
@@ -3105,6 +3128,17 @@ def main():
                         "exceed --table-stiffness * --table-standoff (default "
                         "72 N) or the cap binds before the link reaches the "
                         "table and the last few mm go soft.")
+    p.add_argument("--speed-soft", type=float, default=0.0, metavar="W",
+                   help="Soft joint-speed governor: above W rad/s a joint gets "
+                        "extra braking torque, reaching its full torque limit "
+                        "--speed-soft-band rad/s later. Keeps the arm off the "
+                        f"hard {MAX_JOINT_SPEED} rad/s abort. EXPERIMENTAL, off by "
+                        "default: in MuJoCo (2026-11-10) 1.0 cut the 20 N "
+                        "margin from +15.7 to +2.2 mm and only lowered peak "
+                        "speed 3.4 -> 2.7 rad/s. 0 disables.")
+    p.add_argument("--speed-soft-band", type=float, default=0.5, metavar="B",
+                   help="Speed excess (rad/s) over --speed-soft at which the "
+                        "governor's braking reaches the joint torque limit.")
     p.add_argument("--table-verbose", action="store_true",
                    help="Print the closest guarded link and wall force while "
                         "the wall is engaged (rate-limited to 2 Hz).")
@@ -3124,6 +3158,11 @@ def main():
                         + "%.0f Nm)." % MAX_SING_TORQUE)
     args = p.parse_args()
 
+    if args.speed_soft < 0.0 or args.speed_soft >= MAX_JOINT_SPEED:
+        p.error(f"--speed-soft must be in [0, {MAX_JOINT_SPEED}) rad/s "
+                "(0 disables; at or above the abort speed it never acts).")
+    if args.speed_soft_band <= 0.0:
+        p.error("--speed-soft-band must be > 0.")
     if args.sing_gain < 0.0:
         p.error("--sing-gain must be >= 0 (a negative gain would DESCEND the "
                 "gradient, driving the arm into the singularity).")

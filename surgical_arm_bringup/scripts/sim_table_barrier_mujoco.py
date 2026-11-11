@@ -103,7 +103,8 @@ class Controller:
     """impedance.TableSafetyFilter -- the hot loop's own filter -- plus the
     commanded gravity feedforward, carrying the configured error."""
 
-    def __init__(self, g_error_j4, observer_gain=50.0, gravity_reserve=0.4):
+    def __init__(self, g_error_j4, observer_gain=50.0, gravity_reserve=0.4,
+                 speed_soft=0.0, speed_soft_band=0.5):
         self.model = imp.KinDynModel(imp.DEFAULT_URDF, imp.DEFAULT_BASE_LINK,
                                      imp.DEFAULT_TIP_LINK, tool="thesis_ee")
         self.n = self.model.n
@@ -115,6 +116,8 @@ class Controller:
         self.g_scale = np.ones(self.n)
         self.g_scale[3] = 1.0 - g_error_j4
         self.tau_max = imp.TAU_MAX[:self.n]
+        self.gov = ((speed_soft, self.tau_max / speed_soft_band)
+                    if speed_soft > 0.0 else None)
         self.filter = imp.TableSafetyFilter(
             self.model, self.segs, LINK_RADIUS, LINK_Z_MIN, ALPHA,
             self.tau_max, WALL, tool_hull=self.hull, tool_k=TOOL_K,
@@ -127,7 +130,10 @@ class Controller:
     def step(self, q, dq, tau_task):
         """Return the torque the robot would send, plus filter info."""
         tau_g = self.model.gravity(q) * self.g_scale
-        tau, info = self.filter.apply(q, dq, tau_g + tau_task, tau_g, 1e-3)
+        tau_nom = tau_g + tau_task
+        if self.gov is not None:
+            tau_nom = tau_nom - imp.speed_governor(dq, *self.gov)
+        tau, info = self.filter.apply(q, dq, tau_nom, tau_g, 1e-3)
         tau = np.clip(tau, -self.tau_max, self.tau_max)
         self.filter.sent(tau)
         return tau, info
@@ -368,9 +374,17 @@ def main():
     ap.add_argument("--hand-speed", type=float, default=0.5,
                     help="Operator hand speed limit (m/s).")
     ap.add_argument("--substeps", type=int, default=10)
+    ap.add_argument("--wall-stiffness", type=float, default=WALL["k_wall"],
+                    help="impedance.py --table-stiffness (N/m).")
+    ap.add_argument("--wall-force-max", type=float, default=WALL["f_max"],
+                    help="impedance.py --table-force-max (N per link).")
+    ap.add_argument("--speed-soft", type=float, default=0.0,
+                    help="impedance.py --speed-soft (rad/s, 0 = off).")
+    ap.add_argument("--speed-soft-band", type=float, default=0.5)
     ap.add_argument("--quick", action="store_true",
                     help="g-error plant, rated force only")
     args = ap.parse_args()
+    WALL.update(k_wall=args.wall_stiffness, f_max=args.wall_force_max)
     if args.quick:
         args.plants, args.forces = ["g-error"], [args.rated_force]
     if not os.path.exists(args.mjcf):
@@ -380,7 +394,9 @@ def main():
     fails = []
     for pname in args.plants:
         g_err, damp, arm, tool = PLANTS[pname]
-        ctrl = Controller(g_err, gravity_reserve=args.gravity_reserve)
+        ctrl = Controller(g_err, gravity_reserve=args.gravity_reserve,
+                          speed_soft=args.speed_soft,
+                          speed_soft_band=args.speed_soft_band)
         plant = Plant(args.mjcf, damp, arm, tool, args.substeps, ctrl)
         eg, eM = check_model(ctrl, plant)
         print(f"\n=== plant '{pname}': g error j4 {g_err:.0%}, damping {damp}, "
