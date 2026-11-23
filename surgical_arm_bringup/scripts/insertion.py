@@ -2353,6 +2353,13 @@ class AngledInserter(Node):
                 f"  Unknown azimuth_mode '{azimuth_mode}'; using insertion_azimuth_deg.")
         if azimuth_rad is None:
             azimuth_rad = math.radians(self.get_parameter("insertion_azimuth_deg").value)
+        # Approach direction changes the tip's landing error (two 2026-11-10 runs at
+        # the same target/tilt differed by 25 mm), so every bag must record it.
+        self._run_info(
+            "approach", azimuth_mode=azimuth_mode,
+            azimuth_deg=round(math.degrees(azimuth_rad), 3),
+            tilt_deg=round(math.degrees(tilt_rad), 3),
+            q_ready=None if search_ready is None else [round(float(q), 5) for q in search_ready])
 
         hover_xyz, (axis_x, axis_y, axis_z), D = insertion_axis_geometry(
             cont_x, cont_y, ready_z, target_xyz[2], tilt_rad, azimuth_rad)
@@ -2707,6 +2714,16 @@ class AngledInserter(Node):
         if insert_state != "done":
             self.get_logger().warn(f"  Insertion {insert_state} by the force guard -- skipping hold.")
         elif execute:
+            # Where FK says the tip is at the moment of measurement: splits the
+            # labelled offset into tracking error (fk - target) and target error.
+            tf = self._get_tf(self.get_parameter("world_frame").value,
+                              self.get_parameter("tip_link").value, timeout=1.0)
+            if tf is not None:
+                t = tf.transform.translation
+                self._run_info("tip_fk_at_hold", x=t.x, y=t.y, z=t.z,
+                               err_x_mm=round((t.x - target_xyz[0]) * 1000.0, 2),
+                               err_y_mm=round((t.y - target_xyz[1]) * 1000.0, 2),
+                               err_z_mm=round((t.z - target_xyz[2]) * 1000.0, 2))
             try:
                 prompt = (f"  Tip at target ({target_xyz[0]:.3f}, {target_xyz[1]:.3f}, "
                           f"{target_xyz[2]:.3f}).\n"
