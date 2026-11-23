@@ -102,6 +102,7 @@ import subprocess
 import collections
 import collections.abc
 import json
+import numpy as np
 
 import rclpy
 import rclpy.time
@@ -368,6 +369,11 @@ class AngledInserter(Node):
         # above target_x/target_y (the approach pose) so the wrist camera looks
         # straight down at the square, then measure.
         self.declare_parameter("marker_look_first", True)
+        # "markers": do the look move even when the front camera already gives
+        # a centre, so the wrist camera always gets a close, four-marker view
+        # (logged as "wrist_centre" next to the fused centre for comparison).
+        self.declare_parameter("marker_look_always", False)
+        self.declare_parameter("wrist_camera_name", "kinova")
         self.declare_parameter("marker_wait_s", 5.0)
         self.declare_parameter("marker_min_samples", 5)
         self.declare_parameter("marker_max_spread_mm", 5.0)
@@ -630,6 +636,10 @@ class AngledInserter(Node):
         self._camera_target = None
         self._marker_centres = collections.deque(maxlen=300)   # (monotonic, x, y, frame)
         self.create_subscription(PoseStamped, "/fused_marker_square_center", self._camera_target_cb, 10)
+        # Per-camera marker positions from combine_cameras.py, to score the
+        # wrist camera on its own against the fused centre.
+        self._marker_obs = collections.deque(maxlen=2000)   # (monotonic, camera, frame, {id: (x, y, z)})
+        self.create_subscription(String, "/marker_observations", self._marker_obs_cb, 50)
         self._done = False
 
     def destroy_node(self):
@@ -655,6 +665,53 @@ class AngledInserter(Node):
         self._camera_target = msg
         self._marker_centres.append((time.monotonic(), msg.pose.position.x,
                                      msg.pose.position.y, msg.header.frame_id))
+
+    def _marker_obs_cb(self, msg):
+        try:
+            o = json.loads(msg.data)
+            pos = {int(m["id"]): tuple(m["pos_ref"]) for m in o.get("markers", [])}
+        except (ValueError, KeyError, TypeError):
+            return
+        if pos:
+            self._marker_obs.append((time.monotonic(), o.get("camera"), o.get("frame"), pos))
+
+    def _wrist_centre(self, t_start, ids=(0, 1, 2, 3)):
+        """Wrist-camera-only square centre since t_start: mean of the per-marker
+        median positions, only when every corner marker was seen. Returns
+        (x, y, n_obs, {id: n}) or None."""
+        cam = self.get_parameter("wrist_camera_name").value
+        world = self.get_parameter("world_frame").value
+        per = {}
+        for t, c, frame, pos in list(self._marker_obs):
+            if t < t_start or c != cam or frame != world:
+                continue
+            for i, p in pos.items():
+                per.setdefault(i, []).append(p)
+        counts = {i: len(v) for i, v in per.items()}
+        if not all(i in per for i in ids):
+            return None, counts
+        med = [np.median(np.array(per[i])[:, :2], axis=0) for i in ids]
+        c = np.mean(med, axis=0)
+        return (float(c[0]), float(c[1])), counts
+
+    def _log_wrist_vs_fused(self, t_start, fused):
+        wrist, counts = self._wrist_centre(t_start)
+        data = dict(wrist_counts={str(k): v for k, v in sorted(counts.items())},
+                    fused_x=None if fused is None else fused[0],
+                    fused_y=None if fused is None else fused[1])
+        if wrist is not None:
+            data.update(wrist_x=wrist[0], wrist_y=wrist[1])
+            if fused is not None:
+                data.update(diff_x_mm=round((wrist[0] - fused[0]) * 1000.0, 2),
+                            diff_y_mm=round((wrist[1] - fused[1]) * 1000.0, 2))
+                self.get_logger().info(
+                    f"  [Markers] wrist-only centre ({wrist[0]:.4f}, {wrist[1]:.4f}); "
+                    f"wrist - fused = ({data['diff_x_mm']:+.1f}, {data['diff_y_mm']:+.1f}) mm")
+        else:
+            self.get_logger().info(
+                f"  [Markers] wrist camera did not see all four markers "
+                f"(observations per id: {data['wrist_counts']})")
+        self._run_info("wrist_centre", **data)
 
     def _fresh_marker_centre(self):
         """Median marker-square centre from messages arriving from now on, or None."""
@@ -687,6 +744,7 @@ class AngledInserter(Node):
             return None
         log.info(f"  [Markers] centre ({centre[0]:.4f}, {centre[1]:.4f}) from "
                  f"{len(fresh)} fresh messages, spread {centre[2]*1000:.1f} mm")
+        self._log_wrist_vs_fused(t_start, centre[:2])
         return centre[0], centre[1]
     def _parameter_callback(self, params):
         from rcl_interfaces.msg import SetParametersResult
@@ -2277,7 +2335,10 @@ class AngledInserter(Node):
         if target_source == "markers":
             self.get_logger().info("\n--- [Markers] Locating the marker square ---")
             centre = self._fresh_marker_centre()
-            if centre is None and self.get_parameter("marker_look_first").value:
+            look_always = bool(self.get_parameter("marker_look_always").value)
+            if (centre is None and self.get_parameter("marker_look_first").value) or (
+                    look_always and execute):
+                pre_look = centre
                 ee_look = self._ee_for_tip((cont_x, cont_y, ready_z), q_search)
                 self.get_logger().info(
                     f"  Moving above the nominal target ({cont_x:.3f}, {cont_y:.3f}) so "
@@ -2297,6 +2358,10 @@ class AngledInserter(Node):
                         return
                     time.sleep(1.0)   # let the image settle after the stop
                     centre = self._fresh_marker_centre()
+                    if centre is None and pre_look is not None:
+                        self.get_logger().warn(
+                            "  No centre after the look move; keeping the one from before it.")
+                        centre = pre_look
                 else:
                     self.get_logger().info(
                         "  Dry run -- the arm does not move, so nothing new can be seen.")
