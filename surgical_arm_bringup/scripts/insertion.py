@@ -2316,6 +2316,15 @@ class AngledInserter(Node):
                 cont_x = self._camera_target.pose.position.x
                 cont_y = self._camera_target.pose.position.y
                 self.get_logger().info(f"[Vision] Dynamic target from /fused_marker_square_center: ({cont_x:.3f}, {cont_y:.3f})")
+                target_source = "auto:camera"
+            else:
+                # Silent before 2026-11-23: the 2026-11-10 runs had no camera
+                # running, aimed at the nominal params, and logged "auto".
+                self.get_logger().warn(
+                    f"  [Vision] NO marker centre received -- target is the nominal "
+                    f"params ({cont_x:.3f}, {cont_y:.3f}), not the cameras. Use "
+                    f"target_source:=markers to refuse instead.")
+                target_source = "auto:params_fallback"
         elif target_source != "params":
             self.get_logger().error(
                 f"  Unknown target_source '{target_source}' (auto | params | markers).")
