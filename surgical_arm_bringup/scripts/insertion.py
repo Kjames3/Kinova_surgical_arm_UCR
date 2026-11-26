@@ -326,6 +326,31 @@ class EffortGuard:
         return False
 
 
+def refine_decision(cur_xy, new_xy, min_mm, max_mm):
+    """Decide what to do with a re-measured target centre. Pure; metres in.
+
+    Returns (verdict, dx, dy) with dx, dy in metres (new - cur):
+      "none"  -- no measurement (new_xy is None): keep the current target
+      "skip"  -- |d| < min_mm: noise level, do nothing
+      "abort" -- |d| > max_mm: measurement not trustworthy, do NOT move
+      "apply" -- min_mm <= |d| <= max_mm: shift by (dx, dy)
+    """
+    if new_xy is None:
+        return "none", 0.0, 0.0
+    dx, dy = new_xy[0] - cur_xy[0], new_xy[1] - cur_xy[1]
+    d_mm = math.hypot(dx, dy) * 1000.0
+    if d_mm < min_mm:
+        return "skip", dx, dy
+    if d_mm > max_mm:
+        return "abort", dx, dy
+    return "apply", dx, dy
+
+
+def translate_waypoints(waypoints, dx, dy):
+    """Shift every (x, y, z) in a {name: xyz} dict by (dx, dy, 0). Pure."""
+    return {k: (v[0] + dx, v[1] + dy, v[2]) for k, v in waypoints.items()}
+
+
 class AngledInserter(Node):
 
     def __init__(self):
@@ -373,6 +398,12 @@ class AngledInserter(Node):
         # a centre, so the wrist camera always gets a close, four-marker view
         # (logged as "wrist_centre" next to the fused centre for comparison).
         self.declare_parameter("marker_look_always", False)
+        # "markers": re-measure the board centre at two checkpoints (vertical
+        # hover, then tilted at hover; never after Phase4a starts) and shift
+        # the whole remaining plan by the XY difference. Off by default.
+        self.declare_parameter("refine_target", False)
+        self.declare_parameter("refine_min_mm", 1.0)    # below: do nothing
+        self.declare_parameter("refine_max_mm", 15.0)   # above: abort, do not move
         # Frame centred over the target during the look move, and its height
         # above the board surface (table_z + container_base_offset). The
         # camera (not the tool tip, ~0.11 m lateral from the wrist) must be
@@ -1389,6 +1420,52 @@ class AngledInserter(Node):
             self.get_logger().error(f"  {label} LIN planning failed.")
             return False
         return self._execute_fjt(traj, label)
+
+    def _refine_checkpoint(self, label, cont_xy, q, ee_now, speed_mps, execute):
+        """Re-measure the target centre and shift the arm by the XY difference.
+
+        Returns (status, dx, dy): status is "inactive" (feature off / dry run /
+        not markers: nothing happened, no measurement taken), "skip" (kept the
+        target), "applied" (arm moved by (dx, dy); caller must translate every
+        later waypoint) or "abort" (caller must _recovery_return and stop).
+        ee_now is the EE pose the arm is commanded to be at; q its orientation.
+        """
+        if not (self.get_parameter("refine_target").value and execute
+                and self.get_parameter("target_source").value == "markers"):
+            return "inactive", 0.0, 0.0
+        lo = float(self.get_parameter("refine_min_mm").value)
+        hi = float(self.get_parameter("refine_max_mm").value)
+        log = self.get_logger()
+        centre = self._fresh_marker_centre()
+        verdict, dx, dy = refine_decision(cont_xy, centre, lo, hi)
+        mm = (round(dx * 1000.0, 2), round(dy * 1000.0, 2))
+        info = dict(checkpoint=label, dx_mm=mm[0], dy_mm=mm[1],
+                    new_x=None if centre is None else centre[0],
+                    new_y=None if centre is None else centre[1])
+        if verdict == "none":
+            log.warn(f"  [Refine {label}] no fresh marker centre -- keeping the current target.")
+            self._run_info("target_refine", applied=False, reason="no_measurement", **info)
+            return "skip", 0.0, 0.0
+        if verdict == "skip":
+            log.info(f"  [Refine {label}] shift ({mm[0]:+.2f}, {mm[1]:+.2f}) mm < {lo} mm -- no change.")
+            self._run_info("target_refine", applied=False, reason="below_min", **info)
+            return "skip", 0.0, 0.0
+        if verdict == "abort":
+            log.error(f"  [Refine {label}] shift ({mm[0]:+.1f}, {mm[1]:+.1f}) mm exceeds "
+                      f"{hi} mm -- measurement not trustworthy. Aborting without moving.")
+            self._run_info("target_refine", applied=False, reason="above_max", **info)
+            return "abort", 0.0, 0.0
+        log.info(f"  [Refine {label}] shifting ({mm[0]:+.2f}, {mm[1]:+.2f}) mm.")
+        if not self._wait_for_user(f"Refine{label}"):
+            self._run_info("target_refine", applied=False, reason="declined", **info)
+            return "skip", 0.0, 0.0
+        shifted = (ee_now[0] + dx, ee_now[1] + dy, ee_now[2])
+        if not self._axis_lin(shifted, q, f"Refine{label}", speed_mps, 15.0):
+            log.error(f"  [Refine {label}] shift move failed. Aborting.")
+            self._run_info("target_refine", applied=False, reason="move_failed", **info)
+            return "abort", 0.0, 0.0
+        self._run_info("target_refine", applied=True, reason="applied", **info)
+        return "applied", dx, dy
 
     def _plan_sequence(self, reqs, blend_radii, timeout=45.0):
         self._mark_phase("plan_start")
@@ -2664,6 +2741,33 @@ class AngledInserter(Node):
             if ret: self._recovery_return(p)
             return
 
+        # ── Refine checkpoints C1 / C2 (refine_target, markers only) ──────────
+        # Everything below is computed from the waypoints rebound here, so a
+        # shift is applied once and Phases 3-8 (incl. the Phase 3 plan, which is
+        # made AFTER this point) all use the shifted geometry. Waypoints built
+        # before this point and used after it: target_xyz, hover_xyz, ee_hover
+        # (=ee_start_circ), ee_via_circ, ee_end_circ, ee_ready; pre_tip/ee_pre/
+        # ee_target are computed later from target_xyz and need no shift.
+        def _shift_plan(dx, dy):
+            nonlocal cont_x, cont_y, target_xyz, hover_xyz, ee_hover, ee_start_circ
+            nonlocal ee_via_circ, ee_end_circ, ee_ready
+            w = translate_waypoints(dict(
+                target=target_xyz, hover=hover_xyz, ee_hover=ee_hover,
+                via=ee_via_circ, end=ee_end_circ, ready=ee_ready), dx, dy)
+            cont_x += dx
+            cont_y += dy
+            target_xyz, hover_xyz = w["target"], w["hover"]
+            ee_hover = ee_start_circ = w["ee_hover"]
+            ee_via_circ, ee_end_circ, ee_ready = w["via"], w["end"], w["ready"]
+
+        if not self.get_parameter("direct_to_angled_hover").value:
+            status, rdx, rdy = self._refine_checkpoint(
+                "C1", (cont_x, cont_y), q_vertical, ee_hover, axis_speed, execute)
+            if status == "abort":
+                self._recovery_return(p); return
+            if status == "applied":
+                _shift_plan(rdx, rdy)
+
         if not self.get_parameter("direct_to_angled_hover").value:
             # ── Phase 2: Print geometry summary and optionally confirm ─────────
             self.get_logger().info(
@@ -2773,6 +2877,17 @@ class AngledInserter(Node):
                 return
             if execute and self._wait_for_user("Phase0_direct_approach") and not self._execute_fjt(traj, "Phase0_direct_approach"):
                 self._recovery_return(p); return
+
+        # C2: tilted at hover (also after the direct-to-angled approach).
+        status, rdx, rdy = self._refine_checkpoint(
+            "C2", (cont_x, cont_y), q_tilted, ee_end_circ, axis_speed, execute)
+        if status == "abort":
+            self._recovery_return(p); return
+        if status == "applied":
+            _shift_plan(rdx, rdy)
+        # FROZEN from here: the target is never refined once Phase 4 starts.
+        # Below the rim a lateral correction would push the tool into the
+        # container wall; the force guard is the only protection there.
 
         # ── Phase 4: Angled descent to target ─────────────────────────────
         self.get_logger().info(f"\n--- [Phase 4] Angled descent to target ---")
