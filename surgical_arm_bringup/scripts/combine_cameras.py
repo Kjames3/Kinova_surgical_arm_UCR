@@ -250,6 +250,57 @@ def fit_board_template(template, observed, max_scale_error=0.015):
     return t, {i: R @ np.asarray(xy, dtype=np.float64) + t for i, xy in template.items()}
 
 
+def wrap_angle(a):
+    """Wrap an angle [rad] to (-pi, pi]."""
+    a = math.atan2(math.sin(a), math.cos(a))
+    return math.pi if a <= -math.pi + 1e-12 else a
+
+
+def circular_median(angles):
+    """Median of angles [rad] that is safe across the +/-pi seam.  Medians the
+    wrapped offsets from the circular mean; None for an empty list."""
+    if len(angles) == 0:
+        return None
+    ref = math.atan2(sum(math.sin(a) for a in angles), sum(math.cos(a) for a in angles))
+    return wrap_angle(ref + float(np.median([wrap_angle(a - ref) for a in angles])))
+
+
+def parse_board_template(raw):
+    """Decode a saved board template.  Accepts the old {"id": [x, y]} form and
+    the new {"id": [x, y, yaw]} / {"id": {"xy": [x, y], "yaw": yaw}} forms.
+    Returns (template {id: (x, y)}, template_yaw {id: yaw}); template_yaw only
+    has the markers that carry a yaw, so it is empty for an old file."""
+    template, yaws = {}, {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            xy, yaw = v["xy"], v.get("yaw")
+        else:
+            xy, yaw = v[:2], (v[2] if len(v) > 2 else None)
+        template[int(k)] = (float(xy[0]), float(xy[1]))
+        if yaw is not None:
+            yaws[int(k)] = float(yaw)
+    return template, yaws
+
+
+def fit_board_single(template, template_yaw, marker_id, observed_xy, observed_yaw):
+    """Place the board from ONE visible marker using its in-plane orientation.
+
+    template: {id: (x, y)} relative to the board centre; template_yaw: {id: yaw
+    [rad]} of each marker in that same board frame.  The markers are printed
+    rigidly on the board, so board rotation = observed_yaw - template_yaw[id]
+    and centre = observed_xy - R @ template[id].  Returns (centre_xy, {id: xy
+    for every template corner}) like fit_board_template, or None if the marker
+    has no template position or yaw.
+    """
+    if marker_id not in template or marker_id not in template_yaw:
+        return None
+    ang = wrap_angle(float(observed_yaw) - float(template_yaw[marker_id]))
+    c, sn = math.cos(ang), math.sin(ang)
+    R = np.array([[c, -sn], [sn, c]])
+    t = np.asarray(observed_xy, dtype=np.float64)[:2] - R @ np.asarray(template[marker_id], dtype=np.float64)
+    return t, {i: R @ np.asarray(xy, dtype=np.float64) + t for i, xy in template.items()}
+
+
 def solve_rays(origins, directions, weights=None, plane_z=None):
     """
     Weighted least-squares point closest to a set of rays, optionally
@@ -479,6 +530,11 @@ class CombineCamerasNode(Node):
         # were seen by the same camera(s) and kept across restarts, so the
         # centre can still be placed when only two adjacent corners are visible.
         self.declare_parameter("board_template_file", "~/.ros/marker_board_template.json")
+        # With a template that also holds each marker's yaw, one visible marker
+        # is enough: its in-plane orientation fixes the board's rotation.  A
+        # 0.5 deg yaw error moves the centre ~1.4 mm over the ~0.16 m lever.
+        self.declare_parameter("allow_single_marker_fit", True)
+        self.allow_single_marker_fit = bool(self.get_parameter("allow_single_marker_fit").value)
         # Below this conditioning the ray solve is rejected and the marker falls
         # back to "positions" (0.02 ~ a lone ray 82 deg off vertical).
         self.declare_parameter("ray_min_conditioning", 0.02)
@@ -560,15 +616,26 @@ class CombineCamerasNode(Node):
         # Cache of the latest calculated center for live visual diagnostics
         self.latest_center = None
         self._board_template = None
+        self._board_template_yaw = {}
         self._board_template_saved = 0.0
         self._board_template_path = os.path.expanduser(
             self.get_parameter("board_template_file").value)
         try:
             with open(self._board_template_path) as f:
-                self._board_template = {int(k): v for k, v in json.load(f).items()}
-            self.get_logger().info(f"Loaded board shape from {self._board_template_path}")
-        except (OSError, ValueError):
-            pass
+                self._board_template, self._board_template_yaw = parse_board_template(json.load(f))
+            self.get_logger().info(
+                f"Loaded board shape from {self._board_template_path} "
+                f"({'with' if self._board_template_yaw else 'WITHOUT'} marker yaws)")
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            self._board_template, self._board_template_yaw = None, {}
+        if self._board_template and not self._board_template_yaw and self.allow_single_marker_fit:
+            self.get_logger().info(
+                "Board template has no marker yaws (old file): single-marker fitting is "
+                "unavailable until all four markers are seen once by one camera.")
+        # Recent (time, yaw) per marker, for the median that feeds the single fit
+        self._yaw_hist = {}
+        self._yaw_window = 1.0       # s
+        self._fit_info = "n/a"
         
         # ----------------------------------------------------------------------
         # Publishers
@@ -797,10 +864,23 @@ class CombineCamerasNode(Node):
             t = transform.transform.translation
             origin = np.array([t.x, t.y, t.z], dtype=np.float64)
             
+            # In-plane yaw: the marker's x-axis in the reference frame, projected on XY
+            R_m = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))[0]
+            x_ref = rotate_vector(R_m[:, 0], transform.transform.rotation)
+            n_ref = rotate_vector(R_m[:, 2], transform.transform.rotation)
+            # Flat board: the marker normal must be near vertical. An oblique
+            # view can make PnP flip the plane (IPPE ambiguity), which corrupts
+            # the yaw -- and the single-marker fit trusts that yaw alone.
+            if abs(float(n_ref[2])) / max(float(np.linalg.norm(n_ref)), 1e-9) >= math.cos(math.radians(20.0)):
+                yaw = math.atan2(float(x_ref[1]), float(x_ref[0]))
+            else:
+                yaw = None
+
             # Store measurement in dynamic database
             self._store_measurement(marker_id, camera_name, global_pos,
                                     origin=origin, ray=ray,
-                                    cam_range=float(np.linalg.norm(local_pos)))
+                                    cam_range=float(np.linalg.norm(local_pos)),
+                                    yaw=yaw)
             observations.append({
                 "id": int(marker_id),
                 "corners_px": marker_corners.tolist(),
@@ -902,7 +982,7 @@ class CombineCamerasNode(Node):
         return success, rvec, tvec
 
     def _store_measurement(self, marker_id: int, camera_name: str, pos: np.ndarray,
-                           origin=None, ray=None, cam_range=None):
+                           origin=None, ray=None, cam_range=None, yaw=None):
         """Update the database with the latest transformed marker coordinates."""
         now = self.get_clock().now().nanoseconds / 1e9
         if marker_id not in self.measurements:
@@ -913,6 +993,7 @@ class CombineCamerasNode(Node):
             "origin": origin,       # camera centre, reference frame
             "ray": ray,             # unit ray to the marker centre, reference frame
             "range": cam_range,     # camera-to-marker distance from PnP
+            "yaw": yaw,             # marker x-axis heading about reference Z [rad]
         }
 
     def _fuse_marker_rays(self, m_id: int, records: dict):
@@ -1179,6 +1260,7 @@ class CombineCamerasNode(Node):
         #   • 3+ cameras: median-of-means to suppress gross outliers from any single
         #                 camera that has a bad view angle or lighting artifact
         fused_corners = {}
+        fused_yaws = {}
         corner_cams = {}
         for m_id in self.corner_ids:
             if m_id not in self.measurements:
@@ -1218,6 +1300,16 @@ class CombineCamerasNode(Node):
                 fused_pos[2] = self.table_z + self.marker_height_above_table
             fused_corners[m_id] = fused_pos
 
+            # Marker yaw: circular median over the cameras' latest values, then
+            # over the last _yaw_window seconds (same data the positions use).
+            cam_yaws = [r["yaw"] for r in self.measurements[m_id].values()
+                        if r.get("yaw") is not None]
+            if cam_yaws:
+                hist = self._yaw_hist.setdefault(m_id, [])
+                hist.append((now, circular_median(cam_yaws)))
+                hist[:] = [h for h in hist if now - h[0] <= self._yaw_window][-30:]
+                fused_yaws[m_id] = circular_median([h[1] for h in hist])
+
         # Retrieve specific corners
         tl = fused_corners.get(self.marker_id_tl)
         tr = fused_corners.get(self.marker_id_tr)
@@ -1226,7 +1318,17 @@ class CombineCamerasNode(Node):
         
         num_detected = sum([tl is not None, tr is not None, br is not None, bl is not None])
         
-        if num_detected < 2:
+        single_fit = None
+        if num_detected == 1 and self.allow_single_marker_fit and self._board_template:
+            m_id = next(i for i, p in fused_corners.items() if p is not None)
+            if not self._board_template_yaw:
+                self.get_logger().info(
+                    "One marker visible but the board template has no yaws; "
+                    "single-marker fit unavailable.", throttle_duration_sec=30.0)
+            elif m_id in fused_yaws:
+                single_fit = fit_board_single(self._board_template, self._board_template_yaw,
+                                              m_id, fused_corners[m_id][:2], fused_yaws[m_id])
+        if num_detected < 2 and single_fit is None:
             self.get_logger().info(
                 "Insufficient corner markers detected. Need at least 2 opposite or 3 adjacent.",
                 throttle_duration_sec=10.0
@@ -1234,11 +1336,23 @@ class CombineCamerasNode(Node):
             return
             
         center = None
-        
+        self._fit_info = f"n_markers={num_detected} fit={'all' if num_detected >= 3 else 'midpoint'}"
+
+        if single_fit is not None:
+            z = float(next(iter(fused_corners.values()))[2])
+            center = np.array([single_fit[0][0], single_fit[0][1], z])
+            placed = {i: np.array([xy[0], xy[1], z]) for i, xy in single_fit[1].items()}
+            tl, tr = placed.get(self.marker_id_tl), placed.get(self.marker_id_tr)
+            br, bl = placed.get(self.marker_id_br), placed.get(self.marker_id_bl)
+            self._fit_info = "n_markers=1 fit=single"
+            self.get_logger().info(
+                "Partial fusion: board placed from ONE marker's position + yaw.",
+                throttle_duration_sec=10.0)
+
         # ----------------------------------------------------------------------
         # Case A: Perfect Detection (All 4 Corners Visible)
         # ----------------------------------------------------------------------
-        if num_detected == 4:
+        elif num_detected == 4:
             center = (tl + tr + br + bl) / 4.0
             # Learn the board's shape, but only from a consistent view: a
             # corner that one extra camera also sees is pulled by that
@@ -1246,11 +1360,16 @@ class CombineCamerasNode(Node):
             if len(set(corner_cams.values())) == 1:
                 self._board_template = {int(i): (fused_corners[i][:2] - center[:2]).tolist()
                                         for i in fused_corners}
+                # Yaws are learned in the same (reference-frame) orientation as the positions
+                self._board_template_yaw = ({int(i): float(fused_yaws[i]) for i in fused_corners}
+                                            if all(i in fused_yaws for i in fused_corners) else {})
                 if now - self._board_template_saved > 30.0:
                     self._board_template_saved = now
                     try:
                         with open(self._board_template_path, "w") as f:
-                            json.dump(self._board_template, f)
+                            json.dump({str(i): (list(xy) + ([self._board_template_yaw[i]]
+                                                           if i in self._board_template_yaw else []))
+                                       for i, xy in self._board_template.items()}, f)
                     except OSError as e:
                         self.get_logger().warn(f"Could not save the board shape: {e}",
                                                throttle_duration_sec=60.0)
@@ -1295,6 +1414,7 @@ class CombineCamerasNode(Node):
                         throttle_duration_sec=10.0
                     )
                     return
+                self._fit_info = "n_markers=2 fit=template"
                 z = float(np.mean([p[2] for p in fused_corners.values()]))
                 center = np.array([fit[0][0], fit[0][1], z])
                 placed = {i: np.array([xy[0], xy[1], z]) for i, xy in fit[1].items()}
@@ -1331,7 +1451,7 @@ class CombineCamerasNode(Node):
             f"sign: [{self.x_sign * float(center[0]):.4f}, "
             f"{self.y_sign * float(center[1]):.4f}, "
             f"{self.z_sign * float(center[2]):.4f}]  "
-            f"final: [{cx:.4f}, {cy:.4f}, {cz:.4f}]",
+            f"final: [{cx:.4f}, {cy:.4f}, {cz:.4f}]  {self._fit_info}",
             throttle_duration_sec=5.0
         )
 
