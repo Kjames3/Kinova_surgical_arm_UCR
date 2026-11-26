@@ -373,6 +373,15 @@ class AngledInserter(Node):
         # a centre, so the wrist camera always gets a close, four-marker view
         # (logged as "wrist_centre" next to the fused centre for comparison).
         self.declare_parameter("marker_look_always", False)
+        # Frame centred over the target during the look move, and its height
+        # above the board surface (table_z + container_base_offset). The
+        # camera (not the tool tip, ~0.11 m lateral from the wrist) must be
+        # over the board. cy of the wrist camera is off-centre (238 of 720
+        # rows), so the optical axis is not the image centre; at 0.62 m the
+        # ~0.28 m board still fits (footprint ~0.61 x 0.34 m, 0.113 m above
+        # the axis, 0.229 m below).
+        self.declare_parameter("look_frame", "camera_color_frame")
+        self.declare_parameter("look_height_m", 0.62)
         self.declare_parameter("wrist_camera_name", "kinova")
         self.declare_parameter("marker_wait_s", 5.0)
         self.declare_parameter("marker_min_samples", 5)
@@ -810,6 +819,22 @@ class AngledInserter(Node):
                 self.get_logger().warn("Could not lookup tf ee_link -> tip_link, using default offset.")
                 self._assembly_tip_offset = {"x": 0.108, "y": -0.008, "z": -0.411}
         return self._assembly_tip_offset
+
+    def _get_frame_offset(self, frame):
+        """ee_link -> frame translation (ee_link axes), cached; None if no TF."""
+        cache = getattr(self, "_frame_offsets", None)
+        if cache is None:
+            cache = self._frame_offsets = {}
+        if frame not in cache:
+            tf = self._get_tf(self.get_parameter("ee_link").value, frame)
+            if tf:
+                t = tf.transform.translation
+                cache[frame] = (t.x, t.y, t.z)
+            else:
+                self.get_logger().warn(
+                    f"Could not lookup tf ee_link -> {frame}.")
+                return None
+        return cache[frame]
 
     def _get_tf(self, parent, child, timeout=5.0):
         deadline = time.time() + timeout
@@ -1937,6 +1962,21 @@ class AngledInserter(Node):
         rot = rotate_vector_by_quat(local, q_xyzw)
         return (tip_xyz[0] - rot[0], tip_xyz[1] - rot[1], tip_xyz[2] - rot[2])
 
+    def _ee_for_frame(self, frame_xyz, q_xyzw, frame, fallback_tip_xyz=None):
+        """EE (ee_link) position so `frame`'s origin lands at frame_xyz with EE
+        orientation q. Returns (ee_xyz, fallback). If the TF is unavailable,
+        warns and falls back to _ee_for_tip(fallback_tip_xyz) (fallback=True).
+        """
+        off = self._get_frame_offset(frame)
+        if off is None:
+            self.get_logger().warn(
+                f"look frame '{frame}' unavailable; falling back to tool-tip placement.")
+            tip = fallback_tip_xyz if fallback_tip_xyz is not None else frame_xyz
+            return self._ee_for_tip(tip, q_xyzw), True
+        rot = rotate_vector_by_quat(off, q_xyzw)
+        return (frame_xyz[0] - rot[0], frame_xyz[1] - rot[1],
+                frame_xyz[2] - rot[2]), False
+
     # ------------------------------------------------------------------
     # User prompt
     # ------------------------------------------------------------------
@@ -2339,7 +2379,21 @@ class AngledInserter(Node):
             if (centre is None and self.get_parameter("marker_look_first").value) or (
                     look_always and execute):
                 pre_look = centre
-                ee_look = self._ee_for_tip((cont_x, cont_y, ready_z), q_search)
+                look_frame = self.get_parameter("look_frame").value
+                board_z = (self.get_parameter("table_z").value
+                           + self.get_parameter("container_base_offset").value)
+                look_xyz = (cont_x, cont_y,
+                            board_z + self.get_parameter("look_height_m").value)
+                ee_look, look_fb = self._ee_for_frame(
+                    look_xyz, q_search, look_frame,
+                    fallback_tip_xyz=(cont_x, cont_y, ready_z))
+                self.get_logger().info(
+                    f"  Look pose: {look_frame} -> ({look_xyz[0]:.3f}, {look_xyz[1]:.3f}, "
+                    f"{look_xyz[2]:.3f}); EE ({ee_look[0]:.3f}, {ee_look[1]:.3f}, "
+                    f"{ee_look[2]:.3f}){' [FALLBACK: tip over target]' if look_fb else ''}")
+                self._run_info("look_pose", frame=look_frame,
+                               frame_xyz=[float(v) for v in look_xyz],
+                               ee_xyz=[float(v) for v in ee_look], fallback=bool(look_fb))
                 self.get_logger().info(
                     f"  Moving above the nominal target ({cont_x:.3f}, {cont_y:.3f}) so "
                     f"the wrist camera looks down at it: EE ({ee_look[0]:.3f}, "
